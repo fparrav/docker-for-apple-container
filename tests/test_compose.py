@@ -84,11 +84,14 @@ if a[:1] == ["run"]:
              "--cwd","--entrypoint","--platform","--cap-add","--cap-drop",
              "--ulimit","--shm-size","--dns","--dns-search","--dns-option"}
     boolean = {"-d","-i","-t","--init","--read-only","--rm","--no-dns"}
+    detached = False
     i = 1
     while i < len(a):
         arg = a[i]
         key = arg.split("=",1)[0] if arg.startswith("--") else arg
         if key in boolean:
+            if key == "-d":
+                detached = True
             i += 1; continue
         if key in value:
             v, i = take(a, i)
@@ -104,6 +107,12 @@ if a[:1] == ["run"]:
         image = arg; cmd = a[i+1:]; break
     if not name:
         name = "fake-%d" % len(d["containers"])
+    if name in d.get("fail_run", []):
+        # Scripted launch failure: nothing is created.
+        d["action_log"].append(["run-failed", name])
+        save(d)
+        print("failed to start " + name + " (scripted)", file=sys.stderr)
+        raise SystemExit(1)
     if not networks:
         networks = ["default"]
     status_networks = []
@@ -124,10 +133,18 @@ if a[:1] == ["run"]:
                           "image": {"reference": image or ""}},
         "status": {"state": "running", "networks": status_networks},
     }
+    if name in d.get("exit_after_run", []):
+        d["containers"][name]["status"] = {"state": "stopped", "networks": []}
+    d["action_log"].append(["run", name])
+    if not detached:
+        # Foreground run: the container runs to completion; its exit code is
+        # the scripted one (exit_codes: {container: code}), default 0.
+        d["containers"][name]["status"] = {"state": "stopped", "networks": []}
+        save(d); raise SystemExit(d.get("exit_codes", {}).get(name, 0))
     save(d); print(name); raise SystemExit(0)
 
 if a[:2] == ["image", "inspect"]:
-    print(json.dumps([{"configuration": {"name": a[-1]}, "variants": [
+    print(json.dumps([{"id": "fakeid-" + a[-1], "configuration": {"name": a[-1]}, "variants": [
         {"platform": {"os": "linux", "architecture": "arm64"},
          "config": {"config": {"Entrypoint": ["/entry"], "Cmd": ["serve"]}}}]}]))
     raise SystemExit(0)
@@ -178,7 +195,16 @@ if a[:1] == ["exec"]:
         print("no such executable: sh", file=sys.stderr); raise SystemExit(1)
     d["exec_log"].append({"container": ident, "cmd": cmd})
     d["action_log"].append(["exec", ident, *cmd])
-    save(d); raise SystemExit(0)
+    # exec_script: {container: [return codes]}; consumed in order, the last
+    # one repeats. Containers without a script always succeed.
+    script = d.get("exec_script", {}).get(ident)
+    rc = 0
+    if script:
+        rc = script.pop(0) if len(script) > 1 else script[0]
+    save(d)
+    if rc:
+        print("check failed (scripted)", file=sys.stderr)
+    raise SystemExit(rc)
 
 if a[:1] in (["cp"], ["copy"]):
     d = load(); src, dst = a[1], a[2]
@@ -494,6 +520,46 @@ class ComposeE2ETests(unittest.TestCase):
         state["action_log"] = []
         self.state.write_text(json.dumps(state))
 
+    def script_run_failure(self, container: str, fail: bool = True) -> None:
+        """Make `container run` for `container` fail (or stop failing)."""
+        if not self.state.exists():
+            self._seed_state()
+        state = self.load_state()
+        names = [n for n in state.get("fail_run", []) if n != container]
+        if fail:
+            names.append(container)
+        state["fail_run"] = names
+        self.state.write_text(json.dumps(state))
+
+    def script_exit(self, container: str, code: int) -> None:
+        """Make a foreground `run` of `container` exit with `code`."""
+        if not self.state.exists():
+            self._seed_state()
+        state = self.load_state()
+        state.setdefault("exit_codes", {})[container] = code
+        self.state.write_text(json.dumps(state))
+
+    def script_exec(self, container: str, codes: list[int]) -> None:
+        """Make the fake `exec` return `codes` for `container` (last one repeats)."""
+        if not self.state.exists():
+            self._seed_state()
+        state = self.load_state()
+        state.setdefault("exec_script", {})[container] = list(codes)
+        self.state.write_text(json.dumps(state))
+
+    def script_early_exit(self, container: str) -> None:
+        """Make a detached `run` of `container` be stored already stopped."""
+        if not self.state.exists():
+            self._seed_state()
+        state = self.load_state()
+        state.setdefault("exit_after_run", []).append(container)
+        self.state.write_text(json.dumps(state))
+
+    def assert_sha256(self, value: str) -> None:
+        """A config-hash label must be a 64-char lowercase hex digest."""
+        self.assertEqual(len(value), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in value))
+
     def test_up_creates_labeled_containers_and_network(self) -> None:
         self.write_compose(
             """
@@ -562,6 +628,58 @@ class ComposeE2ETests(unittest.TestCase):
             script = " ".join(entry["cmd"])
             self.assertIn("192.168.65.1 host.docker.internal gateway.docker.internal", script)
             self.assertIn("grep -vE", script)  # replace semantics: strip managed names first
+
+    def test_up_injects_db_address_into_api_hosts_and_replaces_it_on_second_run(self) -> None:
+        # api depends_on db: db's *current* address must land in api's
+        # /etc/hosts on every run, exactly once — a re-run that changes the
+        # address replaces the stale line instead of duplicating it.
+        self.write_compose(
+            """
+            services:
+              api:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        def db_address(state: dict) -> str:
+            return (
+                state["containers"]["demo-db-1"]["status"]["networks"][0]["ipv4Address"]
+                .split("/")[0]
+            )
+
+        def last_api_hosts_script(state: dict) -> str:
+            entries = [e for e in state["exec_log"] if e["container"] == "demo-api-1"]
+            self.assertTrue(entries)
+            cmd = entries[-1]["cmd"]
+            self.assertEqual(cmd[:2], ["sh", "-c"])
+            return cmd[2]
+
+        state = self.load_state()
+        first_ip = db_address(state)
+        script = last_api_hosts_script(state)
+        self.assertIn("/etc/hosts", script)
+        self.assertIn(f"{first_ip} db", script)
+
+        # The runtime hands db a new address, then run `up` again: the shim
+        # may or may not recreate the containers, but the /etc/hosts rewrite
+        # api receives must carry db's current address exactly once, and must
+        # not keep the old address as ` db`.
+        self._move_container_address("demo-db-1", "192.168.65.210")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        current_ip = db_address(state)
+        script = last_api_hosts_script(state)
+        self.assertIn("/etc/hosts", script)
+        self.assertIn(f"{current_ip} db", script)
+        self.assertEqual(script.count(f"{current_ip} db"), 1)
+        self.assertNotEqual(current_ip, first_ip)
+        self.assertNotIn(f"{first_ip} db", script)
 
     def test_single_service_still_gets_host_gateway(self) -> None:
         # A lone service has no peers to resolve, but must still get
@@ -768,6 +886,69 @@ class ComposeE2ETests(unittest.TestCase):
         # And the shelled peer still got plain exec injection.
         self.assertTrue(any(e["container"] == "demo-app-1" for e in state["exec_log"]))
 
+    def _move_container_address(self, container: str, new_ip: str) -> None:
+        """Pretend the runtime gave `container` a new address after a restart."""
+        state = self.load_state()
+        net = state["containers"][container]["status"]["networks"][0]
+        net["ipv4Address"] = f"{new_ip}/24"
+        self.state.write_text(json.dumps(state))
+
+    def test_restart_refreshes_peer_hosts_with_the_new_database_address(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        old_ip = self.load_state()["containers"]["demo-db-1"]["status"]["networks"][0]["ipv4Address"].split("/")[0]
+        new_ip = "192.168.65.200"
+        self.assertNotEqual(old_ip, new_ip)
+        self._move_container_address("demo-db-1", new_ip)
+        for command in (("compose", "restart", "db"), ("restart", "demo-db-1")):
+            with self.subTest(command=command):
+                self._move_container_address("demo-db-1", new_ip)
+                state = self.load_state()
+                state["exec_log"] = []
+                self.state.write_text(json.dumps(state))
+                result = self.docker(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                writes = [
+                    " ".join(e["cmd"])
+                    for e in self.load_state()["exec_log"]
+                    if e["container"] == "demo-api-1" and "/etc/hosts" in " ".join(e["cmd"])
+                ]
+                self.assertTrue(writes, "api hosts were not refreshed after the restart")
+                self.assertIn(f"{new_ip} db", writes[-1])
+                self.assertNotIn(f"{old_ip} db", writes[-1])
+
+    def test_restart_refreshes_a_shell_less_peer_through_cp(self) -> None:
+        self.write_compose(
+            """
+            services:
+              edge:
+                image: distroless/edge:latest
+                x-shim-boot-hosts: false
+                depends_on: [app]
+              app:
+                image: nginx:latest
+            """
+        )
+        self.env["FAKE_NO_SHELL"] = "demo-edge-1"
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        new_ip = "192.168.65.201"
+        self._move_container_address("demo-app-1", new_ip)
+        result = self.docker("compose", "restart", "app")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("could not write /etc/hosts", result.stderr)
+        hosts = self.load_state()["containers"]["demo-edge-1"]["files"]["/etc/hosts"]
+        self.assertIn(f"{new_ip} app", hosts)
+        self.assertEqual(hosts.count(" app"), 1)
+
     def test_boot_hosts_wrapper_can_be_opted_out(self) -> None:
         self.write_compose(
             """
@@ -843,6 +1024,151 @@ class ComposeE2ETests(unittest.TestCase):
         self.docker("compose", "down", "-v")
         state = self.load_state()
         self.assertNotIn("demo_data", state["volumes"])
+
+    def test_up_recreate_keeps_named_volumes_and_never_removes(self) -> None:
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                environment:
+                  MODE: one
+                volumes:
+                  - data:/data
+            volumes:
+              data: {}
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        state = self.load_state()
+        before = set(state["volumes"])
+        self.assertIn("demo_data", before)
+        # Change the environment so the shim must recreate the service.
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                environment:
+                  MODE: two
+                volumes:
+                  - data:/data
+            volumes:
+              data: {}
+            """
+        )
+        self.clear_action_log()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertIn(["rm", "demo-db-1"], actions)
+        self.assertLess(
+            actions.index(["rm", "demo-db-1"]),
+            actions.index(["run", "demo-db-1"]),
+        )
+        # The named volume created by the first `up` must survive the
+        # recreation exactly: nothing removed, nothing duplicated.
+        state = self.load_state()
+        self.assertEqual(set(state["volumes"]), before)
+        self.assertIn("demo_data", state["volumes"])
+        for entry in actions:
+            self.assertNotEqual(entry[0], "volume", entry)
+
+    # -- Volume safety on `down` (external / foreign volumes survive) ------ #
+
+    def _write_demo_compose(self) -> None:
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                volumes:
+                  - data:/var/lib/postgresql/data
+                  - shared:/shared
+            volumes:
+              data: {}
+              shared:
+                external: true
+            """
+        )
+
+    def _seed_demo_volumes(self) -> None:
+        # `shared` is external: it pre-exists with no project label. `other`
+        # owns `other_data`. A `demo` down must never touch either.
+        self._seed_state()
+        state = self.load_state()
+        state["volumes"]["shared"] = {
+            "configuration": {"name": "shared", "labels": {}},
+            "id": "shared",
+        }
+        state["volumes"]["other_data"] = {
+            "configuration": {
+                "name": "other_data",
+                "labels": {"com.docker.compose.project": "other"},
+            },
+            "id": "other_data",
+        }
+        self.state.write_text(json.dumps(state))
+
+    def test_down_without_v_keeps_all_volumes(self) -> None:
+        self._write_demo_compose()
+        self._seed_demo_volumes()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        state = self.load_state()
+        self.assertIn("demo-db-1", state["containers"])
+        before = set(state["volumes"])
+        self.assertEqual(before, {"demo_data", "demo_shared", "shared", "other_data"})
+        down = self.docker("compose", "down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        state = self.load_state()
+        self.assertNotIn("demo-db-1", state["containers"])
+        self.assertIn("demo_data", state["volumes"])
+        self.assertIn("shared", state["volumes"])
+        self.assertIn("other_data", state["volumes"])
+        self.assertEqual(set(state["volumes"]), before)  # no volume removed
+
+    def test_down_v_removes_only_project_labeled_volumes(self) -> None:
+        self._write_demo_compose()
+        self._seed_demo_volumes()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        state = self.load_state()
+        labeled = {
+            name
+            for name, vol in state["volumes"].items()
+            if (vol["configuration"].get("labels") or {}).get(
+                "com.docker.compose.project"
+            )
+            == "demo"
+        }
+        self.assertEqual(labeled, {"demo_data", "demo_shared"})
+        down = self.docker("compose", "down", "-v")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        state = self.load_state()
+        self.assertNotIn("demo_data", state["volumes"])
+        self.assertNotIn("demo_shared", state["volumes"])
+        self.assertIn("shared", state["volumes"])  # external: no project label
+        self.assertIn("other_data", state["volumes"])  # another project
+        for name, vol in state["volumes"].items():
+            self.assertNotEqual(
+                (vol["configuration"].get("labels") or {}).get(
+                    "com.docker.compose.project"
+                ),
+                "demo",
+                f"volume {name} is still labelled for project demo",
+            )
+
+    def test_down_v_without_up_keeps_foreign_volumes(self) -> None:
+        self._write_demo_compose()
+        self._seed_demo_volumes()
+        down = self.docker("compose", "down", "-v")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        state = self.load_state()
+        self.assertNotIn("demo-db-1", state["containers"])
+        # No `up` ran, so no project volume exists; the set must be untouched.
+        self.assertEqual(set(state["volumes"]), {"shared", "other_data"})
 
     def test_up_is_idempotent(self) -> None:
         self.write_compose(
@@ -1064,13 +1390,19 @@ class ComposeE2ETests(unittest.TestCase):
                     aliases: [frontend]
               db:
                 image: postgres:16
+                healthcheck:
+                  test: ["CMD", "true"]
             """
         )
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("deploy.replicas", result.stderr)
         self.assertIn("network aliases ignored", result.stderr)
-        self.assertIn("depends_on conditions ignored", result.stderr)
+        # conditions are enforced, not ignored: `web` waits for `db` to be
+        # healthy (the fake exec passes, so the wait resolves at once), and
+        # the gated healthcheck of `db` triggers no ungated-check warning.
+        self.assertNotIn("depends_on conditions ignored", result.stderr)
+        self.assertNotIn("healthcheck", result.stderr)
         self.assertEqual(
             set(self.load_state()["containers"]),
             {"demo-web-1", "demo-db-1"},
@@ -1256,6 +1588,1123 @@ class ComposeE2ETests(unittest.TestCase):
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("demo-web-1", self.load_state()["containers"])
+
+    # -- depends_on service_healthy validation (all-or-nothing) -------------- #
+
+    def test_up_refuses_service_healthy_without_healthcheck(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("web", result.stderr)
+        self.assertIn("db", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        actions = [entry[0] for entry in state["action_log"]]
+        self.assertNotIn("run", actions)
+        self.assertNotIn("create", actions)
+
+    def test_up_refuses_service_healthy_with_disabled_healthcheck(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  disable: true
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("web", result.stderr)
+        self.assertIn("db", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        actions = [entry[0] for entry in state["action_log"]]
+        self.assertNotIn("run", actions)
+        self.assertNotIn("create", actions)
+
+    def test_up_refuses_service_healthy_with_none_healthcheck(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["NONE"]
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("web", result.stderr)
+        self.assertIn("db", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        actions = [entry[0] for entry in state["action_log"]]
+        self.assertNotIn("run", actions)
+        self.assertNotIn("create", actions)
+
+    def test_up_refuses_invalid_healthcheck_before_creating_containers(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: abc
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("invalid healthcheck", result.stderr)
+        self.assertIn("web", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        actions = [entry[0] for entry in state["action_log"]]
+        self.assertNotIn("run", actions)
+        self.assertNotIn("create", actions)
+
+    def test_service_healthy_with_enabled_healthcheck_passes_validation(self) -> None:
+        # The waiting logic is not implemented yet, so `up` is not exercised
+        # here — only the validation guard, which must accept a dependency
+        # that has an enabled healthcheck.
+        project = compose.Project(
+            "demo",
+            compose.parse_yaml(
+                textwrap.dedent(
+                    """
+                    services:
+                      web:
+                        image: nginx:latest
+                        depends_on:
+                          db:
+                            condition: service_healthy
+                      db:
+                        image: postgres:16
+                        healthcheck:
+                          test: ["CMD", "true"]
+                    """
+                )
+            ),
+            str(self.project),
+        )
+        compose._validate_dependencies(project.topo_sorted())  # must not raise
+
+    # -- depends_on service_healthy waiting (end-to-end) ------------------------ #
+
+    def test_up_waits_for_service_healthy_then_starts_dependent(self) -> None:
+        # retries must tolerate two consecutive failures so that the third,
+        # passing check is reached before `up` gives up on `db`.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 0.05
+                  timeout: 5
+                  retries: 3
+            """
+        )
+        self.script_exec("demo-db-1", [1, 1, 0])
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("demo-db-1 is healthy", result.stdout)
+        state = self.load_state()
+        self.assertIn("demo-db-1", state["containers"])
+        self.assertIn("demo-web-1", state["containers"])
+        pg_execs = [
+            entry
+            for entry in state["action_log"]
+            if entry == ["exec", "demo-db-1", "pg_isready"]
+        ]
+        self.assertEqual(len(pg_execs), 3)
+        log = state["action_log"]
+        self.assertGreater(
+            log.index(["run", "demo-web-1"]),
+            max(i for i, entry in enumerate(log) if entry == ["exec", "demo-db-1", "pg_isready"]),
+        )
+
+    def test_up_fails_when_dependency_never_becomes_healthy(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 0.05
+                  timeout: 5
+                  retries: 2
+            """
+        )
+        self.script_exec("demo-db-1", [1])  # the last code repeats: never passes
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("demo-db-1", result.stderr)
+        self.assertIn("became unhealthy", result.stderr)
+        self.assertIn("last log lines", result.stderr)
+        state = self.load_state()
+        self.assertIn("demo-db-1", state["containers"])
+        self.assertNotIn("demo-web-1", state["containers"])
+
+    def test_up_wait_timeout_bounds_service_healthy_wait(self) -> None:
+        # A slow healthcheck (30s interval, 50 retries) must still be cut
+        # off by --wait-timeout: the wait sleeps at most to the deadline.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 30
+                  timeout: 5
+                  retries: 50
+            """
+        )
+        self.script_exec("demo-db-1", [1])  # never passes
+        result = self.docker("compose", "up", "-d", "--wait-timeout", "1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("did not become healthy", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    # -- depends_on service_completed_successfully (end-to-end) ---------------- #
+
+    def test_up_runs_completed_successfully_dependency_in_foreground(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  migrate:
+                    condition: service_completed_successfully
+              migrate:
+                image: busybox
+                command: ["true"]
+            """
+        )
+        self.script_exit("demo-migrate-1", 0)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("demo-migrate-1 exited with code 0", result.stdout)
+        state = self.load_state()
+        self.assertIn("demo-migrate-1", state["containers"])
+        self.assertIn("demo-web-1", state["containers"])
+        self.assertEqual(
+            state["containers"]["demo-migrate-1"]["status"]["state"], "stopped"
+        )
+        self.assertEqual(
+            state["containers"]["demo-web-1"]["status"]["state"], "running"
+        )
+        log = state["action_log"]
+        self.assertGreater(
+            log.index(["run", "demo-web-1"]), log.index(["run", "demo-migrate-1"])
+        )
+
+    def test_up_fails_when_completed_successfully_dependency_exits_nonzero(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  migrate:
+                    condition: service_completed_successfully
+              migrate:
+                image: busybox
+                command: ["true"]
+            """
+        )
+        self.script_exit("demo-migrate-1", 3)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("demo-migrate-1", result.stderr)
+        self.assertIn("exited with code 3", result.stderr)
+        self.assertIn("last log lines", result.stderr)
+        state = self.load_state()
+        self.assertIn("demo-migrate-1", state["containers"])
+        self.assertNotIn("demo-web-1", state["containers"])
+
+    # -- up --wait (end-to-end) ------------------------------------------------- #
+
+    def test_up_wait_returns_when_services_healthy(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 0.05
+                  timeout: 5
+                  retries: 3
+            """
+        )
+        self.script_exec("demo-db-1", [1, 0])  # fails once, then passes
+        result = self.docker("compose", "up", "--wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("demo-db-1 is healthy", result.stdout)
+        self.assertNotIn("LOGS", result.stdout)  # --wait implies detach: no log streaming
+        state = self.load_state()
+        for name in ("demo-db-1", "demo-web-1"):
+            self.assertEqual(
+                state["containers"][name]["status"]["state"], "running", name
+            )
+
+    def test_up_wait_fails_when_dependency_never_becomes_healthy(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 0.05
+                  timeout: 5
+                  retries: 2
+            """
+        )
+        self.script_exec("demo-db-1", [1])  # the last code repeats: never passes
+        result = self.docker("compose", "up", "--wait")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("demo-db-1", result.stderr)
+        self.assertIn("became unhealthy", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_wait_timeout_cuts_off_slow_healthy_wait(self) -> None:
+        # A slow healthcheck (30s interval, 50 retries) must still be cut
+        # off by --wait-timeout: `up --wait` gives up at the deadline.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 30
+                  timeout: 5
+                  retries: 50
+            """
+        )
+        self.script_exec("demo-db-1", [1])  # never passes
+        result = self.docker("compose", "up", "--wait", "--wait-timeout", "1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("did not become healthy", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_wait_fails_when_service_exited_early(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.script_early_exit("demo-web-1")
+        result = self.docker("compose", "up", "--wait")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("demo-web-1", result.stderr)
+        self.assertIn("is not running", result.stderr)
+        state = self.load_state()
+        self.assertEqual(
+            state["containers"]["demo-web-1"]["status"]["state"], "stopped"
+        )
+
+    def test_up_detach_does_not_wait_for_early_exit(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.script_early_exit("demo-web-1")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        self.assertEqual(
+            state["containers"]["demo-web-1"]["status"]["state"], "stopped"
+        )
+
+    # -- Ungated healthcheck warnings ----------------------------------------- #
+
+    _UNGATED_WARNING = (
+        "only evaluated to gate depends_on service_healthy or 'up --wait'"
+    )
+
+    def test_up_detach_warns_ungated_healthcheck_once(self) -> None:
+        # A declared healthcheck that nothing here gates on is never
+        # evaluated by `up -d`, and the shim must say so exactly once.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: 0.05
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count(self._UNGATED_WARNING), 1, result.stderr)
+
+    def test_up_wait_suppresses_ungated_healthcheck_warning(self) -> None:
+        # `up --wait` evaluates the same healthcheck itself, so the warning
+        # must not fire for it.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                healthcheck:
+                  test: ["CMD", "true"]
+                  interval: 0.05
+            """
+        )
+        result = self.docker("compose", "up", "--wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(self._UNGATED_WARNING, result.stderr)
+
+    def test_disabled_healthcheck_does_not_warn(self) -> None:
+        # Both disabled spellings are never evaluated at all, so neither
+        # triggers the ungated-check warning.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                healthcheck:
+                  disable: true
+                  test: ["CMD", "true"]
+              cache:
+                image: redis:7
+                healthcheck:
+                  test: ["NONE"]
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(self._UNGATED_WARNING, result.stderr)
+        self.assertNotIn("healthcheck", result.stderr)
+
+    def test_up_writes_config_hash_and_image_labels(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+              db:
+                image: postgres:16
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        web = state["containers"]["demo-web-1"]["labels"]
+        self.assertEqual(web["com.docker.compose.image"], "fakeid-nginx:latest")
+        self.assert_sha256(web["com.docker.compose.config-hash"])
+        db = state["containers"]["demo-db-1"]["labels"]
+        self.assertEqual(db["com.docker.compose.image"], "fakeid-postgres:16")
+        self.assert_sha256(db["com.docker.compose.config-hash"])
+        self.assertNotEqual(
+            web["com.docker.compose.config-hash"],
+            db["com.docker.compose.config-hash"],
+        )
+
+    def test_up_config_hash_tracks_spec_changes(self) -> None:
+        original = (
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.write_compose(original)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        first = self.load_state()["containers"]["demo-web-1"]["labels"][
+            "com.docker.compose.config-hash"
+        ]
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                environment:
+                  FOO: bar
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        changed = self.load_state()["containers"]["demo-web-1"]["labels"][
+            "com.docker.compose.config-hash"
+        ]
+        self.assertNotEqual(first, changed)
+        # Rewriting the file back to the original reproduces the first hash.
+        self.write_compose(original)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        restored = self.load_state()["containers"]["demo-web-1"]["labels"][
+            "com.docker.compose.config-hash"
+        ]
+        self.assertEqual(first, restored)
+
+    def test_up_config_hash_ignores_depends_on(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        first = self.load_state()["containers"]["demo-web-1"]["labels"][
+            "com.docker.compose.config-hash"
+        ]
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [cache]
+              cache:
+                image: redis:7
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        state = self.load_state()
+        self.assertEqual(
+            state["containers"]["demo-web-1"]["labels"][
+                "com.docker.compose.config-hash"
+            ],
+            first,
+        )
+
+    # -- up -d per-service reconciliation ----------------------------------- #
+
+    _RECONCILE_COMPOSE = """
+    services:
+      web:
+        image: nginx:latest
+        environment:
+          FOO: one
+        depends_on: [db]
+      db:
+        image: postgres:16
+    """
+
+    def test_up_leaves_unchanged_running_containers_alone(self) -> None:
+        self.write_compose(self._RECONCILE_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        verbs = {entry[0] for entry in actions}
+        self.assertFalse(verbs & {"run", "rm", "stop", "start"}, actions)
+        self.assertIn("demo-web-1 is up to date", result.stdout)
+        self.assertIn("demo-db-1 is up to date", result.stdout)
+
+    def test_up_starts_stopped_container_without_recreating(self) -> None:
+        self.write_compose(self._RECONCILE_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.assertEqual(self.docker("stop", "demo-db-1").returncode, 0)
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertIn(["start", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        # web depends on db, but db was only started, not recreated.
+        self.assertNotIn(["rm", "demo-web-1"], actions)
+        state = self.load_state()
+        self.assertEqual(state["containers"]["demo-db-1"]["status"]["state"], "running")
+
+    def test_up_recreates_only_the_changed_service(self) -> None:
+        self.write_compose(self._RECONCILE_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.clear_action_log()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                environment:
+                  FOO: two
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertLess(
+            actions.index(["rm", "demo-web-1"]),
+            actions.index(["run", "demo-web-1"]),
+        )
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+        self.assertIn("Recreating demo-web-1 (configuration changed)", result.stdout)
+
+    def test_up_recreates_dependent_services_when_a_dependency_changes(self) -> None:
+        self.write_compose(self._RECONCILE_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.clear_action_log()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                environment:
+                  FOO: one
+                depends_on: [db]
+              db:
+                image: postgres:17
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertLess(
+            actions.index(["rm", "demo-db-1"]),
+            actions.index(["rm", "demo-web-1"]),
+        )
+        self.assertLess(
+            actions.index(["run", "demo-db-1"]),
+            actions.index(["run", "demo-web-1"]),
+        )
+        self.assertIn("Recreating demo-db-1", result.stdout)
+        self.assertIn("Recreating demo-web-1 (a dependency was recreated)", result.stdout)
+
+    def test_up_recreates_container_missing_config_hash_label(self) -> None:
+        self.write_compose(self._RECONCILE_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.clear_action_log()
+        state = self.load_state()
+        for labels in (
+            state["containers"]["demo-web-1"]["labels"],
+            state["containers"]["demo-web-1"]["configuration"]["labels"],
+        ):
+            labels.pop("com.docker.compose.config-hash", None)
+        self.state.write_text(json.dumps(state))
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertLess(
+            actions.index(["rm", "demo-web-1"]),
+            actions.index(["run", "demo-web-1"]),
+        )
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+        self.assertIn(
+            "Recreating demo-web-1 (created without a configuration label)",
+            result.stdout,
+        )
+
+    # -- up -d flags: --force-recreate, --no-recreate, --remove-orphans ----- #
+
+    _UP_FLAG_COMPOSE = """
+    services:
+      web:
+        image: nginx:latest
+      db:
+        image: postgres:16
+    """
+
+    def test_up_force_recreate_recreates_unchanged_containers(self) -> None:
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d", "--force-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertLess(
+            actions.index(["rm", "demo-web-1"]),
+            actions.index(["run", "demo-web-1"]),
+        )
+        self.assertLess(
+            actions.index(["rm", "demo-db-1"]),
+            actions.index(["run", "demo-db-1"]),
+        )
+        self.assertIn("Recreating demo-web-1 (forced)", result.stdout)
+        self.assertIn("Recreating demo-db-1 (forced)", result.stdout)
+
+    def test_up_no_recreate_leaves_changed_containers_alone(self) -> None:
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                environment:
+                  FOO: x
+              db:
+                image: postgres:16
+            """
+        )
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d", "--no-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        for entry in actions:
+            self.assertNotIn(entry[0], {"rm", "run"}, actions)
+        self.assertNotIn("Recreating", result.stdout)
+        # Control: a plain `up -d` recreates the changed service.
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertLess(
+            actions.index(["rm", "demo-web-1"]),
+            actions.index(["run", "demo-web-1"]),
+        )
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+
+    def test_up_no_recreate_creates_missing_containers(self) -> None:
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.assertEqual(self.docker("rm", "-f", "demo-web-1").returncode, 0)
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d", "--no-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertIn(["run", "demo-web-1"], actions)
+        self.assertNotIn(["rm", "demo-web-1"], actions)
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+
+    def test_up_rejects_force_recreate_with_no_recreate(self) -> None:
+        self._seed_state()
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        result = self.docker(
+            "compose", "up", "-d", "--force-recreate", "--no-recreate"
+        )
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("incompatible", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertEqual(state["action_log"], [])
+
+    def test_up_warns_about_orphan_containers(self) -> None:
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("found orphan containers", result.stderr)
+        self.assertIn("demo-db-1", result.stderr)
+        self.assertIn("--remove-orphans", result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertIn("demo-db-1", self.load_state()["containers"])
+
+    def test_up_remove_orphans_removes_orphan_containers(self) -> None:
+        self.write_compose(self._UP_FLAG_COMPOSE)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d", "--remove-orphans")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["rm", "demo-web-1"], actions)
+        self.assertNotIn(["run", "demo-web-1"], actions)
+        state = self.load_state()
+        self.assertNotIn("demo-db-1", state["containers"])
+        self.assertIn("demo-web-1", state["containers"])
+        self.assertIn("Removing orphan containers: demo-db-1", result.stdout)
+
+    def test_up_partial_failure_keeps_started_services_and_recovers(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        self.script_run_failure("demo-web-1")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("service 'web' failed to start", result.stderr)
+        state = self.load_state()
+        self.assertIn("demo-db-1", state["containers"])
+        self.assertEqual(state["containers"]["demo-db-1"]["status"]["state"], "running")
+        self.assertNotIn("demo-web-1", state["containers"])
+        self.assertNotIn(["rm", "demo-db-1"], state["action_log"])
+        # Recovery: the next up only starts the missing service.
+        self.script_run_failure("demo-web-1", fail=False)
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertIn(["run", "demo-web-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertIn("demo-db-1 is up to date", result.stdout)
+        state = self.load_state()
+        self.assertEqual(state["containers"]["demo-db-1"]["status"]["state"], "running")
+        self.assertEqual(state["containers"]["demo-web-1"]["status"]["state"], "running")
+
+    def test_up_failed_recreate_leaves_other_services_alone(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                environment:
+                  FOO: x
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        self.script_run_failure("demo-web-1")
+        self.clear_action_log()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("service 'web' failed to start", result.stderr)
+        actions = self.load_state()["action_log"]
+        self.assertNotIn(["rm", "demo-db-1"], actions)
+        self.assertNotIn(["run", "demo-db-1"], actions)
+        self.assertNotIn(["stop", "demo-db-1"], actions)
+        state = self.load_state()
+        self.assertEqual(state["containers"]["demo-db-1"]["status"]["state"], "running")
+
+
+class DependsConditionTests(unittest.TestCase):
+    def project(self, body: str) -> compose.Project:
+        return compose.Project("p", compose.parse_yaml(textwrap.dedent(body)), "/tmp/p")
+
+    def test_list_form_defaults_to_service_started(self) -> None:
+        proj = self.project(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+            """
+        )
+        web = proj.services["web"]
+        self.assertEqual(web.depends_conditions, {"db": "service_started"})
+        self.assertEqual(web.depends_on, ["db"])
+
+    def test_map_form_records_each_condition_and_keeps_order(self) -> None:
+        proj = self.project(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy
+                  cache:
+                    condition: service_started
+                  job:
+                    condition: service_completed_successfully
+              db:
+                image: postgres:16
+              cache:
+                image: redis:7
+              job:
+                image: busybox
+            """
+        )
+        web = proj.services["web"]
+        self.assertEqual(
+            web.depends_conditions,
+            {
+                "db": "service_healthy",
+                "cache": "service_started",
+                "job": "service_completed_successfully",
+            },
+        )
+        self.assertEqual(web.depends_on, ["db", "cache", "job"])
+
+    def test_map_form_empty_value_defaults_to_service_started(self) -> None:
+        proj = self.project(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db: {}
+              db:
+                image: postgres:16
+            """
+        )
+        self.assertEqual(
+            proj.services["web"].depends_conditions, {"db": "service_started"}
+        )
+
+        proj = self.project(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+              db:
+                image: postgres:16
+            """
+        )
+        self.assertEqual(
+            proj.services["web"].depends_conditions, {"db": "service_started"}
+        )
+
+    def test_unknown_condition_raises(self) -> None:
+        doc = compose.parse_yaml(
+            textwrap.dedent(
+                """
+                services:
+                  web:
+                    image: nginx:latest
+                    depends_on:
+                      db:
+                        condition: bogus
+                  db:
+                    image: postgres:16
+                """
+            )
+        )
+        with self.assertRaises(compose.ShimError) as ctx:
+            compose.Project("p", doc, "/tmp/p")
+        self.assertEqual(ctx.exception.code, 64)
+        message = str(ctx.exception)
+        self.assertIn("web", message)
+        self.assertIn("db", message)
+        self.assertIn("bogus", message)
+
+
+class WaitTimeoutFlagTests(unittest.TestCase):
+    def test_accepts_a_positive_number_in_both_forms(self) -> None:
+        self.assertEqual(compose._extract_wait_timeout(["--wait-timeout", "2.5", "web"]), (2.5, ["web"]))
+        self.assertEqual(compose._extract_wait_timeout(["--wait-timeout=7"]), (7.0, []))
+
+    def test_rejects_non_positive_and_non_finite_values(self) -> None:
+        for value in ("0", "-1", "abc", "nan", "inf"):
+            with self.assertRaises(compose.ShimError, msg=value) as ctx:
+                compose._extract_wait_timeout(["--wait-timeout", value])
+            self.assertEqual(ctx.exception.code, 64)
+
+
+class ContainerStateTests(unittest.TestCase):
+    def _inspect(self, state):
+        import json
+        from types import SimpleNamespace
+
+        payload = json.dumps([{"status": {"state": state}}])
+        return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+
+    def test_maps_runtime_states(self) -> None:
+        from unittest import mock
+
+        for runtime_state, expected in (
+            ("running", "running"),
+            ("stopped", "exited"),
+            ("exited", "exited"),
+            ("stopping", "starting"),
+        ):
+            with mock.patch.object(
+                compose, "_run_container_capture", return_value=self._inspect(runtime_state)
+            ):
+                self.assertEqual(compose._container_state("c"), expected, runtime_state)
+
+    def test_missing_container_counts_as_exited(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        gone = SimpleNamespace(returncode=1, stdout="", stderr="no such container")
+        with mock.patch.object(compose, "_run_container_capture", return_value=gone):
+            self.assertEqual(compose._container_state("c"), "exited")
+
+    def test_wait_started_polls_a_starting_container_until_running(self) -> None:
+        from unittest import mock
+
+        states = iter(["starting", "starting", "running"])
+        service = compose.Service("web", {"image": "nginx"})
+        project = compose.Project("demo", {"services": {"web": {"image": "nginx"}}}, "/tmp")
+        with mock.patch.object(compose, "_container_state", side_effect=lambda name: next(states)), \
+                mock.patch.object(compose.time, "sleep"):
+            rc = compose._wait_started_services(project, [service], set(), set(), 5.0)
+        self.assertEqual(rc, 0)
+
+
+class HostsRewriteScriptTests(unittest.TestCase):
+    """The generated hosts rewrite script: idempotent and self-healing.
+
+    Each test runs the script with ``sh -c`` against a temporary file
+    (explicit ``path=``) — the real ``/etc/hosts`` is never touched.
+    """
+
+    LINES = [
+        "192.168.65.3 db",
+        "192.168.65.1 host.docker.internal gateway.docker.internal",
+    ]
+    MANAGED = ["api", "db", "host.docker.internal", "gateway.docker.internal"]
+
+    def _run(self, path: str, lines: list[str]) -> None:
+        script = compose._hosts_rewrite_script(lines, self.MANAGED, path=path)
+        subprocess.run(["sh", "-c", script], check=True, capture_output=True, text=True)
+
+    def _write(self, path: str, content: str) -> None:
+        with open(path, "w") as f:
+            f.write(content)
+
+    def _read(self, path: str) -> str:
+        with open(path) as f:
+            return f.read()
+
+    def test_run_appends_fresh_lines_and_keeps_unmanaged_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hosts")
+            self._write(path, "127.0.0.1 localhost\n")
+            self._run(path, self.LINES)
+            content = self._read(path)
+            self.assertIn("127.0.0.1 localhost", content)
+            self.assertEqual([l for l in content.splitlines() if "db" in l], self.LINES[:1])
+            self.assertEqual(
+                [l for l in content.splitlines() if "host.docker.internal" in l], self.LINES[1:]
+            )
+
+    def test_running_twice_leaves_file_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hosts")
+            self._write(path, "127.0.0.1 localhost\n")
+            self._run(path, self.LINES)
+            first = self._read(path)
+            self._run(path, self.LINES)
+            self.assertEqual(self._read(path), first)
+
+    def test_changed_address_replaces_stale_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hosts")
+            self._write(path, "127.0.0.1 localhost\n")
+            self._run(path, self.LINES)
+            self._run(
+                path,
+                [
+                    "192.168.65.7 db",
+                    "192.168.65.1 host.docker.internal gateway.docker.internal",
+                ],
+            )
+            content = self._read(path)
+            self.assertNotIn("192.168.65.3", content)
+            self.assertIn("127.0.0.1 localhost", content)
+            self.assertEqual([l for l in content.splitlines() if "db" in l], ["192.168.65.7 db"])
+
+    def test_stale_managed_line_removed_unmanaged_line_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hosts")
+            self._write(path, "127.0.0.1 localhost\n192.168.65.9 db\n10.0.0.5 other\n")
+            self._run(path, self.LINES)
+            content = self._read(path)
+            self.assertNotIn("192.168.65.9", content)
+            self.assertIn("10.0.0.5 other", content)
+            self.assertEqual([l for l in content.splitlines() if "db" in l], self.LINES[:1])
+
+    def test_all_lines_managed_still_succeeds_and_writes_fresh_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hosts")
+            self._write(
+                path,
+                "192.168.65.3 db\n192.168.65.1 host.docker.internal gateway.docker.internal\n"
+                "10.1.1.1 api\n",
+            )
+            # grep -v exits 1 when everything is stripped; the script must still succeed.
+            self._run(path, self.LINES)
+            self.assertEqual(
+                self._read(path),
+                "192.168.65.3 db\n192.168.65.1 host.docker.internal gateway.docker.internal\n",
+            )
 
 
 if __name__ == "__main__":

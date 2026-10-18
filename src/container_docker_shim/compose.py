@@ -77,6 +77,8 @@ from .cli import (
     cmd_stop as docker_stop,
 )
 from . import security
+from . import compose_health
+from . import compose_reconcile
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +89,8 @@ LABEL_PROJECT = "com.docker.compose.project"
 LABEL_SERVICE = "com.docker.compose.service"
 LABEL_NUMBER = "com.docker.compose.container-number"
 LABEL_ONEOFF = "com.docker.compose.oneoff"
+LABEL_CONFIG_HASH = compose_reconcile.LABEL_CONFIG_HASH
+LABEL_IMAGE = compose_reconcile.LABEL_IMAGE
 
 SUPPORTED_COMPOSE_FILENAMES = (
     "compose.yaml",
@@ -100,7 +104,6 @@ SUPPORTED_COMPOSE_FILENAMES = (
 # so the user is never misled into thinking they took effect.
 UNSUPPORTED_SERVICE_KEYS = {
     "restart": "restart policies are not supported by Apple container",
-    "healthcheck": "healthchecks are not enforced (depends_on is treated as ordering only)",
     "hostname": "custom hostname is not supported by Apple container",
     "secrets": "secrets are a Swarm feature with no Apple container equivalent",
     "configs": "configs are a Swarm feature with no Apple container equivalent",
@@ -425,6 +428,9 @@ def _as_str(value: Any) -> str:
     return str(value)
 
 
+DEPENDS_CONDITIONS = ("service_started", "service_healthy", "service_completed_successfully")
+
+
 class Service:
     """A normalized compose service."""
 
@@ -432,6 +438,7 @@ class Service:
         self.name = name
         self.spec = spec
         self.depends_on = _parse_depends_on(spec.get("depends_on"))
+        self.depends_conditions: dict[str, str] = _parse_depends_conditions(name, spec.get("depends_on"))
 
     @property
     def container_name(self) -> str | None:
@@ -449,6 +456,37 @@ def _parse_depends_on(value: Any) -> list[str]:
     if isinstance(value, dict):  # map form: {db: {condition: ...}}
         return [str(key) for key in value]
     return []
+
+
+def _parse_depends_conditions(service_name: str, value: Any) -> dict[str, str]:
+    """Map each dependency to its condition, defaulting to `service_started`."""
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        value = [value]
+    if isinstance(value, dict):  # map form: {db: {condition: ...}}
+        entries = list(value.items())
+    elif isinstance(value, list):
+        entries = [(item, None) for item in value]
+    else:
+        return {}
+    allowed = ", ".join(DEPENDS_CONDITIONS[:-1]) + " or " + DEPENDS_CONDITIONS[-1]
+    conditions: dict[str, str] = {}
+    for key, entry in entries:
+        name = str(key)
+        condition = entry.get("condition") if isinstance(entry, dict) else entry
+        if condition in (None, ""):
+            condition = "service_started"
+        else:
+            condition = str(condition)
+        if condition not in DEPENDS_CONDITIONS:
+            raise ShimError(
+                f"compose: service {service_name!r}: depends_on {name!r} "
+                f"has unsupported condition {condition!r} (use {allowed})",
+                64,
+            )
+        conditions[name] = condition
+    return conditions
 
 
 class Project:
@@ -680,6 +718,8 @@ def _build_run_args(
     ensured_volumes: set[str],
     warned: set[str],
     boot_hosts: list[str] | None = None,
+    config_hash: str | None = None,
+    image_id: str | None = None,
 ) -> tuple[list[str], bool]:
     """Translate a service into `container run` args.
 
@@ -699,6 +739,10 @@ def _build_run_args(
     args.extend(["--label", f"{LABEL_SERVICE}={service.name}"])
     args.extend(["--label", f"{LABEL_NUMBER}=1"])
     args.extend(["--label", f"{LABEL_ONEOFF}=False"])
+    if config_hash:
+        args.extend(["--label", f"{LABEL_CONFIG_HASH}={config_hash}"])
+    if image_id:
+        args.extend(["--label", f"{LABEL_IMAGE}={image_id}"])
     user_labels = spec.get("labels")
     if isinstance(user_labels, dict):
         for key, value in user_labels.items():
@@ -879,19 +923,6 @@ def _warn_unsupported(service: Service, warned: set[str]) -> None:
                 "service-name discovery remains available"
             )
             warned.add(aliases_marker)
-    depends_on = service.spec.get("depends_on")
-    condition_marker = f"{service.name}:depends_on.condition"
-    if isinstance(depends_on, dict) and condition_marker not in warned:
-        if any(
-            isinstance(config, dict)
-            and config.get("condition") not in (None, "service_started")
-            for config in depends_on.values()
-        ):
-            _warn(
-                f"service {service.name!r}: depends_on conditions ignored — "
-                "dependency order is preserved without health gating"
-            )
-            warned.add(condition_marker)
 
 
 # Compose keys that map onto the security decision table (security.RULES).
@@ -939,6 +970,194 @@ def _enforce_run_security(services: list[Service]) -> None:
         _warn(message)
     if refuses:
         raise ShimError(refuses[0], 64)
+
+
+def _validate_dependencies(services: list[Service]) -> None:
+    """Reject `service_healthy` depends_on conditions with no usable healthcheck.
+
+    A dependency without an enabled healthcheck would start before it could
+    ever report healthy, so the request is refused (all-or-nothing, like
+    `_enforce_run_security`). Dependencies not defined in the selected set
+    are ignored, matching the rest of the file.
+    """
+    for service in services:
+        try:
+            compose_health.parse_healthcheck(service.spec.get("healthcheck"))
+        except ValueError as exc:
+            raise ShimError(
+                f"compose: service {service.name!r}: invalid healthcheck: {exc}", 64
+            )
+    by_name = {service.name: service for service in services}
+    for service in services:
+        for dep, condition in service.depends_conditions.items():
+            if condition != "service_healthy":
+                continue
+            target = by_name.get(dep)
+            if target is None:
+                continue
+            try:
+                check = compose_health.parse_healthcheck(target.spec.get("healthcheck"))
+            except ValueError as exc:
+                raise ShimError(f"compose: service {dep!r}: invalid healthcheck: {exc}", 64)
+            if check is None or check.disabled:
+                raise ShimError(
+                    f"compose: service {service.name!r} depends_on {dep!r} with "
+                    f"condition service_healthy, but {dep!r} has no enabled healthcheck",
+                    64,
+                )
+
+
+def _warn_ungated_healthchecks(
+    services: list[Service], gated: set[str], wait: bool
+) -> None:
+    """Say so when a healthcheck is declared but nothing here will evaluate it."""
+    if wait:
+        return
+    for service in services:
+        check = compose_health.parse_healthcheck(service.spec.get("healthcheck"))
+        if check is None or check.disabled or service.name in gated:
+            continue
+        _warn(
+            f"service {service.name!r}: 'healthcheck' is only evaluated to gate "
+            "depends_on service_healthy or 'up --wait'; there is no continuous "
+            "monitoring and no restart on failure"
+        )
+
+
+def _container_state(name: str) -> str:
+    """Return ``"running"``, ``"exited"`` or ``"starting"`` (a missing container counts as exited)."""
+    result = _run_container_capture(["inspect", name])
+    if result.returncode != 0:
+        return "exited"
+    import json
+
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError:
+        return "exited"
+    item = data[0] if isinstance(data, list) and len(data) == 1 else None
+    if not isinstance(item, dict):
+        return "exited"
+    state = (item.get("status") or {}).get("state")
+    if state == "running":
+        return "running"
+    if state in ("stopped", "exited", "dead", None, ""):
+        return "exited"
+    return "starting"  # any transitional state: keep waiting
+
+
+def _log_tail(name: str, lines: int = 40) -> str:
+    result = _run_container_capture(["logs", name])
+    return "\n".join((result.stdout or "").rstrip("\n").splitlines()[-lines:])
+
+
+def _exec_with_timeout(timeout: float):
+    """Build an ``exec_fn`` for ``run_check_once`` that enforces the check timeout."""
+    import subprocess
+
+    def run(argv: list[str]) -> Any:
+        try:
+            return _run_container_capture(argv, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                argv, 1, "", f"healthcheck timed out after {timeout:g}s"
+            )
+
+    return run
+
+
+def _check_completed(service: Service, name: str, result: Any) -> int:
+    """Report the outcome of a foreground ``run``; return 0 only for exit code 0."""
+    if result.returncode == 0:
+        print(f"{name} exited with code 0")
+        return 0
+    if _run_container_capture(["inspect", name]).returncode != 0:
+        # The container was never created: this is a launch error, not an exit code.
+        sys.stderr.write(result.stderr or result.stdout)
+        return result.returncode
+    message = [
+        f"compose: service {service.name!r} ({name}) exited with code {result.returncode}"
+    ]
+    logs = _log_tail(name)
+    if logs:
+        message.append("last log lines:\n" + logs)
+    sys.stderr.write("\n".join(message) + "\n")
+    return 1
+
+
+def _wait_started_services(
+    project: Project,
+    started: list[Service],
+    completed: set[str],
+    healthy_waited: set[str],
+    wait_timeout: Optional[float],
+) -> int:
+    """``up --wait``: every started service is running and, with a healthcheck, healthy.
+
+    Services that are ``service_completed_successfully`` dependencies exit by
+    design and are skipped; services already gated on ``service_healthy`` while
+    creating are not waited on twice.
+    """
+    for service in started:
+        if service.name in completed:
+            continue
+        name = service.container_name or f"{project.name}-{service.name}-1"
+        if service.name not in healthy_waited:
+            check = compose_health.parse_healthcheck(service.spec.get("healthcheck"))
+            if check is not None and not check.disabled:
+                rc = _wait_service_healthy(service, name, wait_timeout)
+                if rc != 0:
+                    return rc
+                continue
+        deadline = time.monotonic() + (wait_timeout if wait_timeout is not None else 30.0)
+        state = _container_state(name)
+        while state == "starting" and time.monotonic() < deadline:
+            time.sleep(0.2)
+            state = _container_state(name)
+        if state != "running":
+            reason = "is not running" if state == "exited" else "did not start before the timeout"
+            message = [f"compose: service {service.name!r} ({name}) {reason}"]
+            logs = _log_tail(name)
+            if logs:
+                message.append("last log lines:\n" + logs)
+            sys.stderr.write("\n".join(message) + "\n")
+            return 1
+    return 0
+
+
+def _wait_service_healthy(
+    service: Service, name: str, wait_timeout: Optional[float]
+) -> int:
+    """Block until ``name`` passes its healthcheck; print diagnostics and return 1 otherwise."""
+    check = compose_health.parse_healthcheck(service.spec.get("healthcheck"))
+    if check is None or check.disabled:  # _validate_dependencies refuses this earlier
+        return 0
+    print(f"Waiting for {name} to become healthy ...")
+    exec_fn = _exec_with_timeout(check.timeout)
+    outcome = compose_health.wait_healthy(
+        lambda: compose_health.run_check_once(exec_fn, name, check),
+        check,
+        lambda: _container_state(name),
+        time.monotonic,
+        time.sleep,
+        timeout=wait_timeout,
+    )
+    if outcome.status == "healthy":
+        print(f"{name} is healthy")
+        return 0
+    reason = {
+        "unhealthy": f"became unhealthy after {check.retries} failed checks",
+        "exited": "exited before becoming healthy",
+        "timeout": "did not become healthy before the timeout",
+    }[outcome.status]
+    message = [f"compose: service {service.name!r} ({name}) {reason}"]
+    if outcome.last_output:
+        message.append(f"last check output: {outcome.last_output}")
+    logs = _log_tail(name)
+    if logs:
+        message.append("last log lines:\n" + logs)
+    sys.stderr.write("\n".join(message) + "\n")
+    return 1
 
 
 # ========================================================================== #
@@ -1386,6 +1605,31 @@ def _image_default_argv(image: str, platform_hint: str | None) -> tuple[list[str
     return [_as_str(x) for x in image_entrypoint], [_as_str(x) for x in image_cmd]
 
 
+def _hosts_rewrite_script(lines: list[str], managed: list[str], path: str = "/etc/hosts") -> str:
+    """Shell script that makes ``path`` carry exactly ``lines`` for the managed names.
+
+    Idempotent: every existing line mentioning a managed name is dropped, then
+    the fresh lines are appended, so running it twice (or after an address
+    change) never leaves a duplicate or a stale address. ``grep -v`` exiting 1
+    (nothing left) is fine — the appends still run.
+    """
+    pattern = (
+        "(^|[[:space:]])("
+        + "|".join(re.escape(word) for word in managed)
+        + ")([[:space:]]|$)"
+    )
+    appends = "".join(
+        f"; printf '%s\\n' {shlex.quote(line)} >> \"$tmp\"" for line in lines
+    )
+    quoted_path = shlex.quote(path)
+    return (
+        'tmp="$(mktemp)"; '
+        f'grep -vE {shlex.quote(pattern)} {quoted_path} > "$tmp"'
+        + appends
+        + f'; cat "$tmp" > {quoted_path}; rm -f "$tmp"'
+    )
+
+
 def _inject_etc_hosts(
     project: Project,
     services: list[Service],
@@ -1447,22 +1691,7 @@ def _inject_etc_hosts(
         managed = (
             [svc.name for svc, _name in named] if len(named) >= 2 else []
         ) + _HOST_ALIASES.split()
-        pattern = (
-            "(^|[[:space:]])("
-            + "|".join(re.escape(word) for word in managed)
-            + ")([[:space:]]|$)"
-        )
-        # Rewrite: strip every line mentioning a managed name, append fresh
-        # ones. grep -v exiting 1 (nothing left) is fine — appends still run.
-        appends = "".join(
-            f"; printf '%s\\n' {shlex.quote(line)} >> \"$tmp\"" for line in lines
-        )
-        script = (
-            'tmp="$(mktemp)"; '
-            f'grep -vE {shlex.quote(pattern)} /etc/hosts > "$tmp"'
-            + appends
-            + '; cat "$tmp" > /etc/hosts; rm -f "$tmp"'
-        )
+        script = _hosts_rewrite_script(lines, managed)
         result = _run_container_capture(["exec", name, "sh", "-c", script])
         if result.returncode != 0 and not _cp_hosts_fallback(name, lines, managed):
             _warn(
@@ -1496,7 +1725,127 @@ def _remove_containers(rows: list[dict[str, Any]]) -> int:
     return rc
 
 
-def cmd_up(project: Project, *, detach: bool, build: bool, only: list[str], no_build: bool) -> int:
+def _recreate_reason(
+    row: Optional[dict[str, Any]], wanted_hash: str, wanted_image: str, force: bool
+) -> str:
+    """Why an existing container would be recreated (for the progress line)."""
+    if row is None:
+        return ""
+    if force:
+        return "forced"
+    labels = row.get("labels") or {}
+    if compose_reconcile.LABEL_CONFIG_HASH not in labels:
+        return "created without a configuration label"
+    if labels.get(compose_reconcile.LABEL_IMAGE) != wanted_image:
+        return "image changed"
+    return "configuration changed"
+
+
+def _handle_orphans(
+    project: Project, rows: list[dict[str, Any]], *, remove: bool
+) -> None:
+    """Containers of this project whose service is no longer in the file."""
+    orphans = [
+        row
+        for row in rows
+        if (row.get("labels") or {}).get(LABEL_SERVICE) not in project.services
+    ]
+    if not orphans:
+        return
+    names = ", ".join(str(row.get("name") or row.get("id")) for row in orphans)
+    if remove:
+        print(f"Removing orphan containers: {names}")
+        _remove_containers(orphans)
+    else:
+        _warn(
+            f"found orphan containers for this project ({names}); "
+            "use --remove-orphans to remove them"
+        )
+
+
+def _start_existing(service: Service, name: str, completes: bool) -> int:
+    """Start a stopped container whose configuration is unchanged."""
+    if completes:
+        # A one-shot dependency runs again; `start -a` returns its exit code.
+        print(f"Waiting for {name} to complete ...")
+        return _check_completed(service, name, _run_container_capture(["start", "-a", name]))
+    result = _run_container_capture(["start", name])
+    if result.returncode != 0:
+        sys.stderr.write(f"compose: service {service.name!r} failed to start\n")
+        sys.stderr.write(result.stderr or result.stdout)
+    return result.returncode
+
+
+def _create_service(
+    service: Service,
+    project: Project,
+    *,
+    image: str,
+    image_id: str,
+    config_hash: str,
+    name: str,
+    ensured_volumes: set[str],
+    warned: set[str],
+    nets_by_service: dict[str, list[NetworkAttachment]],
+    completes: bool,
+) -> int:
+    """`container run` for a service; return 0 or the failing exit code."""
+    boot_hosts = _boot_hosts_lines(service, project, nets_by_service)
+    run_args, wrapped = _build_run_args(
+        service,
+        project,
+        image=image,
+        ensured_volumes=ensured_volumes,
+        warned=warned,
+        boot_hosts=boot_hosts,
+        config_hash=config_hash,
+        image_id=image_id,
+    )
+    # A `service_completed_successfully` dependency runs in the foreground:
+    # `container run` returns the container's own exit code (the runtime
+    # does not expose it through `inspect`), which is what the condition needs.
+    if completes:
+        print(f"Waiting for {name} to complete ...")
+        fg_args = run_args[1:] if run_args[:1] == ["-d"] else run_args
+        return _check_completed(service, name, _run_container_capture(["run", *fg_args]))
+    result = _run_container_capture(["run", *run_args])
+    if result.returncode != 0 and wrapped:
+        # Most likely no /bin/sh in the image — relaunch unwrapped and
+        # leave name resolution to post-start injection, as before.
+        _warn(
+            f"service {service.name!r}: boot-time hosts wrapper failed to "
+            "start — retrying without it"
+        )
+        _run_container_capture(["rm", name])
+        run_args, _ = _build_run_args(
+            service,
+            project,
+            image=image,
+            ensured_volumes=ensured_volumes,
+            warned=warned,
+            config_hash=config_hash,
+            image_id=image_id,
+        )
+        result = _run_container_capture(["run", *run_args])
+    if result.returncode != 0:
+        sys.stderr.write(f"compose: service {service.name!r} failed to start\n")
+        sys.stderr.write(result.stderr or result.stdout)
+    return result.returncode
+
+
+def cmd_up(
+    project: Project,
+    *,
+    detach: bool,
+    build: bool,
+    only: list[str],
+    no_build: bool,
+    wait_timeout: Optional[float] = None,
+    wait: bool = False,
+    force_recreate: bool = False,
+    no_recreate: bool = False,
+    remove_orphans: bool = False,
+) -> int:
     services = project.topo_sorted()
     if only:
         wanted = set(only)
@@ -1505,6 +1854,8 @@ def cmd_up(project: Project, *, detach: bool, build: bool, only: list[str], no_b
             return _die(f"compose: no such service(s): {', '.join(only)}", 1)
 
     _enforce_run_security(services)
+    _validate_dependencies(services)
+    detach = detach or wait  # --wait implies --detach
 
     # Provision declared networks (record specs for ensure-on-attach), defaulting
     # to the implicit project network every service joins.
@@ -1521,53 +1872,89 @@ def cmd_up(project: Project, *, detach: bool, build: bool, only: list[str], no_b
     for net in referenced:
         _ensure_network(project.name, net)
 
-    # Idempotent: clear this project's previous containers before recreating.
-    existing = _project_containers(project.name)
-    if only:
-        existing = [r for r in existing if (r.get("labels") or {}).get(LABEL_SERVICE) in set(only)]
-    if existing:
-        _remove_containers(existing)
+    # Reconcile instead of clearing: containers whose configuration and image
+    # are unchanged stay untouched, stopped ones are started, changed ones are
+    # recreated. State lives in the labels written at creation time.
+    existing_rows = _project_containers(project.name)
+    by_service: dict[str, dict[str, Any]] = {}
+    for row in existing_rows:
+        label = (row.get("labels") or {}).get(LABEL_SERVICE)
+        if label and label not in by_service:
+            by_service[str(label)] = row
+    _handle_orphans(project, existing_rows, remove=remove_orphans)
 
     ensured_volumes: set[str] = set()
     warned: set[str] = set()
     started: list[Service] = []
+    recreated: set[str] = set()
     net_info: dict[str, list[NetworkAttachment]] = {}
     nets_by_service: dict[str, list[NetworkAttachment]] = {}
     depended_on = {dep for svc in services for dep in svc.depends_on}
+    needs_healthy = {
+        dep
+        for svc in services
+        for dep, condition in svc.depends_conditions.items()
+        if condition == "service_healthy"
+    }
+    _warn_ungated_healthchecks(services, needs_healthy, wait)
+    needs_completed = {
+        dep
+        for svc in services
+        for dep, condition in svc.depends_conditions.items()
+        if condition == "service_completed_successfully"
+    }
+    healthy_waited: set[str] = set()
+    # Resolve (and build) every image before touching any container, so a
+    # missing image or failed build cannot leave the project half changed.
+    plans: list[tuple[Service, str, str, str]] = []
     for service in services:
         image = _resolve_image(service, project, build=build, no_build=no_build)
-        boot_hosts = _boot_hosts_lines(service, project, nets_by_service)
-        run_args, wrapped = _build_run_args(
-            service,
-            project,
-            image=image,
-            ensured_volumes=ensured_volumes,
-            warned=warned,
-            boot_hosts=boot_hosts,
-        )
+        image_id = _image_id(image)
+        plans.append((service, image, image_id, compose_reconcile.config_hash(service.spec, image_id)))
+    for service, image, image_id, config_hash in plans:
         name = service.container_name or f"{project.name}-{service.name}-1"
-        print(f"Creating {name} ...")
-        result = _run_container_capture(["run", *run_args])
-        if result.returncode != 0 and wrapped:
-            # Most likely no /bin/sh in the image — relaunch unwrapped and
-            # leave name resolution to post-start injection, as before.
-            _warn(
-                f"service {service.name!r}: boot-time hosts wrapper failed to "
-                "start — retrying without it"
-            )
-            _run_container_capture(["rm", name])
-            run_args, _ = _build_run_args(
+        row = by_service.get(service.name)
+        action = compose_reconcile.decide(
+            row, config_hash, image_id, force_recreate, no_recreate
+        )
+        reason = _recreate_reason(row, config_hash, image_id, force_recreate)
+        if action in ("keep", "start") and not no_recreate and recreated & set(service.depends_on):
+            # A dependency got a new container (and address): this one baked
+            # the old address into its boot-time hosts, so it is recreated too.
+            action, reason = "recreate", "a dependency was recreated"
+        completes = service.name in needs_completed
+        if action == "keep":
+            print(f"{name} is up to date")
+        elif action == "start":
+            print(f"Starting {name} ...")
+            rc = _start_existing(service, name, completes)
+            if rc != 0:
+                return rc
+        else:
+            if action == "recreate":
+                print(f"Recreating {name} ({reason}) ...")
+                _remove_containers([row])  # type: ignore[list-item]
+                recreated.add(service.name)
+            else:
+                print(f"Creating {name} ...")
+            rc = _create_service(
                 service,
                 project,
                 image=image,
+                image_id=image_id,
+                config_hash=config_hash,
+                name=name,
                 ensured_volumes=ensured_volumes,
                 warned=warned,
+                nets_by_service=nets_by_service,
+                completes=completes,
             )
-            result = _run_container_capture(["run", *run_args])
-        if result.returncode != 0:
-            sys.stderr.write(result.stderr or result.stdout)
-            return result.returncode
+            if rc != 0:
+                return rc
         started.append(service)
+        if completes:
+            net_info[name] = []
+            continue
         # Learn this container's address now so later dependents can bake it
         # into their boot-time /etc/hosts (retry briefly — the address can lag
         # `run` returning by a beat, and a dependent needs it).
@@ -1581,12 +1968,23 @@ def cmd_up(project: Project, *, detach: bool, build: bool, only: list[str], no_b
         net_info[name] = networks
         if networks:
             nets_by_service[service.name] = networks
+        if service.name in needs_healthy:
+            rc = _wait_service_healthy(service, name, wait_timeout)
+            if rc != 0:
+                return rc
+            healthy_waited.add(service.name)
 
     # Whole project, not just `started`: a partial `up <svc>` must give the
     # fresh container ALL peer names, and rewrite the recreated service's new
     # address into every already-running peer.
     _inject_etc_hosts(project, project.topo_sorted(), net_info)
 
+    if wait:
+        rc = _wait_started_services(
+            project, started, needs_completed, healthy_waited, wait_timeout
+        )
+        if rc != 0:
+            return rc
     if detach:
         return 0
     # Foreground: stream the logs of every started service until interrupted.
@@ -1938,6 +2336,23 @@ def _image_exists(tag: str) -> bool:
     return result.returncode == 0
 
 
+def _image_id(image: str) -> str:
+    """The runtime's ID (digest) of a local image, or ``""`` when not inspectable."""
+    result = _run_container_capture(["image", "inspect", image])
+    if result.returncode != 0:
+        return ""
+    import json
+
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError:
+        return ""
+    item = data[0] if isinstance(data, list) and len(data) == 1 else None
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("id") or "")
+
+
 def _run_build(service: Service, project: Project, tag: str) -> None:
     build = service.spec["build"]
     if isinstance(build, str):
@@ -2150,13 +2565,27 @@ def _dispatch(
             return _sanitize_project_name(os.path.basename(directory.rstrip("/")) or "default")
 
     if sub == "up":
-        opts = _parse_flags(sub_args, bools={"-d", "--detach", "--build", "--no-build"})
+        wait_timeout, up_args = _extract_wait_timeout(sub_args)
+        opts = _parse_flags(
+            up_args,
+            bools={
+                "-d", "--detach", "--build", "--no-build", "--wait",
+                "--force-recreate", "--no-recreate", "--remove-orphans",
+            },
+        )
+        if opts.flag("--force-recreate") and opts.flag("--no-recreate"):
+            raise ShimError("compose: --force-recreate and --no-recreate are incompatible", 64)
         return cmd_up(
             project(),
+            wait=opts.flag("--wait"),
+            force_recreate=opts.flag("--force-recreate"),
+            no_recreate=opts.flag("--no-recreate"),
+            remove_orphans=opts.flag("--remove-orphans"),
             detach=opts.flag("-d") or opts.flag("--detach"),
             build=opts.flag("--build"),
             no_build=opts.flag("--no-build"),
             only=opts.positionals,
+            wait_timeout=wait_timeout,
         )
     if sub == "down":
         opts = _parse_flags(sub_args, bools={"-v", "--volumes"})
@@ -2248,6 +2677,32 @@ class _Flags:
 
     def flag(self, name: str) -> bool:
         return name in self._present
+
+
+def _extract_wait_timeout(argv: list[str]) -> tuple[Optional[float], list[str]]:
+    """Pull ``--wait-timeout <seconds>`` (or ``=``) out of ``argv``."""
+    timeout: Optional[float] = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        raw = argv[i]
+        if raw == "--wait-timeout":
+            value, i = _take(argv, i, raw)
+        elif raw.startswith("--wait-timeout="):
+            value, i = raw.split("=", 1)[1], i + 1
+        else:
+            rest.append(raw)
+            i += 1
+            continue
+        try:
+            timeout = float(value)
+        except ValueError:
+            timeout = -1.0
+        if not (0 < timeout < float("inf")):  # also rejects nan
+            raise ShimError(
+                f"compose: --wait-timeout needs a positive number of seconds, got {value!r}", 64
+            )
+    return timeout, rest
 
 
 def _parse_flags(argv: list[str], *, bools: set[str]) -> _Flags:
