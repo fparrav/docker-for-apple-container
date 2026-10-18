@@ -197,6 +197,10 @@ if args and args[0] == "build":
     raise SystemExit(0)
 
 if args and args[0] == "run":
+    run_error = os.environ.get("FAKE_CONTAINER_RUN_ERROR")
+    if run_error:
+        print(run_error, file=sys.stderr)
+        raise SystemExit(1)
     data = load()
     name = None
     labels = {}
@@ -1246,6 +1250,155 @@ class ContainerResolutionTests(ShimCLITestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("CONTAINER_DOCKER_SHIM_CONTAINER", result.stderr)
         self.assertIn("PATH", result.stderr)
+
+
+class RunSecurityRefusalTests(ShimCLITestCase):
+    def _no_run_or_create_calls(self) -> None:
+        called = [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] in (["run"], ["create"])
+        ]
+        self.assertEqual(called, [], f"shim must not call container: {called}")
+
+    def test_unenforced_options_are_refused(self) -> None:
+        for extra in (
+            ["--security-opt", "no-new-privileges"],
+            ["--pids-limit", "100"],
+            ["--privileged"],
+            ["--storage-opt", "size=1G"],
+        ):
+            with self.subTest(option=extra):
+                result = self.docker("run", *extra, "alpine", "true")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn(extra[0], result.stderr)
+                self._no_run_or_create_calls()
+
+    def test_opt_in_allows_unenforced_run_with_warning(self) -> None:
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "security-opt"
+        result = self.docker("run", "--security-opt", "no-new-privileges", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning:", result.stderr)
+        self.assertIn("--security-opt", result.stderr)
+        runs = [entry for entry in self.container_calls() if entry[:1] == ["run"]]
+        self.assertTrue(runs, "expected a container run call")
+
+    def test_opt_in_does_not_cover_other_options(self) -> None:
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "security-opt"
+        result = self.docker(
+            "run",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "100",
+            "alpine",
+            "true",
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--pids-limit", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_inline_value_form_is_refused(self) -> None:
+        result = self.docker("run", "--pids-limit=100", "alpine", "true")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self._no_run_or_create_calls()
+
+
+class RunTmpfsForwardingTests(ShimCLITestCase):
+    """`run --tmpfs` is forwarded verbatim (including options) to Apple `container run`.
+
+    Docker behavior reference:
+    https://docs.docker.com/reference/cli/docker/container/run/#tmpfs
+    """
+
+    def _run_entries(self) -> list[list[str]]:
+        return [entry for entry in self.container_calls() if entry[:1] == ["run"]]
+
+    def _assert_forwarded_pair(self, option: str, value: str) -> None:
+        runs = self._run_entries()
+        self.assertTrue(runs, "expected a container run call")
+        for entry in runs:
+            pairs = [entry[i : i + 2] for i in range(len(entry) - 1)]
+            self.assertIn(
+                [option, value],
+                pairs,
+                f"expected {option!r} {value!r} forwarded verbatim: {entry!r}",
+            )
+
+    def test_tmpfs_path_is_forwarded(self) -> None:
+        result = self.docker("run", "--tmpfs", "/tmp", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--tmpfs", "/tmp")
+
+    def test_tmpfs_with_options_is_forwarded_verbatim(self) -> None:
+        result = self.docker(
+            "run", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "alpine", "true"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--tmpfs", "/tmp:rw,noexec,nosuid,size=64m")
+
+    def test_tmpfs_inline_value_form_is_forwarded(self) -> None:
+        result = self.docker("run", "--tmpfs=/run:size=1m", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--tmpfs", "/run:size=1m")
+
+    def test_inline_equals_value_forms_are_parsed(self) -> None:
+        result = self.docker(
+            "run", "--memory=1g", "--name=probe", "--tmpfs=/tmp", "alpine", "true"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--name", "probe")
+        self._assert_forwarded_pair("--tmpfs", "/tmp")
+
+
+class RunCapabilityPassthroughTests(ShimCLITestCase):
+    """`run --cap-add` / `--cap-drop` are forwarded verbatim to Apple `container run`.
+
+    Docker behavior reference:
+    https://docs.docker.com/reference/cli/docker/container/run/#cap-add
+    """
+
+    def _run_entries(self) -> list[list[str]]:
+        return [entry for entry in self.container_calls() if entry[:1] == ["run"]]
+
+    def _assert_forwarded_pair(self, option: str, value: str) -> None:
+        runs = self._run_entries()
+        self.assertTrue(runs, "expected a container run call")
+        for entry in runs:
+            pairs = [entry[i : i + 2] for i in range(len(entry) - 1)]
+            self.assertIn(
+                [option, value],
+                pairs,
+                f"expected {option!r} {value!r} forwarded verbatim: {entry!r}",
+            )
+
+    def test_cap_add_name_is_forwarded(self) -> None:
+        result = self.docker("run", "--cap-add", "NET_ADMIN", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--cap-add", "NET_ADMIN")
+
+    def test_cap_add_prefixed_name_is_forwarded(self) -> None:
+        result = self.docker(
+            "run", "--cap-add", "CAP_NET_ADMIN", "alpine", "true"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--cap-add", "CAP_NET_ADMIN")
+
+    def test_cap_drop_all_is_forwarded(self) -> None:
+        result = self.docker("run", "--cap-drop", "ALL", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--cap-drop", "ALL")
+
+    def test_cap_drop_name_is_forwarded(self) -> None:
+        result = self.docker("run", "--cap-drop", "NET_RAW", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_forwarded_pair("--cap-drop", "NET_RAW")
+
+    def test_runtime_capability_rejection_fails_the_command(self) -> None:
+        self.env["FAKE_CONTAINER_RUN_ERROR"] = "invalid CapabilityName 'NOT_A_CAP'"
+        result = self.docker("run", "--cap-add", "NOT_A_CAP", "alpine", "true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid CapabilityName 'NOT_A_CAP'", result.stderr)
 
 
 if __name__ == "__main__":

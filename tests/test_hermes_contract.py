@@ -21,6 +21,9 @@ class HermesContractTests(test_cli.ShimCLITestCase):
         self.assertEqual(image.returncode, 0, image.stderr)
         self.assertEqual(image.stdout.strip(), '["docker-entrypoint.sh"]')
 
+        # The contract inherits --security-opt/--pids-limit, which Apple container never applies and the shim now refuses without explicit opt-in.
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "security-opt,pids-limit"
+
         run = self.docker(
             "run",
             "-d",
@@ -136,6 +139,25 @@ class HermesContractTests(test_cli.ShimCLITestCase):
         )
         self.assertEqual(gone.returncode, 0, gone.stderr)
         self.assertEqual(gone.stdout.strip(), "")
+
+    def test_hermes_run_is_refused_without_opt_in(self) -> None:
+        run = self.docker(
+            "run",
+            "-d",
+            "--name",
+            "hermes-refused",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "256",
+            "nikolaik/python-nodejs:python3.11-nodejs20",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(run.returncode, 64, run.stderr)
+        self.assertIn("--security-opt", run.stderr)
+        for call in self.container_calls():
+            self.assertNotIn(call[0], ("run", "create"))
 
     def test_orphan_reaper_receives_a_real_finished_time(self) -> None:
         run = self.docker(

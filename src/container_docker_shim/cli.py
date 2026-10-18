@@ -11,6 +11,8 @@ import sys
 import uuid
 from typing import Any
 
+from . import security
+
 
 DOCKER_ZERO_TIME = "0001-01-01T00:00:00Z"
 SUPPORTED_CONTAINER_VERSION = "1.5.0"
@@ -137,11 +139,7 @@ def _translate_volume(value: str) -> list[str]:
 
 
 def _tmpfs_path(value: str) -> str:
-    if ":" not in value:
-        return value
-    path, options = value.split(":", 1)
-    _debug(f"discarding Docker tmpfs options for {path}: {options}")
-    return path
+    return value
 
 
 def _parse_key_value(value: str) -> tuple[str, str]:
@@ -1391,86 +1389,67 @@ def _parse_run_options(
         elif current in ("-it", "-ti"):
             opts.extend(["-i", "-t"])
         elif arg == "--name":
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, "--name")
+            value, i = _take_value(argv, i, "--name")
             name = value
             opts.extend(["--name", value])
             continue
         elif arg in ("--label", "-l"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--label", value])
             continue
         elif arg in ("--workdir", "--cwd", "-w"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["-w", value])
             continue
         elif arg in ("--env", "-e"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["-e", value])
             continue
         elif arg in ("--volume", "-v"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(_translate_volume(value))
             continue
         elif arg == "--mount":
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--mount", value])
             continue
         elif arg == "--tmpfs":
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--tmpfs", _tmpfs_path(value)])
             continue
         elif arg in ("--memory", "-m"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--memory", _normalize_memory(value)])
             continue
         elif arg == "--cpus":
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--cpus", _normalize_cpus(value)])
             continue
         elif arg in ("--user", "-u"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--user", value])
             continue
         elif arg == "--network":
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             if value == "none":
                 raise ShimError("Docker --network=none has no verified Apple container equivalent; refusing unsafe translation", 64)
             opts.extend(["--network", value])
             continue
-        elif arg in ("--security-opt", "--pids-limit", "--storage-opt"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
-            _debug(f"accepted no-op run option {arg}={value}")
+        elif arg in ("--security-opt", "--pids-limit", "--privileged", "--storage-opt"):
+            if arg == "--privileged":
+                i += 1
+            else:
+                _, i = _take_value(argv, i, arg)
+            decision = security.decide(arg)
+            if decision.action == "refuse":
+                raise ShimError(decision.message, 64)
+            if decision.action == "skip":
+                print(decision.message, file=sys.stderr)
             continue
         elif arg in unsupported_apple_options:
             raise ShimError(f"unsupported docker run option for Apple container: {current}", 64)
         elif arg in value_options or arg in ("-p", "-c"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             if arg == "-c":
                 opts.extend(["--cpus", _normalize_cpus(value)])
                 continue
