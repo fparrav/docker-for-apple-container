@@ -252,10 +252,13 @@ when available, then fall back to stable service-name order from labels.
   out of scope.
 
 Compose keys with no Apple equivalent (the service-level `restart` policy,
-`healthcheck`, `privileged`, `hostname`, `secrets`, `configs`, `deploy`
-replicas, `extra_hosts`, network aliases, and `depends_on` conditions beyond
+`healthcheck`, `hostname`, `secrets`, `configs`, `deploy` replicas,
+`extra_hosts`, network aliases, and `depends_on` conditions beyond
 `service_started`) are parsed but ignored, with a one-line warning per service
-so behavior is never silently misrepresented.
+so behavior is never silently misrepresented. Security keys are different:
+`privileged`, `security_opt`, `pids_limit`, `sysctls`, and `devices` make `up`
+fail with exit 64 before any network or container is created (see
+[Security options](#security-options)).
 `compose run`, scaling, health-gated dependencies, network aliases, and
 anonymous-volume removal remain intentionally out of scope.
 
@@ -266,13 +269,53 @@ Commands and flags with no verified Apple equivalent fail loudly:
 `history`/`import` (no Apple equivalent), `docker run --network=none`,
 `docker run --add-host/--hostname`, and any unknown command.
 
+### Security options
+
+Restrictions are applied or refused, never dropped silently. Each option below
+has exactly one status; the table is generated from `security.RULES` and a test
+keeps it in sync.
+
+| Option | Status | Reason |
+| --- | --- | --- |
+| `cap-add` | SUPPORTED | names normalized to CAP_* by the runtime |
+| `cap-drop` | SUPPORTED | names normalized to CAP_* by the runtime |
+| `read-only` | SUPPORTED | verified by a failing write |
+| `user` | SUPPORTED | forwarded unchanged |
+| `memory` | SUPPORTED | granularity of 1 MiB |
+| `cpus` | SUPPORTED | forwarded as a fractional CPU count |
+| `ulimit` | SUPPORTED | forwarded as --ulimit |
+| `tmpfs` | SUPPORTED | options applied by the runtime |
+| `init` | SUPPORTED | forwarded unchanged |
+| `security-opt` | UNSUPPORTED | Apple container 1.5.0 has no equivalent: no seccomp/AppArmor/no-new-privileges knob is documented |
+| `pids-limit` | UNSUPPORTED | Apple container 1.5.0 documents no process-count limit |
+| `privileged` | UNSUPPORTED | Apple container 1.5.0 has no privileged mode |
+| `storage-opt` | UNSUPPORTED | Apple container 1.5.0 documents no storage driver options |
+| `sysctls` | UNSUPPORTED | Apple container 1.5.0 documents no sysctl passthrough |
+| `devices` | UNSUPPORTED | Apple container 1.5.0 documents no host device passthrough |
+| `hostname` | UNSUPPORTED | not a restriction; Apple container 1.5.0 documents no hostname flag |
+| `add-host` | UNSUPPORTED | not a restriction; Apple container 1.5.0 documents no add-host flag |
+| `network-none` | UNSUPPORTED | not a restriction; Apple container 1.5.0 has no none network |
+
+A command that uses an UNSUPPORTED option exits 64 before any container is
+created, naming the option and the reason. The same applies to the matching
+Compose keys (`privileged`, `security_opt`, `pids_limit`, `sysctls`, `devices`),
+which are validated for every service before `up` creates anything.
+
+To run a workload whose restriction cannot be enforced, opt in explicitly by
+naming the option in `CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED` (comma-separated;
+there is no wildcard). Allowed names: `security-opt`, `pids-limit`,
+`storage-opt`, `privileged`, `sysctls`, `devices`. The option is skipped with a
+warning on every use and the restriction is **not** enforced:
+
+```bash
+CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED=security-opt,pids-limit docker run ...
+```
+
 ### Caveats
 
-- `--security-opt`, `--pids-limit`, and `--storage-opt` on `run` are accepted as
-  **silent no-ops**. Apple `container` documents no equivalent, so a container
-  may be less constrained than the flag implies.
 - `docker run -v host:ctr:ro` becomes an Apple `--mount` bind (only `ro` mode is
-  honored). `--tmpfs` option suffixes are reduced to the mount path.
+  honored). `--tmpfs` values, including their mount options, are forwarded to
+  Apple `container` unchanged.
 
 ## State
 
