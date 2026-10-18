@@ -39,7 +39,12 @@ def _debug(message: str) -> None:
         print(f"docker-for-apple-container debug: {message}", file=sys.stderr)
 
 
-def _run_container_capture(args: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run_container_capture(
+    args: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     cmd = [_container_bin(), *args]
     _debug("container capture: " + json.dumps(cmd))
     try:
@@ -49,6 +54,7 @@ def _run_container_capture(args: list[str], *, input_text: str | None = None) ->
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
     except FileNotFoundError:
         raise ShimError(f"Apple container CLI not found: {_container_bin()}")
