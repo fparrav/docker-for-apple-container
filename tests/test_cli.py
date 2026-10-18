@@ -1208,5 +1208,45 @@ class CLIContractTests(ShimCLITestCase):
         self.assertEqual(result.stdout.strip(), "LOAD -i /tmp/img.tar")
 
 
+class ContainerResolutionTests(ShimCLITestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Emulate the native Apple binary: execution must not depend on PATH,
+        # so pin the fake's interpreter to an absolute path.
+        self.fake.write_text(
+            FAKE_CONTAINER.replace("#!/usr/bin/env python3", "#!" + sys.executable)
+        )
+
+    def test_override_is_used_without_path_lookup(self) -> None:
+        empty = self.root / "empty-path"
+        empty.mkdir()
+        self.env["PATH"] = str(empty)
+        result = self.docker("version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("container CLI version", result.stdout)
+
+    def test_container_found_on_path(self) -> None:
+        self.env.pop("CONTAINER_DOCKER_SHIM_CONTAINER")
+        pathbin = self.root / "pathbin"
+        pathbin.mkdir()
+        found = pathbin / "container"
+        found.write_text(self.fake.read_text())
+        found.chmod(0o755)
+        self.env["PATH"] = str(pathbin)
+        result = self.docker("version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("container CLI version", result.stdout)
+
+    def test_missing_container_names_override_and_path(self) -> None:
+        self.env.pop("CONTAINER_DOCKER_SHIM_CONTAINER")
+        empty = self.root / "empty-path"
+        empty.mkdir()
+        self.env["PATH"] = str(empty)
+        result = self.docker("version")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CONTAINER_DOCKER_SHIM_CONTAINER", result.stderr)
+        self.assertIn("PATH", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

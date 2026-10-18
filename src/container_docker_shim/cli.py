@@ -5,6 +5,7 @@ import json
 import os
 import platform as host_platform
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -22,7 +23,13 @@ class ShimError(Exception):
 
 
 def _container_bin() -> str:
-    return os.environ.get("CONTAINER_DOCKER_SHIM_CONTAINER", "/usr/local/bin/container")
+    explicit = os.environ.get("CONTAINER_DOCKER_SHIM_CONTAINER")
+    if explicit:
+        return explicit
+    found = shutil.which("container")
+    if found:
+        return found
+    raise ShimError("Apple container CLI not found: set CONTAINER_DOCKER_SHIM_CONTAINER or add container to PATH")
 
 
 def _debug(message: str) -> None:
