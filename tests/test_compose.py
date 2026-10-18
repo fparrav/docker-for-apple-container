@@ -381,6 +381,72 @@ class TranslationTests(unittest.TestCase):
                          ["redis-server", "--port", "6379"])
 
 
+class RunArgsSecurityTests(unittest.TestCase):
+    """Security-related `container run` flags without the fake binary."""
+
+    def pairs(self, args: list[str]) -> list[list[str]]:
+        """Consecutive [flag, value] pairs for assertions."""
+        return [
+            [args[i], args[i + 1]]
+            for i, tok in enumerate(args)
+            if tok.startswith("--") and i + 1 < len(args)
+        ]
+
+    def build(self, spec: dict) -> list[str]:
+        svc = compose.Service("web", spec)
+        project = compose.Project("demo", {"services": {"web": spec}}, "/tmp")
+        args, _ = compose._build_run_args(
+            svc, project, image="img:1", ensured_volumes=set(), warned=set()
+        )
+        return args
+
+    def test_ulimit_list_form(self) -> None:
+        args = self.build({"image": "img:1", "ulimits": ["nofile=1024"]})
+        self.assertIn(["--ulimit", "nofile=1024"], self.pairs(args))
+
+    def test_ulimit_map_form(self) -> None:
+        args = self.build(
+            {
+                "image": "img:1",
+                "ulimits": {"nproc": 65535, "nofile": {"soft": 20000, "hard": 40000}},
+            }
+        )
+        self.assertIn(["--ulimit", "nproc=65535"], self.pairs(args))
+        self.assertIn(["--ulimit", "nofile=20000:40000"], self.pairs(args))
+
+    def test_read_only_flag(self) -> None:
+        args = self.build({"image": "img:1", "read_only": True})
+        self.assertIn("--read-only", args)
+        args = self.build({"image": "img:1", "read_only": False})
+        self.assertNotIn("--read-only", args)
+
+    def test_init_flag(self) -> None:
+        args = self.build({"image": "img:1", "init": True})
+        self.assertIn("--init", args)
+
+    def test_capabilities_not_normalized(self) -> None:
+        args = self.build(
+            {
+                "image": "img:1",
+                "cap_add": ["NET_ADMIN", "CAP_SYS_TIME"],
+                "cap_drop": ["ALL"],
+            }
+        )
+        self.assertIn(["--cap-add", "NET_ADMIN"], self.pairs(args))
+        self.assertIn(["--cap-add", "CAP_SYS_TIME"], self.pairs(args))
+        self.assertIn(["--cap-drop", "ALL"], self.pairs(args))
+
+    def test_user_pair(self) -> None:
+        args = self.build({"image": "img:1", "user": "1000:1000"})
+        self.assertIn(["--user", "1000:1000"], self.pairs(args))
+
+    def test_tmpfs_forms(self) -> None:
+        args = self.build({"image": "img:1", "tmpfs": ["/tmp:rw,size=64m"]})
+        self.assertIn(["--tmpfs", "/tmp:rw,size=64m"], self.pairs(args))
+        args = self.build({"image": "img:1", "tmpfs": "/run"})
+        self.assertIn(["--tmpfs", "/run"], self.pairs(args))
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end tests against the fake container binary
 # --------------------------------------------------------------------------- #
@@ -1024,6 +1090,172 @@ class ComposeE2ETests(unittest.TestCase):
         down = self.docker("compose", "down")
         self.assertEqual(down.returncode, 0, down.stderr)
         self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    # -- Security enforcement (security.decide, all-or-nothing) ------------- #
+
+    def _seed_state(self) -> None:
+        # A refused `up` never reaches the fake runtime, so give the state
+        # file the same defaults the fake binary would create on first run.
+        self.state.write_text(
+            json.dumps(
+                {
+                    "containers": {},
+                    "networks": {},
+                    "volumes": {},
+                    "ip": 1,
+                    "exec_log": [],
+                    "action_log": [],
+                }
+            )
+        )
+
+    def test_up_refuses_privileged_service(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                privileged: true
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("privileged", result.stderr)
+        self.assertIn("web", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_refuses_security_opt_service(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                security_opt: ["no-new-privileges:true"]
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertTrue(
+            "security_opt" in result.stderr or "--security-opt" in result.stderr,
+            result.stderr,
+        )
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_refuses_pids_limit_service(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                pids_limit: 100
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("pids_limit", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_refusal_is_all_or_nothing(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+        self.write_compose(
+            """
+            services:
+              bad:
+                image: nginx:latest
+                privileged: true
+              good:
+                image: nginx:latest
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertNotIn("demo_default", state["networks"])
+
+    def test_up_opt_in_turns_refusal_into_warning(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = (
+            "privileged,security-opt,pids-limit,sysctls,devices"
+        )
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                privileged: true
+                security_opt: ["no-new-privileges:true"]
+                pids_limit: 100
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning:", result.stderr)
+        for name in ("privileged", "security-opt", "pids-limit"):
+            self.assertIn(name, result.stderr)
+        self.assertIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_opt_in_covers_only_named_option(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "security-opt"
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                security_opt: ["no-new-privileges:true"]
+                pids_limit: 100
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("pids_limit", result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_refuses_sysctls_and_devices(self) -> None:
+        cases = {
+            "sysctls": 'sysctls: {net.ipv4.ip_forward: "1"}',
+            "devices": 'devices: ["/dev/fuse:/dev/fuse"]',
+        }
+        for key, yaml_key in cases.items():
+            with self.subTest(key=key):
+                self._seed_state()
+                self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+                self.write_compose(
+                    f"""
+                    services:
+                      web:
+                        image: nginx:latest
+                        {yaml_key}
+                    """
+                )
+                result = self.docker("compose", "up", "-d")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn(key, result.stderr)
+                self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_up_ignores_disabled_security_keys(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = ""
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                privileged: false
+                security_opt: []
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("demo-web-1", self.load_state()["containers"])
 
 
 if __name__ == "__main__":

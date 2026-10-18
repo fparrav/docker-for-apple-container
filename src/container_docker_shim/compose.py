@@ -76,6 +76,7 @@ from .cli import (
     cmd_start as docker_start,
     cmd_stop as docker_stop,
 )
+from . import security
 
 
 # --------------------------------------------------------------------------- #
@@ -100,13 +101,10 @@ SUPPORTED_COMPOSE_FILENAMES = (
 UNSUPPORTED_SERVICE_KEYS = {
     "restart": "restart policies are not supported by Apple container",
     "healthcheck": "healthchecks are not enforced (depends_on is treated as ordering only)",
-    "privileged": "privileged mode is not supported by Apple container",
     "hostname": "custom hostname is not supported by Apple container",
     "secrets": "secrets are a Swarm feature with no Apple container equivalent",
     "configs": "configs are a Swarm feature with no Apple container equivalent",
     "extra_hosts": "extra_hosts is not yet translated",
-    "devices": "device mapping is not supported by Apple container",
-    "sysctls": "sysctls are not supported by Apple container",
 }
 
 # Per-service escape hatch: `x-shim-boot-hosts: false` skips the boot-time
@@ -740,8 +738,8 @@ def _build_run_args(
         args.extend(["--cap-add", _as_str(cap)])
     for cap in _as_list(spec.get("cap_drop")):
         args.extend(["--cap-drop", _as_str(cap)])
-    for limit in _as_list(spec.get("ulimits")):
-        args.extend(["--ulimit", _as_str(limit)])
+    for limit in _ulimit_values(spec.get("ulimits")):
+        args.extend(["--ulimit", limit])
     for entry in _as_list(spec.get("tmpfs")):
         args.extend(["--tmpfs", _as_str(entry)])
 
@@ -792,6 +790,26 @@ def _build_run_args(
     args.append(image)
     args.extend(positional)
     return args, wrapped
+
+
+def _ulimit_values(value: Any) -> list[str]:
+    """Translate Compose `ulimits` into `<type>=<soft>[:<hard>]` strings.
+
+    Compose defines `ulimits` as a mapping (`nproc: 65535` or
+    `nofile: {soft: 20000, hard: 40000}`); a list of `type=value` strings is
+    also accepted.
+    """
+    if isinstance(value, dict):
+        out: list[str] = []
+        for name, limit in value.items():
+            if isinstance(limit, dict):
+                soft = _as_str(limit.get("soft"))
+                hard = _as_str(limit.get("hard"))
+                out.append(f"{name}={soft}:{hard}")
+            else:
+                out.append(f"{name}={_as_str(limit)}")
+        return out
+    return [_as_str(item) for item in _as_list(value)]
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -874,6 +892,53 @@ def _warn_unsupported(service: Service, warned: set[str]) -> None:
                 "dependency order is preserved without health gating"
             )
             warned.add(condition_marker)
+
+
+# Compose keys that map onto the security decision table (security.RULES).
+# Unlike the other UNSUPPORTED_SERVICE_KEYS, these are enforced by
+# security.decide(): a requested value is refused (or warned about when
+# explicitly allowed unenforced) before `up` creates anything.
+SECURITY_OPTION_KEYS = {
+    "privileged": "privileged",
+    "security_opt": "security-opt",
+    "pids_limit": "pids-limit",
+    "sysctls": "sysctls",
+    "devices": "devices",
+}
+
+
+def _counts_as_requested(value: Any) -> bool:
+    """Whether a compose value counts as requested (not an empty/no-op form).
+
+    The minimal YAML parser can return strings for empty-ish values, so both
+    native and string forms are treated as "not requested".
+    """
+    if value is None or value is False:
+        return False
+    return value not in ("", [], {}, "false", "False", "0", "-1", 0, -1)
+
+
+def _enforce_run_security(services: list[Service]) -> None:
+    """Apply security.decide() to every requested security key, all-or-nothing.
+
+    Walks all services first, accumulating every "skip" warning; if any option
+    must be refused, raises before any network or container is created.
+    """
+    skips: list[str] = []
+    refuses: list[str] = []
+    for service in services:
+        for key, option in SECURITY_OPTION_KEYS.items():
+            if key not in service.spec or not _counts_as_requested(service.spec[key]):
+                continue
+            decision = security.decide(option)
+            if decision.action == "refuse":
+                refuses.append(f"service {service.name!r}: '{key}': {decision.message}")
+            elif decision.action == "skip":
+                skips.append(f"service {service.name!r}: '{key}': {decision.message}")
+    for message in skips:
+        _warn(message)
+    if refuses:
+        raise ShimError(refuses[0], 64)
 
 
 # ========================================================================== #
@@ -1438,6 +1503,8 @@ def cmd_up(project: Project, *, detach: bool, build: bool, only: list[str], no_b
         services = [svc for svc in services if svc.name in wanted]
         if not services:
             return _die(f"compose: no such service(s): {', '.join(only)}", 1)
+
+    _enforce_run_security(services)
 
     # Provision declared networks (record specs for ensure-on-attach), defaulting
     # to the implicit project network every service joins.
