@@ -153,6 +153,74 @@ class ImagePresentationTests(test_cli.ShimCLITestCase):
         self.assertEqual(unsupported.stdout, "")
         self.assertIn("unsupported image list field: .Containers", unsupported.stderr)
 
+    def test_image_list_uses_variant_size_and_hides_epoch_creation(self) -> None:
+        self.docker("create", "--name", "fixture", "alpine", "true")
+        self.update_fake_state(
+            image_payload=[
+                {
+                    "id": "sha256:" + "d" * 64,
+                    "configuration": {
+                        "name": "example/big:1",
+                        "creationDate": "2026-09-19T00:38:59Z",
+                        "descriptor": {
+                            "digest": "sha256:" + "d" * 64,
+                            "mediaType":
+                            "application/vnd.oci.image.index.v1+json",
+                            "size": 10237,
+                        },
+                    },
+                    "variants": [
+                        {
+                            "digest": "sha256:" + "d" * 64,
+                            "size": 159971863,
+                            "platform": {
+                                "architecture": "arm64",
+                                "os": "linux",
+                                "variant": "v8",
+                            },
+                            "config": {
+                                "created": "2026-09-19T00:38:59.786253347Z"
+                            },
+                        }
+                    ],
+                },
+                {
+                    "id": "sha256:" + "e" * 64,
+                    "configuration": {
+                        "name": "example/epoch:1",
+                        "creationDate": "1970-01-01T00:00:00Z",
+                        "descriptor": {
+                            "digest": "sha256:" + "e" * 64,
+                            "mediaType":
+                            "application/vnd.oci.image.index.v1+json",
+                            "size": 306,
+                        },
+                    },
+                    "variants": [
+                        {
+                            "digest": "sha256:" + "e" * 64,
+                            "size": 69078349,
+                            "platform": {
+                                "architecture": "arm64",
+                                "os": "linux",
+                                "variant": "v8",
+                            },
+                            "config": {},
+                        }
+                    ],
+                },
+            ]
+        )
+        result = self.docker(
+            "images", "--format", "{{.Repository}} {{.Size}} {{.CreatedSince}}"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("example/big 160MB "))
+        self.assertNotIn("years ago", lines[1])
+        self.assertEqual(lines[1], "example/epoch 69.1MB N/A")
+
 
 if __name__ == "__main__":
     import unittest

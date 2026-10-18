@@ -722,14 +722,25 @@ def _docker_image_list_row(item: dict[str, Any], *, no_trunc: bool) -> dict[str,
     )
     digest = str(descriptor.get("digest") or "")
     image_id = digest if no_trunc else digest.removeprefix("sha256:")[:12]
-    created = str(configuration.get("creationDate") or DOCKER_ZERO_TIME)
-    size = int(descriptor.get("size") or 0)
+    variant = _select_image_variant(item, None)
+    variant_config = variant.get("config") or {}
+    if not isinstance(variant_config, dict):
+        variant_config = {}
+    created = str(
+        variant_config.get("created")
+        or configuration.get("creationDate")
+        or DOCKER_ZERO_TIME
+    )
+    parsed = _parse_timestamp(created)
+    if parsed is None or parsed.year <= 1970:
+        created = DOCKER_ZERO_TIME
+    size = int(variant.get("size") or descriptor.get("size") or 0)
     return {
         "ID": image_id,
         "Repository": repository,
         "Tag": tag,
         "Digest": digest,
-        "CreatedSince": _human_age(created),
+        "CreatedSince": _human_age(created) or "N/A",
         "CreatedAt": created,
         "Size": _human_size(size),
     }
