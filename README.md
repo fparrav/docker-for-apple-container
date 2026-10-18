@@ -244,22 +244,55 @@ when available, then fall back to stable service-name order from labels.
 - **Teardown is self-coherent.** `down` removes the project's containers (found
   by label), then removes the network (and with `-v`, the volumes) **only if the
   shim created them** (verified via the project label), never external ones.
-- **`up` is idempotent**: it removes the project's previous containers before
-  recreating, so re-running never accumulates duplicates.
+- **`up` is idempotent and converges.** Each container carries
+  `com.docker.compose.config-hash` (a SHA-256 over the normalized service
+  definition plus the image ID) and `com.docker.compose.image`. Re-running `up`
+  keeps an unchanged running container untouched, starts a stopped one, and
+  recreates one whose definition or image changed (or that has no hash label),
+  together with the services that depend on it, printing what is recreated and
+  why. `--force-recreate` recreates everything, `--no-recreate` never recreates
+  an existing container (it still creates missing ones); the two are mutually
+  exclusive. Containers of services no longer in the file are reported as
+  orphans and removed only with `--remove-orphans`. All images are resolved
+  before any container is touched, and a failing service is named in the error
+  while the services that already started keep running; fixing the file and
+  running `up -d` again starts only what is missing.
+- **Dependency conditions are enforced.** `depends_on` accepts
+  `service_started` (the default), `service_healthy` and
+  `service_completed_successfully`; any other condition exits 64. A
+  `service_healthy` dependency must declare an enabled `healthcheck` (otherwise
+  `up` exits 64 before creating anything). The shim evaluates the check with
+  `container exec`, honouring `test` (`CMD`, `CMD-SHELL`), `interval`,
+  `timeout`, `retries`, `start_period` and `start_interval` with Compose's
+  defaults; the dependent is created only once the check passes. Failures name
+  the service, the last check output and the last 40 log lines. A
+  `service_completed_successfully` dependency runs in the foreground and `up`
+  fails if it exits non-zero. Every wait is bounded (default
+  `start_period + retries * (interval + timeout)`) and ends early when the
+  container exits; `--wait-timeout SECONDS` overrides the bound.
+- **`up --wait`** implies `-d` and returns only when every started service is
+  running and, where it declares a healthcheck, healthy; it exits non-zero on
+  timeout or when a service exits early. Healthchecks are evaluated only while
+  `up` gates a dependent or waits: there is no background monitoring and no
+  restart on failure, and `up` warns about a declared healthcheck that nothing
+  evaluates.
+- **Volumes survive recreation.** Recreating a service never removes a volume.
+  `down` removes no volume; `down -v` removes only the named volumes the shim
+  created for that project (verified by label), never external or other-project
+  volumes.
 - **YAML** is parsed by a small dependency-free subset parser (block maps and
   sequences, flow collections, quoted scalars, comments, and `${VAR:-default}`
   interpolation). Anchors, multi-document streams, and `|`/`>` block scalars are
   out of scope.
 
 Compose keys with no Apple equivalent (the service-level `restart` policy,
-`healthcheck`, `hostname`, `secrets`, `configs`, `deploy` replicas,
-`extra_hosts`, network aliases, and `depends_on` conditions beyond
-`service_started`) are parsed but ignored, with a one-line warning per service
-so behavior is never silently misrepresented. Security keys are different:
+`hostname`, `secrets`, `configs`, `deploy` replicas, `extra_hosts`, and network
+aliases) are parsed but ignored, with a one-line warning per service so
+behavior is never silently misrepresented. Security keys are different:
 `privileged`, `security_opt`, `pids_limit`, `sysctls`, and `devices` make `up`
 fail with exit 64 before any network or container is created (see
 [Security options](#security-options)).
-`compose run`, scaling, health-gated dependencies, network aliases, and
+`compose run`, scaling, network aliases, continuous healthchecks and
 anonymous-volume removal remain intentionally out of scope.
 
 ### Refused, by design
