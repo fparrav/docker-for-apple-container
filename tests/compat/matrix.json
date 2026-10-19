@@ -1,0 +1,1730 @@
+[
+  {
+    "id": "build --add-host",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no add-host flag."
+  },
+  {
+    "id": "build --arch",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--arch",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --arch."
+  },
+  {
+    "id": "build --build-arg",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--build-arg",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_build_arg_reaches_image_and_cli_label_wins",
+    "note": "Forwarded verbatim to Apple --build-arg."
+  },
+  {
+    "id": "build --build-context",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no build-context flag."
+  },
+  {
+    "id": "build --cache-from",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no cache-from flag."
+  },
+  {
+    "id": "build --cache-to",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no cache-to flag."
+  },
+  {
+    "id": "build --cpus",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--cpus",
+    "evidence": "fake",
+    "test": null,
+    "note": "Normalized and forwarded to Apple --cpus as a fractional CPU count."
+  },
+  {
+    "id": "build --file",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--file",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --file."
+  },
+  {
+    "id": "build --force-rm",
+    "kind": "option",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Accepted and ignored; Apple container 1.5.0 build documents no force-remove flag."
+  },
+  {
+    "id": "build --help",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--help",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple container build --help."
+  },
+  {
+    "id": "build --iidfile",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no iidfile flag."
+  },
+  {
+    "id": "build --label",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--label",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_build_arg_reaches_image_and_cli_label_wins",
+    "note": "Forwarded verbatim to Apple --label."
+  },
+  {
+    "id": "build --load",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no load flag."
+  },
+  {
+    "id": "build --memory",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--memory",
+    "evidence": "fake",
+    "test": null,
+    "note": "Unit letter upper-cased before forwarding; sets the builder container memory."
+  },
+  {
+    "id": "build --network",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no build network flag."
+  },
+  {
+    "id": "build --no-cache",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--no-cache",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --no-cache."
+  },
+  {
+    "id": "build --output",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--output",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --output."
+  },
+  {
+    "id": "build --platform",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--platform",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_fixture_f_arm64_image_reports_aarch64",
+    "note": "Forwarded verbatim to Apple --platform, including a comma list (`linux/amd64,linux/arm64`), which Apple 1.5.0 builds into one local tag holding an index with both variants (findings 1.2)."
+  },
+  {
+    "id": "build --progress",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--progress",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --progress."
+  },
+  {
+    "id": "build --pull",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--pull",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --pull."
+  },
+  {
+    "id": "build --push",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no build push flag."
+  },
+  {
+    "id": "build --quiet",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--quiet",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --quiet."
+  },
+  {
+    "id": "build --rm",
+    "kind": "option",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Accepted and ignored; Apple container 1.5.0 build documents no remove flag."
+  },
+  {
+    "id": "build --secret",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--secret",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --secret (`id=<id>,src=<path>` or `id=<id>,env=<VAR>`, verified live in findings 1.5)."
+  },
+  {
+    "id": "build --ssh",
+    "kind": "option",
+    "status": "PARTIAL",
+    "apple": "--ssh default",
+    "evidence": "fake",
+    "test": null,
+    "note": "Only `--ssh default` is forwarded (the host agent, as Apple container 1.5.0 build supports); any other form is refused with exit 64."
+  },
+  {
+    "id": "build --tag",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--tag",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --tag."
+  },
+  {
+    "id": "build --target",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--target",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --target."
+  },
+  {
+    "id": "build --ulimit",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag."
+  },
+  {
+    "id": "compose build",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "build",
+    "evidence": "fake",
+    "test": null,
+    "note": "Translates to `container build` of the service context, tagging the service image."
+  },
+  {
+    "id": "compose build.args",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--build-arg",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --build-arg."
+  },
+  {
+    "id": "compose build.context",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Context directory, defaulting to the project directory; passed as the build's positional argument."
+  },
+  {
+    "id": "compose build.dockerfile",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--file",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded as Apple --file, resolved against the context."
+  },
+  {
+    "id": "compose build.platforms",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--platform",
+    "evidence": "fake",
+    "test": null,
+    "note": "Comma-joined into Apple --platform, falling back to the service platform."
+  },
+  {
+    "id": "compose cap_add",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--cap-add",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --cap-add."
+  },
+  {
+    "id": "compose cap_drop",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--cap-drop",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --cap-drop."
+  },
+  {
+    "id": "compose command",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Shell-lexically split and appended as positional args after the image."
+  },
+  {
+    "id": "compose configs",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Ignored with a warning — configs are a Swarm feature with no Apple container equivalent."
+  },
+  {
+    "id": "compose container_name",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--name",
+    "evidence": "fake",
+    "test": null,
+    "note": "Used for Apple --name; defaults to <project>-<service>-1 when absent."
+  },
+  {
+    "id": "compose cpus",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--cpus",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --cpus, with fractional values normalized."
+  },
+  {
+    "id": "compose depends_on",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Starts dependencies first and honors the service_started, service_healthy and service_completed_successfully conditions."
+  },
+  {
+    "id": "compose deploy",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": "--cpus",
+    "evidence": "fake",
+    "test": null,
+    "note": "Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is ignored with a warning."
+  },
+  {
+    "id": "compose devices",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no host device passthrough."
+  },
+  {
+    "id": "compose dns",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--dns",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --dns."
+  },
+  {
+    "id": "compose dns_opt",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--dns-option",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --dns-option."
+  },
+  {
+    "id": "compose dns_search",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--dns-search",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --dns-search."
+  },
+  {
+    "id": "compose entrypoint",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--entrypoint",
+    "evidence": "fake",
+    "test": null,
+    "note": "String form is shell-lexically split and forwarded as Apple --entrypoint, discarding the image CMD."
+  },
+  {
+    "id": "compose env_file",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "-e",
+    "evidence": "fake",
+    "test": null,
+    "note": "Files are read at up time and flattened into -e pairs."
+  },
+  {
+    "id": "compose environment",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "-e",
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Map and list forms flatten into Apple -e pairs."
+  },
+  {
+    "id": "compose extra_hosts",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Ignored with a warning — extra_hosts is not yet translated."
+  },
+  {
+    "id": "compose healthcheck",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_dependent_waits_for_delayed_healthy_dependency",
+    "note": "'healthcheck' is only evaluated to gate depends_on service_healthy or 'up --wait'; there is no continuous monitoring and no restart on failure."
+  },
+  {
+    "id": "compose hostname",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Ignored with a warning — custom hostname is not supported by Apple container."
+  },
+  {
+    "id": "compose image",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Used as the run's positional image; required when no build section is present."
+  },
+  {
+    "id": "compose init",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--init",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --init."
+  },
+  {
+    "id": "compose labels",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--label",
+    "evidence": "fake",
+    "test": null,
+    "note": "Map and list forms translate to Apple --label alongside the shim's bookkeeping labels."
+  },
+  {
+    "id": "compose mem_limit",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--memory",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --memory."
+  },
+  {
+    "id": "compose networks",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": "--network",
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_e_services_resolve_only_peers_on_a_shared_network",
+    "note": "Each declared network joins via Apple --network; per-network aliases are ignored with a warning."
+  },
+  {
+    "id": "compose pids_limit",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no process-count limit."
+  },
+  {
+    "id": "compose platform",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--platform",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --platform on run and on build (unless build.platforms is set); an image without that platform variant fails at run time."
+  },
+  {
+    "id": "compose ports",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": "-p",
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_a_published_port_answers_http_and_down_removes_everything",
+    "note": "Publishes via Apple -p; bare container ports map to the identical host port, as Apple has no random-host-port mode."
+  },
+  {
+    "id": "compose privileged",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 has no privileged mode."
+  },
+  {
+    "id": "compose read_only",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--read-only",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --read-only."
+  },
+  {
+    "id": "compose restart",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Ignored with a warning — restart policies are not supported by Apple container."
+  },
+  {
+    "id": "compose secrets",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Ignored with a warning — secrets are a Swarm feature with no Apple container equivalent."
+  },
+  {
+    "id": "compose security_opt",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 has no seccomp/AppArmor/no-new-privileges knob."
+  },
+  {
+    "id": "compose shm_size",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--shm-size",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --shm-size."
+  },
+  {
+    "id": "compose stdin_open",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "-i",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple -i."
+  },
+  {
+    "id": "compose sysctls",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no sysctl passthrough."
+  },
+  {
+    "id": "compose tmpfs",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--tmpfs",
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry forwards as Apple --tmpfs."
+  },
+  {
+    "id": "compose top-level name",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Sanitized into the project name that scopes container, network and volume resources."
+  },
+  {
+    "id": "compose top-level networks",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": "network create",
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_e_services_resolve_only_peers_on_a_shared_network",
+    "note": "Declared networks are created at up time honoring --internal; external networks are warned and not created."
+  },
+  {
+    "id": "compose top-level services",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Each entry becomes a service, started in topological (dependency) order."
+  },
+  {
+    "id": "compose top-level volumes",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Parsed and shown by `config`; named volumes are created on demand from service references."
+  },
+  {
+    "id": "compose tty",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "-t",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple -t."
+  },
+  {
+    "id": "compose ulimits",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--ulimit",
+    "evidence": "fake",
+    "test": null,
+    "note": "Map or list form translates to Apple --ulimit as type=soft[:hard]."
+  },
+  {
+    "id": "compose user",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "--user",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple --user."
+  },
+  {
+    "id": "compose volumes",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": "-v",
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v."
+  },
+  {
+    "id": "compose working_dir",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": "-w",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple -w."
+  },
+  {
+    "id": "compose x-shim-boot-hosts",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Shim extension: false skips the boot-time /etc/hosts entrypoint wrapper for the service."
+  },
+  {
+    "id": "docker build",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container build",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_build_arg_reaches_image_and_cli_label_wins",
+    "note": "Translates the -f/-t build form to Apple container build."
+  },
+  {
+    "id": "docker commit",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker compose build",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Builds each service with Apple container build; no shim state persists."
+  },
+  {
+    "id": "docker compose config",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "The built-in parser refuses anchors, aliases, and block scalars without the official docker-compose binary."
+  },
+  {
+    "id": "docker compose down",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Removes only containers, networks, and volumes the shim created, verified by label."
+  },
+  {
+    "id": "docker compose exec",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "Resolves one service to its labeled container; defaults to an interactive TTY."
+  },
+  {
+    "id": "docker compose logs",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_h_dotenv_value_reaches_container",
+    "note": "Streams each service's logs via Apple container logs."
+  },
+  {
+    "id": "docker compose ls",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Lists projects reconstructed from Compose labels."
+  },
+  {
+    "id": "docker compose ps",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_dependent_waits_for_delayed_healthy_dependency",
+    "note": "Reconstructs project membership from Compose labels."
+  },
+  {
+    "id": "docker compose pull",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Build-only services are skipped with a warning instead of being built implicitly."
+  },
+  {
+    "id": "docker compose restart",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_restart_db_keeps_api_connectivity",
+    "note": "Stops in reverse dependency order, then starts forward."
+  },
+  {
+    "id": "docker compose rm",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Never prompts; -f is accepted and -s/--stop stops services first."
+  },
+  {
+    "id": "docker compose start",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Starts dependencies first, falling back to service-name order without a file."
+  },
+  {
+    "id": "docker compose stop",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Stops services in reverse dependency order."
+  },
+  {
+    "id": "docker compose up",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
+    "note": "No background monitoring or restarts; keys with no Apple equivalent are ignored with a warning."
+  },
+  {
+    "id": "docker compose version",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Reports the active normalizer (official docker-compose or built-in subset)."
+  },
+  {
+    "id": "docker container inspect",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "Alias for docker inspect."
+  },
+  {
+    "id": "docker container port",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "Alias for docker port; published bindings come from Apple inspect."
+  },
+  {
+    "id": "docker container prune",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container prune",
+    "evidence": "fake",
+    "test": null,
+    "note": "Non-interactive Apple prune; Docker prune filters are refused."
+  },
+  {
+    "id": "docker cp",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container copy",
+    "evidence": "fake",
+    "test": null,
+    "note": "Maps 1:1 onto Apple container copy; Docker -a and -L are refused."
+  },
+  {
+    "id": "docker create",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container create",
+    "evidence": "fake",
+    "test": null,
+    "note": "Same flag translation as run; prints the new container ID."
+  },
+  {
+    "id": "docker diff",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker exec",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container exec",
+    "evidence": "fake",
+    "test": null,
+    "note": "Covers detach, interactive/TTY, user, environment, and working-directory options."
+  },
+  {
+    "id": "docker export",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container export",
+    "evidence": "fake",
+    "test": null,
+    "note": "Apple requires the container to be stopped."
+  },
+  {
+    "id": "docker history",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker image inspect",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container image inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "Selects the requested platform, or the host platform when none is given."
+  },
+  {
+    "id": "docker image load",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image load",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image ls",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container image list",
+    "evidence": "fake",
+    "test": null,
+    "note": "Docker-shaped default, quiet, digest, no-truncation, JSON, and bounded template output."
+  },
+  {
+    "id": "docker image prune",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image prune",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image pull",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image pull",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image push",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image push",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image rm",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image rm",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image save",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image save",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker image tag",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image tag",
+    "evidence": "fake",
+    "test": null,
+    "note": "pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused."
+  },
+  {
+    "id": "docker images",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container image list",
+    "evidence": "fake",
+    "test": null,
+    "note": "Top-level alias for image ls with the same output shapes."
+  },
+  {
+    "id": "docker import",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker info",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container system status",
+    "evidence": "fake",
+    "test": null,
+    "note": "Only the {{.Driver}} --format template is translated; other formats are refused."
+  },
+  {
+    "id": "docker inspect",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "Bounded template subset: field paths, literal text, and json rendering."
+  },
+  {
+    "id": "docker kill",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container kill",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwards to Apple container kill, including -s SIG."
+  },
+  {
+    "id": "docker load",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image load",
+    "evidence": "fake",
+    "test": null,
+    "note": "Basic form only; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker login",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container registry login",
+    "evidence": "fake",
+    "test": null,
+    "note": "Apple stores the credential; -p/--password is refused in favor of --password-stdin."
+  },
+  {
+    "id": "docker logout",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container registry logout",
+    "evidence": "fake",
+    "test": null,
+    "note": "Delegates to Apple registry logout; flags are refused."
+  },
+  {
+    "id": "docker logs",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container logs",
+    "evidence": "fake",
+    "test": null,
+    "note": "--tail maps to Apple -n; --since and --timestamps are refused."
+  },
+  {
+    "id": "docker network create",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container network create",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker network inspect",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container network inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker network ls",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container network list",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker network prune",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container network prune",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker network rm",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container network delete",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker port",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "Published port bindings are derived from Apple inspect."
+  },
+  {
+    "id": "docker ps",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container list",
+    "evidence": "fake",
+    "test": null,
+    "note": "Stateless filters cover id, name, label, status, ancestor, network, and volume."
+  },
+  {
+    "id": "docker pull",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image pull",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_push_pull_round_trip_keeps_digest_and_oci_index_manifest",
+    "note": "Basic form only; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker push",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image push",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_push_pull_round_trip_keeps_digest_and_oci_index_manifest",
+    "note": "Basic form only; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker rename",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker restart",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Composed from Apple stop + start; Apple has no restart."
+  },
+  {
+    "id": "docker rm",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container rm",
+    "evidence": "fake",
+    "test": null,
+    "note": "Maps -f force removal to Apple container rm."
+  },
+  {
+    "id": "docker rmi",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image rm",
+    "evidence": "fake",
+    "test": null,
+    "note": "Top-level alias for image rm; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker run",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container run",
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_cap_drop_all_leaves_no_effective_capabilities",
+    "note": "Unverified options are refused with exit 64 before any container is created."
+  },
+  {
+    "id": "docker save",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image save",
+    "evidence": "fake",
+    "test": null,
+    "note": "Basic form only; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker start",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container start",
+    "evidence": "fake",
+    "test": null,
+    "note": "Non-attached starts refresh Compose /etc/hosts mappings; attach/interactive stay passthroughs."
+  },
+  {
+    "id": "docker stats",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container stats",
+    "evidence": "fake",
+    "test": null,
+    "note": "Go-template --format is refused; Apple accepts json|table|yaml|toml."
+  },
+  {
+    "id": "docker stop",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": "container stop",
+    "evidence": "fake",
+    "test": null,
+    "note": "Maps -s SIGNAL and -t N to Apple container stop."
+  },
+  {
+    "id": "docker system df",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container system df",
+    "evidence": "fake",
+    "test": null,
+    "note": "Maps directly; Go templates and Docker's verbose mode are refused."
+  },
+  {
+    "id": "docker system events",
+    "kind": "command",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Stateful watcher with no Apple equivalent; refused with exit 64."
+  },
+  {
+    "id": "docker system info",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container system status",
+    "evidence": "fake",
+    "test": null,
+    "note": "Maps to docker info; only the {{.Driver}} --format template is translated."
+  },
+  {
+    "id": "docker system prune",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Non-interactive; runs Apple prune, image prune, network prune, and volume prune."
+  },
+  {
+    "id": "docker tag",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container image tag",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_push_pull_round_trip_keeps_digest_and_oci_index_manifest",
+    "note": "Basic form only; Docker-only flags are not translated."
+  },
+  {
+    "id": "docker version",
+    "kind": "command",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Renders a Docker-shaped client/server version from Apple CLI and apiserver status."
+  },
+  {
+    "id": "docker volume create",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container volume create",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker volume inspect",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container volume inspect",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker volume ls",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container volume list",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker volume prune",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container volume prune",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "docker volume rm",
+    "kind": "command",
+    "status": "PARTIAL",
+    "apple": "container volume delete",
+    "evidence": "fake",
+    "test": null,
+    "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
+  },
+  {
+    "id": "run --add-host",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no add-host flag."
+  },
+  {
+    "id": "run --arch",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--arch",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --arch."
+  },
+  {
+    "id": "run --cap-add",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--cap-add",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*."
+  },
+  {
+    "id": "run --cap-drop",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--cap-drop",
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_cap_drop_all_leaves_no_effective_capabilities",
+    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*."
+  },
+  {
+    "id": "run --cidfile",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--cidfile",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --cidfile."
+  },
+  {
+    "id": "run --cpus",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--cpus",
+    "evidence": "fake",
+    "test": null,
+    "note": "Normalized and forwarded to Apple --cpus as a fractional CPU count."
+  },
+  {
+    "id": "run --cwd",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-w",
+    "evidence": "fake",
+    "test": null,
+    "note": "Alias of --workdir; translated to Apple -w."
+  },
+  {
+    "id": "run --detach",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-d",
+    "evidence": "fake",
+    "test": null,
+    "note": "Detached run re-adds -d and generates a --name when none is given; create refuses -d with exit 64."
+  },
+  {
+    "id": "run --device",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough."
+  },
+  {
+    "id": "run --dns",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--dns",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --dns."
+  },
+  {
+    "id": "run --dns-option",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--dns-option",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --dns-option."
+  },
+  {
+    "id": "run --dns-search",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--dns-search",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --dns-search."
+  },
+  {
+    "id": "run --entrypoint",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--entrypoint",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --entrypoint."
+  },
+  {
+    "id": "run --env",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-e",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple -e."
+  },
+  {
+    "id": "run --env-file",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--env-file",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --env-file."
+  },
+  {
+    "id": "run --hostname",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no hostname flag."
+  },
+  {
+    "id": "run --init",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--init",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --init."
+  },
+  {
+    "id": "run --interactive",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-i",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple -i."
+  },
+  {
+    "id": "run --label",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--label",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --label."
+  },
+  {
+    "id": "run --memory",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--memory",
+    "evidence": "fake",
+    "test": null,
+    "note": "Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity."
+  },
+  {
+    "id": "run --mount",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--mount",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --mount without content validation."
+  },
+  {
+    "id": "run --name",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--name",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --name."
+  },
+  {
+    "id": "run --network",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--network",
+    "evidence": "fake",
+    "test": null,
+    "note": "Verified networks forward verbatim; --network=none is refused (see run --network none)."
+  },
+  {
+    "id": "run --network none",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "No verified Apple container equivalent; refused with exit 64 as an unsafe translation."
+  },
+  {
+    "id": "run --no-dns",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--no-dns",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --no-dns."
+  },
+  {
+    "id": "run --pids-limit",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no process-count limit."
+  },
+  {
+    "id": "run --platform",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--platform",
+    "evidence": "live",
+    "test": "test_live_images.LiveImageTests.test_fixture_g_amd64_image_runs_only_with_an_explicit_platform",
+    "note": "Forwarded verbatim to Apple --platform."
+  },
+  {
+    "id": "run --privileged",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_privileged_is_refused_before_any_container_is_created",
+    "note": "Refused with exit 64; Apple container 1.5.0 has no privileged mode."
+  },
+  {
+    "id": "run --publish",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--publish",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --publish."
+  },
+  {
+    "id": "run --read-only",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--read-only",
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_read_only_root_filesystem_rejects_writes",
+    "note": "Forwarded verbatim; guest writes fail on the read-only root filesystem."
+  },
+  {
+    "id": "run --rm",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--rm",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --rm."
+  },
+  {
+    "id": "run --runtime",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--runtime",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --runtime."
+  },
+  {
+    "id": "run --security-opt",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob."
+  },
+  {
+    "id": "run --shm-size",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--shm-size",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --shm-size."
+  },
+  {
+    "id": "run --storage-opt",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no storage driver options, and the create probe exits 125."
+  },
+  {
+    "id": "run --sysctl",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no sysctl passthrough."
+  },
+  {
+    "id": "run --tmpfs",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--tmpfs",
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_tmpfs_options_are_applied_to_the_mount",
+    "note": "Forwarded verbatim including options, which the runtime applies to the mount."
+  },
+  {
+    "id": "run --tty",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-t",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple -t."
+  },
+  {
+    "id": "run --ulimit",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--ulimit",
+    "evidence": "fake",
+    "test": null,
+    "note": "Forwarded verbatim to Apple --ulimit."
+  },
+  {
+    "id": "run --user",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "--user",
+    "evidence": "live",
+    "test": "test_live_security.LiveSecurityTests.test_user_maps_to_uid_1000",
+    "note": "Forwarded verbatim; a numeric user maps to that UID in the guest."
+  },
+  {
+    "id": "run --volume",
+    "kind": "option",
+    "status": "PARTIAL",
+    "apple": "--mount",
+    "evidence": "fake",
+    "test": null,
+    "note": "Bind mounts translate to Apple --mount with ro becoming readonly; other mode flags are dropped."
+  },
+  {
+    "id": "run --workdir",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": "-w",
+    "evidence": "fake",
+    "test": null,
+    "note": "Translated to Apple -w, accepting the --cwd and -w aliases."
+  }
+]
