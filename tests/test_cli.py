@@ -9,6 +9,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+TIER = "fake"
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER = ROOT / "bin" / "docker"
@@ -778,6 +779,87 @@ class CLIContractTests(ShimCLITestCase):
                 "images",
             ],
         )
+
+    def test_build_accepts_inline_values_for_every_value_option(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        result = self.docker(
+            "build",
+            "--tag=example/x:1",
+            "--file=images/Dockerfile",
+            "--build-arg=FOO=bar",
+            "--memory=2g",
+            "--cpus=2",
+            "--output=type=local,dest=out",
+            "images",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads((self.root / "build-args.json").read_text())
+        self.assertEqual(
+            args,
+            [
+                "build",
+                "--tag",
+                "example/x:1",
+                "--file",
+                "images/Dockerfile",
+                "--build-arg",
+                "FOO=bar",
+                "--memory",
+                "2G",
+                "--cpus",
+                "2",
+                "--output",
+                "type=local,dest=out",
+                "images",
+            ],
+        )
+
+    def test_build_forwards_multi_platform_list_unchanged(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        for forms in (
+            ("--platform", "linux/amd64,linux/arm64"),
+            ("--platform=linux/amd64,linux/arm64",),
+        ):
+            with self.subTest(forms=forms):
+                result = self.docker("build", *forms, "images")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads((self.root / "build-args.json").read_text())
+                self.assertEqual(
+                    args,
+                    ["build", "--platform", "linux/amd64,linux/arm64", "images"],
+                )
+
+    def test_build_forwards_secret_verbatim(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        for forms in (
+            ("--secret", "id=tok,src=/tmp/tok"),
+            ("--secret=id=tok,env=TOKEN",),
+        ):
+            with self.subTest(forms=forms):
+                result = self.docker("build", *forms, "images")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads((self.root / "build-args.json").read_text())
+                value = forms[-1].split("=", 1)[1] if len(forms) == 1 else forms[-1]
+                self.assertEqual(args, ["build", "--secret", value, "images"])
+
+    def test_build_ssh_default_is_forwarded(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        for forms in (("--ssh", "default"), ("--ssh=default",)):
+            with self.subTest(forms=forms):
+                result = self.docker("build", *forms, "images")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads((self.root / "build-args.json").read_text())
+                self.assertEqual(args, ["build", "--ssh", "default", "images"])
+
+    def test_build_ssh_other_forms_are_refused(self) -> None:
+        for forms in (
+            ("--ssh", "mykey=/tmp/key"),
+            ("--ssh=id=/tmp/agent.sock",),
+        ):
+            with self.subTest(forms=forms):
+                result = self.docker("build", *forms, "images")
+                self.assertEqual(result.returncode, 64)
+                self.assertIn("only --ssh default is supported", result.stderr)
 
     def test_build_help_forwards_to_container_build_help(self) -> None:
         result = self.docker("build", "--help")

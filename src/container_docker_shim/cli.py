@@ -6,6 +6,7 @@ import os
 import platform as host_platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -64,16 +65,42 @@ def _run_container_passthrough(args: list[str]) -> int:
     cmd = [_container_bin(), *args]
     _debug("container passthrough: " + json.dumps(cmd))
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             stdin=sys.stdin,
             stdout=sys.stdout,
             stderr=sys.stderr,
-            check=False,
         )
     except FileNotFoundError:
         raise ShimError(f"Apple container CLI not found: {_container_bin()}")
-    return result.returncode
+
+    def forward(signum: int, _frame: Any) -> None:
+        # Without this, SIGTERM would end the shim and leave `container` running.
+        try:
+            process.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[signum] = signal.signal(signum, forward)
+        except ValueError:  # not the main thread: nothing to forward
+            break
+    try:
+        returncode = process.wait()
+    except KeyboardInterrupt:
+        # Same contract as subprocess.run: give the child a moment, then kill it.
+        try:
+            process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    return 128 - returncode if returncode < 0 else returncode
 
 
 def _print_completed(result: subprocess.CompletedProcess[str]) -> None:
@@ -1334,16 +1361,10 @@ def cmd_port(argv: list[str]) -> int:
     return 0
 
 
-def _parse_run_options(
-    argv: list[str],
-) -> tuple[list[str], str | None, list[str], bool, str | None]:
-    """Translate Docker `run`/`create` flags into Apple container flags.
-
-    Returns (opts, image, command, detach, name). `opts` never contains `-d`;
-    the caller decides whether to detach. Raises ShimError on unsupported input
-    so main() renders the standard clear error.
-    """
-    value_options = {
+# Option sets used by _parse_run_options. tests/test_option_sets.py keeps them
+# in sync with the flag literals in that function.
+RUN_VALUE_OPTIONS = frozenset(
+    {
         "--arch",
         "--cap-add",
         "--cap-drop",
@@ -1359,10 +1380,62 @@ def _parse_run_options(
         "--shm-size",
         "--ulimit",
     }
-    bool_options = {"--init", "--read-only", "--rm", "--no-dns"}
-    # Common Docker run flags Apple `container run` has no equivalent for. Refuse
-    # them with a clear message instead of forwarding a flag the CLI rejects opaquely.
-    unsupported_apple_options = {"--add-host", "--hostname"}
+)
+RUN_BOOL_OPTIONS = frozenset({"--init", "--read-only", "--rm", "--no-dns"})
+# Common Docker run flags Apple `container run` has no equivalent for. Refuse
+# them with a clear message instead of forwarding a flag the CLI rejects opaquely.
+RUN_REFUSED_OPTIONS = frozenset({"--add-host", "--hostname"})
+# Flags matched by literal in the _parse_run_options if/elif chain.
+RUN_EXPLICIT_OPTIONS = frozenset(
+    {
+        "-d",
+        "--detach",
+        "-i",
+        "--interactive",
+        "-t",
+        "--tty",
+        "-it",
+        "-ti",
+        "--name",
+        "--label",
+        "-l",
+        "--workdir",
+        "--cwd",
+        "-w",
+        "--env",
+        "-e",
+        "--volume",
+        "-v",
+        "--mount",
+        "--tmpfs",
+        "--memory",
+        "-m",
+        "--cpus",
+        "--user",
+        "-u",
+        "--network",
+        "--security-opt",
+        "--pids-limit",
+        "--privileged",
+        "--storage-opt",
+        "-p",
+        "-c",
+    }
+)
+
+
+def _parse_run_options(
+    argv: list[str],
+) -> tuple[list[str], str | None, list[str], bool, str | None]:
+    """Translate Docker `run`/`create` flags into Apple container flags.
+
+    Returns (opts, image, command, detach, name). `opts` never contains `-d`;
+    the caller decides whether to detach. Raises ShimError on unsupported input
+    so main() renders the standard clear error.
+    """
+    value_options = RUN_VALUE_OPTIONS
+    bool_options = RUN_BOOL_OPTIONS
+    unsupported_apple_options = RUN_REFUSED_OPTIONS
 
     detach = False
     name = None
@@ -1496,12 +1569,10 @@ def cmd_run(argv: list[str]) -> int:
     return _print_new_container_id(result, name)
 
 
-def cmd_build(argv: list[str]) -> int:
-    opts: list[str] = []
-    context = "."
-    saw_context = False
-
-    value_options = {
+# Option sets used by cmd_build. tests/test_option_sets.py keeps them in sync
+# with the flag literals in that function.
+BUILD_VALUE_OPTIONS = frozenset(
+    {
         "--arch",
         "--build-arg",
         "--file",
@@ -1512,7 +1583,53 @@ def cmd_build(argv: list[str]) -> int:
         "--secret",
         "--target",
     }
-    bool_options = {"--no-cache", "--pull", "--quiet"}
+)
+BUILD_BOOL_OPTIONS = frozenset({"--no-cache", "--pull", "--quiet"})
+# Flags Docker accepts but Apple `container build` has no equivalent for. Accept
+# them as no-ops so existing build scripts keep working.
+BUILD_NOOP_OPTIONS = frozenset({"--rm", "--force-rm"})
+# Build flags Apple `container build` has no equivalent for. Refuse them with
+# a clear message instead of forwarding a flag the CLI rejects opaquely.
+BUILD_REFUSED_OPTIONS = frozenset(
+    {
+        "--add-host",
+        "--build-context",
+        "--cache-from",
+        "--cache-to",
+        "--iidfile",
+        "--load",
+        "--network",
+        "--push",
+        "--ulimit",
+    }
+)
+# Flags matched by literal in the cmd_build while loop. "--file" and
+# "--output" stay in BUILD_VALUE_OPTIONS to keep the sets pairwise disjoint.
+BUILD_EXPLICIT_OPTIONS = frozenset(
+    {
+        "-h",
+        "--help",
+        "--tag",
+        "-t",
+        "-f",
+        "--memory",
+        "-m",
+        "--cpus",
+        "-c",
+        "-o",
+        "-q",
+        "--ssh",
+    }
+)
+
+
+def cmd_build(argv: list[str]) -> int:
+    opts: list[str] = []
+    context = "."
+    saw_context = False
+
+    value_options = BUILD_VALUE_OPTIONS
+    bool_options = BUILD_BOOL_OPTIONS
 
     i = 0
     while i < len(argv):
@@ -1538,57 +1655,46 @@ def cmd_build(argv: list[str]) -> int:
 
         arg, inline_value = _split_long(current)
         if arg in ("--tag", "-t"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--tag", value])
             continue
         if arg in ("--file", "-f"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--file", value])
             continue
         if arg in ("--memory", "-m"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--memory", _normalize_memory(value)])
             continue
         if arg in ("--cpus", "-c"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--cpus", _normalize_cpus(value)])
             continue
         if arg in ("--output", "-o"):
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend(["--output", value])
             continue
+        if arg == "--ssh":
+            value, i = _take_value(argv, i, arg)
+            # Apple `container build --ssh` takes only `default` (the host
+            # agent); Docker's `id=path` forms have no equivalent.
+            if value != "default":
+                return _die(
+                    f"unsupported docker build option for Apple container: "
+                    f"--ssh {value} (only --ssh default is supported)",
+                    64,
+                )
+            opts.extend(["--ssh", "default"])
+            continue
         if arg in value_options:
-            value = inline_value
-            if value is None:
-                value, i = _take_value(argv, i, arg)
+            value, i = _take_value(argv, i, arg)
             opts.extend([arg, value])
             continue
         if arg in bool_options or arg == "-q":
             opts.append("--quiet" if arg == "-q" else arg)
-        elif arg in {"--rm", "--force-rm"}:
+        elif arg in BUILD_NOOP_OPTIONS:
             _debug(f"accepted no-op build option {arg}")
-        elif arg in {
-            "--add-host",
-            "--build-context",
-            "--cache-from",
-            "--cache-to",
-            "--iidfile",
-            "--load",
-            "--network",
-            "--push",
-            "--ssh",
-            "--ulimit",
-        }:
+        elif arg in BUILD_REFUSED_OPTIONS:
             return _die(f"unsupported docker build option for Apple container: {current}", 64)
         else:
             return _die(f"unsupported docker build option: {current}", 64)
