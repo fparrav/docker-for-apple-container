@@ -1,0 +1,297 @@
+"""Compose normalizer adapter around the official `docker-compose` binary.
+
+The adapter runs ``docker-compose <global flags> config --format json`` and
+converts the JSON into the model that ``compose.py`` reads, so compose
+semantics (merging, interpolation, profiles) stay Compose's.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+# When set, names the exact `docker-compose` executable to use (never
+# searched on `PATH`); the value must be an existing file.
+EXECUTABLE_ENV = "CONTAINER_DOCKER_SHIM_COMPOSE"
+# Set in the child's environment so a re-entering call (for example through
+# a `docker compose` plugin wrapper that re-invokes the shim) can be
+# detected and refused.
+MARKER_ENV = "CONTAINER_DOCKER_SHIM_NORMALIZING"
+
+
+class NormalizerError(Exception):
+    """A normalizer failure; ``.code`` is the shim's exit code."""
+
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Inputs:
+    """Compose global flags to forward to the normalizer call.
+
+    ``files``, ``env_files`` and ``profiles`` are tuples of strings, one
+    entry per repeated ``-f``, ``--env-file`` or ``--profile`` flag;
+    ``project_name`` and ``project_dir`` map to ``-p`` and
+    ``--project-directory``.
+    """
+
+    files: tuple = ()
+    env_files: tuple = ()
+    profiles: tuple = ()
+    project_name: Optional[str] = None
+    project_dir: Optional[str] = None
+
+
+def build_argv(executable: str, inputs: Inputs, tail: Sequence[str]) -> list:
+    """Build the full argv for one normalizer call.
+
+    The order is fixed: the executable, every ``-f`` file, every
+    ``--env-file`` env file, every ``--profile`` profile, ``-p`` project
+    name, ``--project-directory``, and then ``tail`` (the subcommand, e.g.
+    ``["config", "--format", "json"]``). ``None`` or empty-string entries
+    are omitted, so ``build_argv("docker-compose", Inputs(), tail)``
+    returns ``["docker-compose", *tail]``.
+    """
+    argv = [executable]
+    for flag in inputs.files:
+        if flag:
+            argv += ["-f", flag]
+    for env_file in inputs.env_files:
+        if env_file:
+            argv += ["--env-file", env_file]
+    for profile in inputs.profiles:
+        if profile:
+            argv += ["--profile", profile]
+    if inputs.project_name:
+        argv += ["-p", inputs.project_name]
+    if inputs.project_dir:
+        argv += ["--project-directory", inputs.project_dir]
+    argv.extend(tail)
+    return argv
+
+
+def resolve_executable(
+    env: Mapping[str, Optional[str]],
+    which: Callable[[str], Optional[str]],
+    launcher_paths: Sequence[str],
+    is_file=os.path.isfile,
+    realpath=os.path.realpath,
+) -> Optional[str]:
+    """Pick the ``docker-compose`` executable for a normalizer call.
+
+    When ``env`` has ``EXECUTABLE_ENV`` set to a non-empty value, that
+    value is used as-is and never searched on ``PATH``; a value that is
+    not an existing file raises ``NormalizerError`` naming the variable
+    and the path. Otherwise the candidate is ``which("docker-compose")``,
+    or ``None`` when the binary is not on ``PATH``.
+
+    The loop guard refuses re-entry before returning a candidate: when
+    ``env`` already has ``MARKER_ENV`` set, ``NormalizerError`` says the
+    shim was ``re-entered``; and when ``realpath`` of the candidate
+    equals the ``realpath`` of any ``launcher_paths`` entry (checked for
+    the explicit value and the ``PATH`` candidate alike),
+    ``NormalizerError`` says a ``loop`` was detected and names the
+    offending path. With no candidate at all, ``None`` is returned even
+    when the marker is set.
+    """
+    explicit = env.get(EXECUTABLE_ENV)
+    if explicit:
+        if not is_file(explicit):
+            raise NormalizerError(
+                "%s names a path that is not an existing file: %s"
+                % (EXECUTABLE_ENV, explicit)
+            )
+        candidate = explicit
+    else:
+        candidate = which("docker-compose")
+    if not candidate:
+        return None
+    if MARKER_ENV in env:
+        raise NormalizerError(
+            "%s is already set: the shim re-entered through %s; refusing "
+            "to run the compose normalizer a second time" % (MARKER_ENV, candidate)
+        )
+    for launcher in launcher_paths:
+        if realpath(candidate) == realpath(launcher):
+            raise NormalizerError(
+                "executable %s resolves to shim launcher path %s: detected "
+                "a loop, refusing to run it" % (candidate, launcher)
+            )
+    return candidate
+
+
+def child_env(env: Mapping[str, Optional[str]]) -> dict:
+    """Environment for the compose normalizer child process.
+
+    A copy of ``env`` with ``MARKER_ENV`` set to ``"1"`` so a wrapper
+    around the normalizer that re-invokes the shim is caught by the loop
+    guard in :func:`resolve_executable`. The argument is not mutated.
+    """
+    child = dict(env)
+    child[MARKER_ENV] = "1"
+    return child
+
+
+def load_normalized(
+    executable: str,
+    inputs: Inputs,
+    run: Callable[[list, dict], Any],
+    env: Mapping[str, Optional[str]],
+) -> tuple[dict, str]:
+    """Fetch the normalized compose model and return it with the stderr.
+
+    Runs ``run(build_argv(executable, inputs, ["config", "--format",
+    "json"]), child_env(env))``; ``run`` returns an object with
+    ``returncode``, ``stdout`` and ``stderr`` (strings). On success the
+    parsed JSON object is returned together with the child's ``stderr``
+    text. A non-zero exit code raises ``NormalizerError`` (code 1)
+    carrying the stripped ``stderr``, or
+    ``"docker-compose config failed"`` when that is empty; ``stdout``
+    that is not valid JSON, or whose top-level value is not a JSON
+    object, raises ``NormalizerError`` naming the problem; an
+    ``OSError`` from ``run`` is reported with its text. No process is
+    spawned here; the caller owns execution.
+    """
+    argv = build_argv(executable, inputs, ["config", "--format", "json"])
+    try:
+        result = run(argv, child_env(env))
+    except OSError as exc:
+        raise NormalizerError(str(exc))
+    if result.returncode != 0:
+        message = str(result.stderr).strip()
+        raise NormalizerError(
+            message if message else "docker-compose config failed",
+            code=1,
+        )
+    try:
+        model = json.loads(str(result.stdout))
+    except ValueError as exc:
+        raise NormalizerError(
+            "compose normalizer returned invalid JSON: %s" % exc
+        )
+    if not isinstance(model, dict):
+        raise NormalizerError(
+            "compose normalizer returned a JSON %s, expected an object"
+            % type(model).__name__
+        )
+    return model, str(result.stderr)
+
+
+def executable_version(
+    executable: str,
+    run: Callable[[list, dict], Any],
+    env: Mapping[str, Optional[str]],
+) -> str:
+    """Return the executable's short version string, or ``"unknown"``.
+
+    Runs ``run([executable, "version", "--short"], child_env(env))``
+    (``run`` returns an object with ``returncode``, ``stdout`` and
+    ``stderr``, as in :func:`load_normalized`) and returns the stripped
+    ``stdout``. A non-zero exit code, a ``stdout`` that is blank once
+    stripped, or an ``OSError`` from ``run`` all yield ``"unknown"``;
+    this is a best-effort query that never raises. No process is
+    spawned here; the caller owns execution.
+    """
+    try:
+        result = run([executable, "version", "--short"], child_env(env))
+    except OSError:
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    version = str(result.stdout).strip()
+    return version if version else "unknown"
+
+
+def _convert_port(port: Any) -> Any:
+    """Render one normalized ``ports`` object as a compose port string.
+
+    The result is ``[host_ip:]published:target`` when ``published`` is
+    present, else just ``target``; ``/<protocol>`` is appended only when
+    the protocol is not ``tcp`` (a missing ``host_ip`` is simply omitted).
+    Entries that are not mappings are copied unchanged.
+    """
+    if not isinstance(port, dict):
+        return port
+    published = port.get("published")
+    host_ip = port.get("host_ip")
+    protocol = port.get("protocol") or "tcp"
+    if published:
+        result = "%s:%s" % (published, port.get("target"))
+        if host_ip:
+            result = "%s:%s" % (host_ip, result)
+    else:
+        result = str(port.get("target"))
+    if protocol != "tcp":
+        result += "/%s" % protocol
+    return result
+
+
+def _convert_service(service: Mapping[str, Any]) -> dict:
+    """Copy a service, dropping top-level ``None`` keys and rendering ports.
+
+    Only keys whose value is ``None`` are dropped (no recursion: e.g.
+    ``networks: {"default": None}`` is kept as-is); its ``ports`` entries
+    are rendered to strings by :func:`_convert_port`; every other value is
+    copied unchanged.
+    """
+    result: dict = {}
+    for key, value in service.items():
+        if value is None:
+            continue
+        if key == "ports" and isinstance(value, list):
+            value = [_convert_port(entry) for entry in value]
+        result[key] = value
+    return result
+
+
+def convert_model(raw: Any, version: str) -> dict:
+    """Convert the normalized JSON into the model dictionary ``compose.py`` reads.
+
+    Returns ``{"name", "services", "networks", "volumes"}`` taken from
+    ``raw`` (missing ``networks``/``volumes`` become ``{}``); inside every
+    service, keys whose value is ``None`` are dropped (no recursion) and
+    each ``ports`` object becomes a port string (see :func:`_convert_port`);
+    every other service value is copied unchanged, and top-level ``x-*``
+    keys and everything else are ignored.
+
+    A ``raw`` that is not a mapping, has no ``name`` string, has
+    ``services`` that is not a mapping, or has a service that is not a
+    mapping raises ``NormalizerError`` whose message names
+    ``Docker Compose <version>`` and the offending key.
+    """
+    if not isinstance(raw, dict):
+        raise NormalizerError(
+            "Docker Compose %s: the normalized model must be a mapping, "
+            "got %s" % (version, type(raw).__name__)
+        )
+    name = raw.get("name")
+    if not isinstance(name, str):
+        raise NormalizerError(
+            "Docker Compose %s: 'name' must be a string, got %r"
+            % (version, name)
+        )
+    services = raw.get("services")
+    if services is None:
+        services = {}
+    if not isinstance(services, dict):
+        raise NormalizerError(
+            "Docker Compose %s: 'services' must be a mapping, got %s"
+            % (version, type(services).__name__)
+        )
+    converted: dict = {}
+    for service_name, service in services.items():
+        if not isinstance(service, dict):
+            raise NormalizerError(
+                "Docker Compose %s: service %r must be a mapping, got %s"
+                % (version, service_name, type(service).__name__)
+            )
+        converted[service_name] = _convert_service(service)
+    return {
+        "name": name,
+        "services": converted,
+        "networks": raw.get("networks") or {},
+        "volumes": raw.get("volumes") or {},
+    }

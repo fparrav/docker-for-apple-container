@@ -1,0 +1,38 @@
+x-common: &common
+  restart: unless-stopped
+  environment:
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+services:
+  api:
+    <<: *common
+    image: ${API_IMAGE:-alpine:3.20}
+    command: |
+      sh -c "echo starting
+      sleep infinity"
+    ports:
+      - "8080:80"
+      - "127.0.0.1:9090:90/udp"
+    volumes:
+      - data:/data
+      - ./conf:/etc/conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 1m30s
+      timeout: 5s
+    depends_on:
+      db:
+        condition: service_healthy
+    build:
+      context: ./api
+      args:
+        FOO: bar
+  db:
+    <<: *common
+    image: postgres:17
+    env_file: db.env
+  debug:
+    image: alpine:3.20
+    profiles: [debug]
+    command: ["sleep", "infinity"]
+volumes:
+  data: {}

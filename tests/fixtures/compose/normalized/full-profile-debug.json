@@ -1,0 +1,123 @@
+{
+  "name": "full",
+  "networks": {
+    "default": {
+      "name": "full_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "api": {
+      "restart": "unless-stopped",
+      "command": [
+        "sh",
+        "-c",
+        "echo starting\nsleep infinity"
+      ],
+      "entrypoint": null,
+      "environment": {
+        "EXTRA": "from-override",
+        "LOG_LEVEL": "debug"
+      },
+      "image": "alpine:3.20",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "data",
+          "target": "/data",
+          "volume": {}
+        },
+        {
+          "type": "bind",
+          "source": "__PROJECT_DIR__/conf",
+          "target": "/etc/conf",
+          "read_only": true,
+          "bind": {}
+        }
+      ],
+      "build": {
+        "context": "__PROJECT_DIR__/api",
+        "dockerfile": "Dockerfile",
+        "args": {
+          "FOO": "bar"
+        }
+      },
+      "depends_on": {
+        "db": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "true"
+        ],
+        "timeout": "5s",
+        "interval": "1m30s"
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 80,
+          "published": "8080",
+          "protocol": "tcp"
+        },
+        {
+          "mode": "ingress",
+          "host_ip": "127.0.0.1",
+          "target": 90,
+          "published": "9090",
+          "protocol": "udp"
+        },
+        {
+          "mode": "ingress",
+          "target": 81,
+          "published": "8081",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "db": {
+      "restart": "unless-stopped",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "LOG_LEVEL": "debug",
+        "POSTGRES_PASSWORD": "secret"
+      },
+      "image": "postgres:17",
+      "networks": {
+        "default": null
+      }
+    },
+    "debug": {
+      "profiles": [
+        "debug"
+      ],
+      "command": [
+        "sleep",
+        "infinity"
+      ],
+      "entrypoint": null,
+      "image": "alpine:3.20",
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "volumes": {
+    "data": {
+      "name": "full_data"
+    }
+  },
+  "x-common": {
+    "environment": {
+      "LOG_LEVEL": "debug"
+    },
+    "restart": "unless-stopped"
+  }
+}
