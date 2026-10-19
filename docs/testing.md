@@ -60,6 +60,20 @@ images they need:
 The live and conformance tiers use the **identical, unmodified** file, which is
 the point of the conformance tier.
 
+A fixture can describe something the shim must refuse. `n-network-none` asks for
+`network_mode: none`: the live tier asserts `up` exits 64 with a `REFUSED:` line
+and creates nothing, while the conformance tier asserts real Docker starts the
+service with only the loopback interface. `m-readonly-volume` mounts a named
+volume and a bind read-only, and both tiers assert that a write fails.
+
+Two fixtures cover resource identity and service selection.
+`o-external-volume` declares a volume `external: true` with `name: ${EXT_VOLUME}`;
+the test pre-creates a disposable `shimtest-` volume, passes its name through a
+`.env` override, and asserts the data survives `down -v` and a second `up` and
+that no `<project>_` copy is created. `p-selective-up` has `api` depending on
+`db` (healthy) plus an unrelated `worker`: `up -d api` must create `db` and
+`api` only, after `db` is healthy, and `up -d --no-deps api` creates `api` alone.
+
 ## Conformance tier in CI
 
 The conformance tier needs a Docker Engine, so it is meant for CI or on-demand

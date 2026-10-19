@@ -5,8 +5,11 @@ deployment project in the sibling `armada/` directory.
 
 ## Runtime contract
 
-- Support exactly Apple `container` **1.4.1** on macOS 26. Do not add backward
-  compatibility paths or claim support for unverified newer releases.
+- Support exactly one Apple `container` release on macOS 26: the one declared
+  by `SUPPORTED_CONTAINER_VERSION` in `src/container_docker_shim/cli.py`. Do not
+  add backward compatibility paths or claim support for unverified newer
+  releases. Advance that constant, the test fixtures, and the README together
+  only after validating the new release.
 - When the supported runtime advances, update the code, fixtures, and README.
   Refresh the centrally published website in
   `appautomaton/appautomaton.github.io/sites/docker-for-apple-container/public/`
