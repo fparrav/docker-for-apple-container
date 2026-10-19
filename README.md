@@ -63,8 +63,10 @@ on the `container` executable, not directly on Apple's Containerization Swift
 package. Apple selects and bundles Containerization as part of `container`, so
 there is no separate framework to install or manage.
 
-Nothing else to install. The shim is pure Python standard library with no
-third-party packages, and it runs on the Python that ships with macOS.
+Nothing else is required. The shim is pure Python standard library with no
+third-party packages, and it runs on the Python that ships with macOS. The
+official `docker-compose` binary is optional and only widens what Compose files
+the shim can read (see [Compose normalizer](#compose-normalizer)).
 
 Start the apiserver with:
 
@@ -177,7 +179,7 @@ loudly.
 
 ### Compose (stateless orchestration)
 
-`docker compose up/down/ps/logs/build/pull/exec/start/stop/restart/rm/config/ls`
+`docker compose up/down/ps/logs/build/pull/exec/start/stop/restart/rm/config/ls/version`
 orchestrate multi-service stacks **without persisting any shim-owned state**.
 Apple `container` has no native compose, so the shim issues a sequence of
 `container` commands but keeps no project file. Every resource is tagged with
@@ -280,10 +282,10 @@ when available, then fall back to stable service-name order from labels.
   `down` removes no volume; `down -v` removes only the named volumes the shim
   created for that project (verified by label), never external or other-project
   volumes.
-- **YAML** is parsed by a small dependency-free subset parser (block maps and
-  sequences, flow collections, quoted scalars, comments, and `${VAR:-default}`
-  interpolation). Anchors, multi-document streams, and `|`/`>` block scalars are
-  out of scope.
+- **The Compose model comes from the official `docker-compose` when it is
+  installed**, and from a small built-in parser otherwise. See
+  [Compose normalizer](#compose-normalizer) below; `docker compose version`
+  reports which one is active.
 
 Compose keys with no Apple equivalent (the service-level `restart` policy,
 `hostname`, `secrets`, `configs`, `deploy` replicas, `extra_hosts`, and network
@@ -294,6 +296,43 @@ fail with exit 64 before any network or container is created (see
 [Security options](#security-options)).
 `compose run`, scaling, network aliases, continuous healthchecks and
 anonymous-volume removal remain intentionally out of scope.
+
+#### Compose normalizer
+
+The shim does not re-implement Compose. When the official Docker Compose binary
+is available it renders the merged, interpolated model with
+`docker-compose config --format json`, and the shim only translates that model
+into Apple `container` commands. Install it without Docker Desktop:
+
+```bash
+brew install docker-compose
+```
+
+No Docker Engine is needed: `config` renders the model without contacting one
+(verified with Docker Compose 5.6.0, the tested release). The binary is found
+through `CONTAINER_DOCKER_SHIM_COMPOSE` (an explicit path that must exist; there
+is no fallback after an explicit choice) or else `PATH`. The shim never calls
+`docker compose` to normalize and refuses a binary that resolves back to itself.
+
+With the official binary the shim supports repeatable `-f` files merged in
+order, the automatic `compose.override.yaml`, `--env-file` and `.env`,
+`--profile`, `COMPOSE_FILE`, `COMPOSE_PROFILES`, `COMPOSE_PROJECT_NAME`,
+`--project-directory`, YAML anchors, aliases, merge keys, `|`/`>` block scalars,
+`extends`, `include`, `env_file` and relative paths exactly as Compose resolves
+them. `docker compose config` prints the normalized JSON and `config -q` only
+validates it.
+
+`docker compose version` prints `normalizer: official <version>` or
+`normalizer: built-in subset`. Switching normalizer changes the model's
+fingerprint, so the next `up` may recreate containers once.
+
+Without the official binary the built-in parser reads only block maps and
+sequences, flow collections, quoted scalars, comments and `${VAR:-default}`
+interpolation. It **refuses, with exit 64 and the install hint**, everything it
+cannot read instead of misreading it: anchors, aliases, merge keys, `|`/`>`
+block scalars, multi-document files, `include`, `extends` and `profiles`; several
+`-f` files, `--profile`, `COMPOSE_PROFILES` and an automatically merged override
+file are refused as well.
 
 ### Refused, by design
 

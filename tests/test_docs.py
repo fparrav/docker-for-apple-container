@@ -34,6 +34,18 @@ class DocumentationConsistencyTests(unittest.TestCase):
             passthrough,
         )
 
+    def test_readme_documents_the_compose_normalizer(self) -> None:
+        for expected in (
+            "brew install docker-compose",
+            "CONTAINER_DOCKER_SHIM_COMPOSE",
+            "normalizer: official",
+            "normalizer: built-in subset",
+            "5.6.0",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self.readme)
+        self.assertNotIn("Anchors, multi-document streams, and `|`/`>` block scalars are\n  out of scope", self.readme)
+
     def test_cli_help_uses_the_same_image_classification(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
