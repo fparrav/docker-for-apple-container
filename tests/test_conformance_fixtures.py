@@ -33,6 +33,7 @@ while real Docker reports it — the conformance test asserts the numeric 3.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -55,6 +56,10 @@ from test_live_fixtures import (  # noqa: E402
     FIXTURE_H,
     FIXTURE_I,
     FIXTURE_K,
+    FIXTURE_M,
+    FIXTURE_N,
+    FIXTURE_O,
+    FIXTURE_P,
     FIXTURES_DIR,
     HTTP_URL,
     UP_TIMEOUT_SECONDS,
@@ -276,6 +281,149 @@ class ConformanceFixtureTests(unittest.TestCase):
         self.assertNotIn(project, volumes.stdout + volumes.stderr)
 
     @tiers.conformance_tier()
+    def test_fixture_o_external_volume_survives_down_v_and_is_reused(self) -> None:
+        client = _client()
+
+        # 0. Pre-create the external volume the fixture declares (its name
+        #    arrives through a `.env` override) through the real client; a
+        #    cleanup removes it by the exact name — `down -v` must not.
+        ext = tiers.disposable_name("ext")
+
+        def _remove_external_volume(name: str) -> None:
+            # Ignore errors: the volume may already be gone.
+            _run([client, "volume", "rm", name])
+
+        # Registered before the create so a failed create is still cleaned up.
+        self.addCleanup(_remove_external_volume, ext)
+        result = _run([client, "volume", "create", ext])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        harness = FixtureHarness(
+            self,
+            FIXTURE_O,
+            overrides={".env": f"EXT_VOLUME={ext}\n"},
+            docker=client,
+            prefix="conf",
+        )
+        project = harness.project
+
+        # 1. Detached up, then wait for postgres to accept connections.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._wait_for_postgres_ready(harness)
+
+        # 2. Write a row into the data directory on the external volume.
+        result = harness.compose(
+            "exec",
+            "-T",
+            "db",
+            "psql",
+            "-U",
+            "postgres",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "CREATE TABLE IF NOT EXISTS notes(id serial primary key, body text); "
+            "INSERT INTO notes(body) VALUES ('survives down -v');",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 3. `down -v` must not remove the external volume: it is not the
+        #    project's, so it is still listed afterwards.
+        result = harness.compose("down", "-v")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        volumes = _run([client, "volume", "ls", "--format", "{{.Name}}"])
+        self.assertEqual(volumes.returncode, 0, volumes.stdout + volumes.stderr)
+        self.assertIn(ext, volumes.stdout + volumes.stderr)
+
+        # 4. `up` again reuses the same external volume, so the row is back.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._wait_for_postgres_ready(harness)
+        result = harness.compose(
+            "exec",
+            "-T",
+            "db",
+            "psql",
+            "-U",
+            "postgres",
+            "-t",
+            "-A",
+            "-c",
+            "SELECT body FROM notes ORDER BY id",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("survives down -v", result.stdout)
+
+        # 5. The project created no volume of its own for the declaration:
+        #    neither the key-prefixed nor the name-prefixed copy exists.
+        volumes = _run([client, "volume", "ls", "--format", "{{.Name}}"])
+        self.assertEqual(volumes.returncode, 0, volumes.stdout + volumes.stderr)
+        listing = volumes.stdout + volumes.stderr
+        self.assertNotIn(f"{project}_pgext", listing)
+        self.assertNotIn(f"{project}_{ext}", listing)
+
+    @tiers.conformance_tier()
+    def test_fixture_p_up_service_creates_its_dependency_and_not_unrelated_services(self) -> None:
+        harness = FixtureHarness(self, FIXTURE_P, docker=_client(), prefix="conf")
+        project = harness.project
+        client = _client()
+
+        # 1. The up of one service pulls in its dependency closure: db and
+        #    api are started, the unrelated worker never.
+        result = harness.compose("up", "-d", "api", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. `docker ps -a` proves the selection.
+        listing = _run([client, "ps", "-a", "--format", "{{.Names}}"])
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        names = listing.stdout + listing.stderr
+        self.assertIn(f"{project}-db-1", names)
+        self.assertIn(f"{project}-api-1", names)
+        self.assertNotIn(f"{project}-worker-1", names)
+
+        # 3. api started only after db's first passing healthcheck ended:
+        #    compare api's start with the end of db's first successful probe.
+        inspected = _run(
+            [client, "inspect", "--format", "{{json .State.Health.Log}}", f"{project}-db-1"]
+        )
+        self.assertEqual(inspected.returncode, 0, inspected.stdout + inspected.stderr)
+        passing = [
+            entry["End"]
+            for entry in json.loads(inspected.stdout)
+            if entry.get("ExitCode") == 0
+        ]
+        self.assertTrue(passing, f"db never passed a healthcheck: {inspected.stdout}")
+        first_healthy = _started_key(passing[0].replace("+00:00", "Z"))
+        api_key = _started_key(_started_at(client, f"{project}-api-1"))
+        self.assertLessEqual(
+            first_healthy,
+            api_key,
+            f"api started before db was healthy: healthy={first_healthy} api={api_key}",
+        )
+
+    @tiers.conformance_tier()
+    def test_fixture_p_no_deps_creates_only_the_named_service(self) -> None:
+        harness = FixtureHarness(self, FIXTURE_P, docker=_client(), prefix="conf")
+        project = harness.project
+        client = _client()
+
+        # 1. `--no-deps` up acts on the named service alone; real Docker
+        #    prints no shim notice, so only the selection is asserted.
+        result = harness.compose(
+            "up", "-d", "--no-deps", "api", timeout=UP_TIMEOUT_SECONDS
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. `docker ps -a` proves nothing else of the project exists.
+        listing = _run([client, "ps", "-a", "--format", "{{.Names}}"])
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        names = listing.stdout + listing.stderr
+        self.assertIn(f"{project}-api-1", names)
+        self.assertNotIn(f"{project}-db-1", names)
+        self.assertNotIn(f"{project}-worker-1", names)
+
+    @tiers.conformance_tier()
     def test_fixture_c_service_names_resolve_inside_the_api_container(self) -> None:
         harness = FixtureHarness(self, FIXTURE_C, docker=_client(), prefix="conf")
 
@@ -420,6 +568,33 @@ class ConformanceFixtureTests(unittest.TestCase):
         env = harness.compose(*files, "exec", "-T", "web", "env")
         self.assertEqual(env.returncode, 0, env.stdout + env.stderr)
         self.assertIn("LAYER=override", env.stdout)
+
+    @tiers.conformance_tier()
+    def test_fixture_m_read_only_volume_and_bind_reject_writes(self) -> None:
+        harness = FixtureHarness(self, FIXTURE_M, docker=_client(), prefix="conf")
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self._wait_for_log(harness, "writer", "VOL_WRITE_BLOCKED")
+        self._wait_for_log(harness, "writer", "BIND_WRITE_BLOCKED")
+
+        for target in ("/vol/y", "/shared/y"):
+            attempt = harness.compose("exec", "-T", "writer", "touch", target)
+            self.assertNotEqual(attempt.returncode, 0, f"write to {target} succeeded")
+            self.assertIn("Read-only file system", attempt.stdout + attempt.stderr)
+
+    @tiers.conformance_tier()
+    def test_fixture_n_network_mode_none_has_no_connectivity(self) -> None:
+        harness = FixtureHarness(self, FIXTURE_N, docker=_client(), prefix="conf")
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # Docker honours the isolation request: only the loopback interface.
+        interfaces = harness.compose("exec", "-T", "isolated", "ls", "/sys/class/net")
+        self.assertEqual(interfaces.returncode, 0, interfaces.stdout + interfaces.stderr)
+        self.assertEqual(interfaces.stdout.split(), ["lo"])
 
     @tiers.conformance_tier()
     def test_fixture_k_exited_container_reports_numeric_exit_code(self) -> None:

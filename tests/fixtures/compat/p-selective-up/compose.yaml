@@ -1,0 +1,20 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  db:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+      timeout: 3s
+      retries: 5
+  api:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    image: alpine:3.20
+    command: ["sleep", "3600"]

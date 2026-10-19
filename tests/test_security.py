@@ -104,6 +104,68 @@ class UnenforcedOptInTests(unittest.TestCase):
     def test_unknown_option_is_ok(self):
         self.assertEqual(security.decide("no-such-option", {}).action, "ok")
 
+    def test_waivable_rules_are_only_the_restriction_options(self):
+        self.assertEqual(
+            {
+                name
+                for name, rule in security.RULES.items()
+                if rule.status == security.UNSUPPORTED and rule.waivable
+            },
+            {
+                "security-opt",
+                "pids-limit",
+                "storage-opt",
+                "privileged",
+                "sysctls",
+                "devices",
+            },
+        )
+
+    def test_waiving_network_none_still_refuses(self):
+        env = {security.ENV_ALLOW: "network-none"}
+        decision = security.decide("network-none", env)
+        self.assertEqual(decision.action, "refuse")
+        self.assertIn("cannot be waived", decision.message)
+        self.assertIn(security.ENV_ALLOW, decision.message)
+
+    def test_network_none_without_opt_in_refuses(self):
+        decision = security.decide("network-none", {})
+        self.assertEqual(decision.action, "refuse")
+        self.assertIn("cannot be waived", decision.message)
+
+    def test_waiving_pids_limit_skips(self):
+        env = {security.ENV_ALLOW: "pids-limit"}
+        decision = security.decide("pids-limit", env)
+        self.assertEqual(decision.action, "skip")
+
+    def test_hostname_and_add_host_cannot_be_waived(self):
+        for name in ("hostname", "add-host"):
+            with self.subTest(name=name):
+                self.assertFalse(security.RULES[name].waivable, name)
+                self.assertEqual(
+                    security.decide(name, {security.ENV_ALLOW: name}).action,
+                    "refuse",
+                )
+
+    def test_unknown_waivers_reports_a_typo(self):
+        env = {security.ENV_ALLOW: "pid-limit"}
+        self.assertEqual(security.unknown_waivers(env), ["pid-limit"])
+
+    def test_unknown_waivers_names_non_waivable_options(self):
+        env = {security.ENV_ALLOW: "network-none"}
+        self.assertEqual(security.unknown_waivers(env), ["network-none"])
+
+    def test_unknown_waivers_is_sorted_and_without_duplicates(self):
+        env = {security.ENV_ALLOW: "zzz, pids-limit, zzz, network-none"}
+        self.assertEqual(security.unknown_waivers(env), ["network-none", "zzz"])
+
+    def test_unknown_waivers_empty_for_valid_names(self):
+        env = {security.ENV_ALLOW: "security-opt, pids-limit"}
+        self.assertEqual(security.unknown_waivers(env), [])
+
+    def test_unknown_waivers_empty_without_variable(self):
+        self.assertEqual(security.unknown_waivers({}), [])
+
 
 class ReadmeTableTests(unittest.TestCase):
     def setUp(self):

@@ -1,0 +1,15 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# Both mounts are read-only: a write must fail on Docker and on the shim.
+services:
+  writer:
+    image: alpine:3.20
+    volumes:
+      - data:/vol:ro
+      - ./shared:/shared:ro
+    command:
+      - "sh"
+      - "-c"
+      - "(touch /vol/x 2>/dev/null && echo VOL_WRITE_OK || echo VOL_WRITE_BLOCKED); (touch /shared/x 2>/dev/null && echo BIND_WRITE_OK || echo BIND_WRITE_BLOCKED); sleep 3600"
+volumes:
+  data: {}

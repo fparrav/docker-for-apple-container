@@ -1385,6 +1385,51 @@ class RunSecurityRefusalTests(ShimCLITestCase):
         self.assertEqual(result.returncode, 64, result.stderr)
         self._no_run_or_create_calls()
 
+    def test_waived_run_d_prints_id_and_single_not_applied(self) -> None:
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "security-opt"
+        result = self.docker(
+            "run", "-d", "--security-opt", "x", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout_lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(stdout_lines), 1, result.stdout)
+        self.assertFalse(any(line.startswith(("NOT APPLIED:", "REFUSED:")) for line in stdout_lines))
+        notices = [
+            line for line in result.stderr.splitlines() if line.startswith("NOT APPLIED:")
+        ]
+        self.assertEqual(len(notices), 1, result.stderr)
+
+    def test_refused_stderr_starts_with_refused(self) -> None:
+        result = self.docker("run", "--security-opt", "no-new-privileges", "alpine", "true")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        message = result.stderr.strip().removeprefix("docker-for-apple-container: ")
+        self.assertTrue(message.startswith("REFUSED:"), message)
+        self.assertIn("--security-opt", message)
+
+    def test_typo_waiver_name_is_warned_once(self) -> None:
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "pid-limit"
+        result = self.docker("ps")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        warnings = [
+            line
+            for line in result.stderr.splitlines()
+            if "names no waivable option" in line
+        ]
+        self.assertEqual(
+            warnings,
+            [
+                "warning: CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED names no waivable "
+                "option: pid-limit"
+            ],
+            result.stderr,
+        )
+
+    def test_no_waiver_warning_when_variable_unset(self) -> None:
+        self.env.pop("CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED", None)
+        result = self.docker("ps")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("names no waivable option", result.stderr)
+
 
 class RunTmpfsForwardingTests(ShimCLITestCase):
     """`run --tmpfs` is forwarded verbatim (including options) to Apple `container run`.
@@ -1481,6 +1526,42 @@ class RunCapabilityPassthroughTests(ShimCLITestCase):
         result = self.docker("run", "--cap-add", "NOT_A_CAP", "alpine", "true")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid CapabilityName 'NOT_A_CAP'", result.stderr)
+
+
+class BuildTranslatorTests(unittest.TestCase):
+    """`translate_build_argv` is the one translation `docker build` and Compose share."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from container_docker_shim import cli
+
+        cls.cli = cli
+
+    def test_target_label_and_flags_are_forwarded(self) -> None:
+        opts, context = self.cli.translate_build_argv(
+            ["--target", "runtime", "--label", "a=b", "--no-cache", "--pull", "ctx"]
+        )
+        self.assertEqual(
+            opts, ["--target", "runtime", "--label", "a=b", "--no-cache", "--pull"]
+        )
+        self.assertEqual(context, "ctx")
+
+    def test_help_returns_none(self) -> None:
+        self.assertIsNone(self.cli.translate_build_argv(["--help"]))
+
+    def test_refused_option_raises_with_exit_64(self) -> None:
+        with self.assertRaises(self.cli.ShimError) as caught:
+            self.cli.translate_build_argv(["--cache-from", "img:cache", "."])
+        self.assertEqual(caught.exception.code, 64)
+        self.assertIn("--cache-from", str(caught.exception))
+
+    def test_ssh_other_than_default_is_refused(self) -> None:
+        with self.assertRaises(self.cli.ShimError) as caught:
+            self.cli.translate_build_argv(["--ssh", "id=/tmp/key", "."])
+        self.assertEqual(caught.exception.code, 64)
 
 
 if __name__ == "__main__":

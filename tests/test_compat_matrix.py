@@ -31,6 +31,7 @@ import compat_matrix  # noqa: E402
 
 from container_docker_shim import cli  # noqa: E402
 from container_docker_shim import compose  # noqa: E402
+from container_docker_shim import compose_capabilities  # noqa: E402
 
 
 TIER = "unit"
@@ -248,17 +249,38 @@ class MatrixCoverageTests(unittest.TestCase):
         self._check_short_aliases("build", union, BUILD_SHORT_ALIASES)
 
     def test_every_compose_key_has_an_entry(self):
-        keys = sorted(
-            compose.SUPPORTED_SERVICE_KEYS
-            | set(compose.UNSUPPORTED_SERVICE_KEYS)
-            | set(compose.SECURITY_OPTION_KEYS)
-        )
-        missing = [key for key in keys if f"compose {key}" not in self.ids]
+        caps = compose_capabilities
+        wanted = {f"compose {key}" for key in compose.SUPPORTED_SERVICE_KEYS}
+        wanted |= {f"compose {key}" for key in compose.UNSUPPORTED_SERVICE_KEYS}
+        wanted |= {f"compose {key}" for key in compose.SECURITY_OPTION_KEYS}
+        wanted |= {f"compose {key}" for key in caps.SERVICE_KEYS}
+        wanted |= {f"compose build.{key}" for key in caps.BUILD_KEYS}
+        wanted |= {f"compose deploy.{key}" for key in caps.DEPLOY_KEYS}
+        wanted |= {f"compose volumes.{key}" for key in caps.MOUNT_OPTIONS}
+        for kind, attrs in caps.RESOURCE_ATTRIBUTES.items():
+            wanted |= {f"compose top-level {kind}.{key}" for key in attrs}
+        missing = sorted(entry for entry in wanted if entry not in self.ids)
         self.assertEqual(
             missing,
             [],
-            "matrix entries missing for compose keys: " + ", ".join(missing),
+            "matrix entries missing for classified compose keys: " + ", ".join(missing),
         )
+
+    def test_matrix_status_matches_the_capability_table(self):
+        by_id = {e["id"]: e for e in self.entries if isinstance(e, dict)}
+        wrong = []
+        for key, rule in compose_capabilities.SERVICE_KEYS.items():
+            entry = by_id.get(f"compose {key}")
+            if entry is None:
+                continue
+            # A key the table accepts may be PARTIAL in the matrix because
+            # its sub-keys carry limits that have their own table entries.
+            allowed = {rule.status}
+            if rule.status == compose_capabilities.SUPPORTED:
+                allowed.add(compose_capabilities.PARTIAL)
+            if entry["status"] not in allowed:
+                wrong.append(f"{key}: matrix {entry['status']} vs table {rule.status}")
+        self.assertEqual(wrong, [], "; ".join(wrong))
 
     def test_live_entries_name_existing_tests(self):
         broken = []

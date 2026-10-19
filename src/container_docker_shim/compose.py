@@ -51,6 +51,7 @@ name work unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import shlex
@@ -61,6 +62,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from . import compose_capabilities
 from .cli import (
     DOCKER_ZERO_TIME,
     ShimError,
@@ -77,11 +79,14 @@ from .cli import (
     cmd_rm as docker_rm,
     cmd_start as docker_start,
     cmd_stop as docker_stop,
+    translate_build_argv,
 )
 from . import security
 from . import compose_health
 from . import compose_normalizer
+from . import compose_plan
 from . import compose_reconcile
+from . import compose_resources
 from . import compose_subset
 
 
@@ -103,59 +108,32 @@ SUPPORTED_COMPOSE_FILENAMES = (
     "docker-compose.yml",
 )
 
-# Compose keys that have no verified Apple `container` equivalent. They are
-# parsed (so the file is valid) but not applied; `up` warns once per service
-# so the user is never misled into thinking they took effect.
-UNSUPPORTED_SERVICE_KEYS = {
-    "restart": "restart policies are not supported by Apple container",
-    "hostname": "custom hostname is not supported by Apple container",
-    "secrets": "secrets are a Swarm feature with no Apple container equivalent",
-    "configs": "configs are a Swarm feature with no Apple container equivalent",
-    "extra_hosts": "extra_hosts is not yet translated",
-}
-
-# Service-level keys the translator reads or tolerates. Together with
-# UNSUPPORTED_SERVICE_KEYS this is the full service-key vocabulary the shim
-# knows about; any other key is parsed and ignored, as in Docker Compose.
-SUPPORTED_SERVICE_KEYS = frozenset({
-    "build",
-    "cap_add",
-    "cap_drop",
-    "command",
-    "container_name",
-    "cpus",
-    "depends_on",
-    "deploy",
-    "dns",
-    "dns_opt",
-    "dns_search",
-    "entrypoint",
-    "env_file",
-    "environment",
-    "healthcheck",
-    "image",
-    "init",
-    "labels",
-    "mem_limit",
-    "networks",
-    "platform",
-    "ports",
-    "read_only",
-    "shm_size",
-    "stdin_open",
-    "tmpfs",
-    "tty",
-    "ulimits",
-    "user",
-    "volumes",
-    "working_dir",
-    "x-shim-boot-hosts",
-})
-
 # Per-service escape hatch: `x-shim-boot-hosts: false` skips the boot-time
 # /etc/hosts entrypoint wrapper for that service (post-start injection still
 # applies). For `depends_on` services whose image has no /bin/sh.
 BOOT_HOSTS_KEY = "x-shim-boot-hosts"
+
+# Derived views of the capability table (`compose_capabilities.SERVICE_KEYS`),
+# which is the only place that decides what a service key means: the keys the
+# shim applies, and the keys classified but not applied (refused, or reported
+# with a NOT APPLIED line).
+SECURITY_OPTION_KEYS = dict(compose_capabilities.SECURITY_KEYS)
+
+UNSUPPORTED_SERVICE_KEYS = {
+    key: rule.reason
+    for key, rule in compose_capabilities.SERVICE_KEYS.items()
+    if rule.status != compose_capabilities.SUPPORTED and key not in SECURITY_OPTION_KEYS
+}
+
+SUPPORTED_SERVICE_KEYS = frozenset(
+    {
+        key
+        for key, rule in compose_capabilities.SERVICE_KEYS.items()
+        if rule.status == compose_capabilities.SUPPORTED
+        and rule.reason != compose_capabilities.NO_EFFECT
+    }
+    | {BOOT_HOSTS_KEY}
+)
 
 
 # ========================================================================== #
@@ -481,6 +459,7 @@ class Service:
         self.spec = spec
         self.depends_on = _parse_depends_on(spec.get("depends_on"))
         self.depends_conditions: dict[str, str] = _parse_depends_conditions(name, spec.get("depends_on"))
+        self.depends_required: dict[str, bool] = _parse_depends_required(name, spec.get("depends_on"))
 
     @property
     def container_name(self) -> str | None:
@@ -531,6 +510,30 @@ def _parse_depends_conditions(service_name: str, value: Any) -> dict[str, str]:
     return conditions
 
 
+def _parse_depends_required(service_name: str, value: Any) -> dict[str, bool]:
+    """Map each dependency to ``required`` (default True; only the map form sets it)."""
+    if isinstance(value, str):
+        value = [value]
+    if isinstance(value, list):
+        return {str(item): True for item in value}
+    if not isinstance(value, dict):
+        return {}
+    required: dict[str, bool] = {}
+    for key, entry in value.items():
+        flag = entry.get("required") if isinstance(entry, dict) else None
+        if flag is None or flag is True or flag == "true":
+            required[str(key)] = True
+        elif flag is False or flag == "false":
+            required[str(key)] = False
+        else:
+            raise ShimError(
+                f"compose: service {service_name!r}: depends_on {str(key)!r} "
+                f"has an invalid 'required' value {flag!r} (use true or false)",
+                64,
+            )
+    return required
+
+
 class Project:
     """A parsed, interpolated compose project."""
 
@@ -552,6 +555,14 @@ class Project:
         self.volumes = doc.get("volumes") or {}
         # The official normalizer's JSON as received; None for the built-in parser.
         self.normalized: dict[str, Any] | None = None
+        self._resources: compose_resources.Resources | None = None
+
+    @property
+    def resources(self) -> compose_resources.Resources:
+        """Networks and volumes with their single resolved runtime name each."""
+        if self._resources is None:
+            self._resources = compose_resources.resolve(self)
+        return self._resources
 
     def topo_sorted(self) -> list[Service]:
         """Services in dependency order (dependencies first), cycle-detected."""
@@ -687,6 +698,45 @@ def _load_normalized_model(
         raise ShimError(f"compose: {exc}", exc.code)
 
 
+_UNDEFINED_DEPENDENCY = re.compile(
+    r'service "([^"]+)" depends on undefined service "([^"]+)"'
+)
+
+
+def _inactive_profile_hint(
+    executable: str, inputs: compose_normalizer.Inputs, message: str
+) -> str | None:
+    """Say which profile hides a dependency the normalizer reports as undefined.
+
+    The official normalizer drops services of inactive profiles, so a
+    dependency on one surfaces as "undefined service". Re-reading the project
+    with every profile enabled tells whether the service exists and which
+    profile it needs. Any failure here keeps the original message.
+    """
+    found = _UNDEFINED_DEPENDENCY.search(message)
+    if found is None:
+        return None
+    service, dependency = found.groups()
+    try:
+        raw, _warnings = compose_normalizer.load_normalized(
+            executable,
+            dataclasses.replace(inputs, profiles=("*",)),
+            _run_normalizer,
+            os.environ,
+        )
+    except compose_normalizer.NormalizerError:
+        return None
+    declared = (raw.get("services") or {}).get(dependency) if isinstance(raw, dict) else None
+    needed = declared.get("profiles") if isinstance(declared, dict) else None
+    if not isinstance(needed, list) or not needed:
+        return None
+    names = ", ".join(str(item) for item in needed)
+    return (
+        f'compose: service "{service}" depends on service "{dependency}", which is only '
+        f"in profile {names}; enable it with --profile {needed[0]} (or COMPOSE_PROFILES)"
+    )
+
+
 _INSTALL_HINT = "install the official docker-compose (brew install docker-compose)"
 _OVERRIDE_FILENAMES = (
     "compose.override.yaml",
@@ -741,12 +791,16 @@ def _load_project(
 
     executable = _resolve_normalizer()
     if executable is not None:
-        model, raw = _load_normalized_model(
-            executable,
-            _normalizer_inputs(
-                files, profiles, compose_paths, project_name, project_dir, env_file
-            ),
+        inputs = _normalizer_inputs(
+            files, profiles, compose_paths, project_name, project_dir, env_file
         )
+        try:
+            model, raw = _load_normalized_model(executable, inputs)
+        except ShimError as exc:
+            hint = _inactive_profile_hint(executable, inputs, str(exc))
+            if hint is None:
+                raise
+            raise ShimError(hint, exc.code) from exc
         name = _sanitize_project_name(model["name"])
         project = Project(name, model, project_dir_resolved)
         project.normalized = raw
@@ -789,12 +843,16 @@ def _resolve_project_name(explicit: str | None, doc: dict[str, Any], directory: 
 # ========================================================================== #
 
 
-def _network_resource_name(project: str, network: str) -> str:
-    return f"{project}_{network}"
+def _network_resource(project: Project, key: str) -> compose_resources.Resource:
+    """The resolved network for ``key``; an undeclared key is a managed one."""
+    found = project.resources.networks.get(key)
+    return found or compose_resources.Resource(key, f"{project.name}_{key}", False)
 
 
-def _volume_resource_name(project: str, volume: str) -> str:
-    return f"{project}_{volume}"
+def _volume_resource(project: Project, key: str) -> compose_resources.Resource:
+    """The resolved volume for ``key``; an undeclared key is a managed one."""
+    found = project.resources.volumes.get(key)
+    return found or compose_resources.Resource(key, f"{project.name}_{key}", False)
 
 
 def _compose_port_to_publish(port: Any) -> str:
@@ -847,7 +905,8 @@ def _classify_and_translate_volume(
             host = _resolve_host_path(source, project.directory)
             mode = "ro" if entry.get("read_only") is True else ""
             return _translate_volume(_join_volume(host, target, mode))
-        return _named_volume_args(source, target, "", project, ensured_volumes)
+        mode = "ro" if entry.get("read_only") is True else ""
+        return _named_volume_args(source, target, mode, project, ensured_volumes)
 
     text = _as_str(entry)
     parts = text.split(":")
@@ -857,7 +916,8 @@ def _classify_and_translate_volume(
     mode = parts[2] if len(parts) > 2 else ""
     if _is_host_path(source):
         host = _resolve_host_path(source, project.directory)
-        return _translate_volume(_join_volume(host, target, mode))
+        readonly = _mount_readonly(mode, target)
+        return _translate_volume(_join_volume(host, target, "ro" if readonly else ""))
     return _named_volume_args(source, target, mode, project, ensured_volumes)
 
 
@@ -877,29 +937,69 @@ def _join_volume(source: str, target: str, mode: str) -> str:
     return f"{source}:{target}:{mode}" if mode else f"{source}:{target}"
 
 
+# Short-syntax mode flags with no effect on Apple's mounts.
+_NOOP_MOUNT_MODES = frozenset({"rw", "z", "Z", "cached", "delegated"})
+
+
+def _mount_readonly(mode: str, target: str) -> bool:
+    """Whether the short-syntax ``mode`` asks for read-only; refuse other flags."""
+    readonly = False
+    for flag in (item.strip() for item in mode.split(",")):
+        if flag == "ro":
+            readonly = True
+        elif flag and flag not in _NOOP_MOUNT_MODES:
+            raise ShimError(
+                f"compose: volume option {flag!r} on {target!r} has no Apple "
+                "container equivalent",
+                64,
+            )
+    return readonly
+
+
 def _named_volume_args(
     source: str, target: str, mode: str, project: Project, ensured_volumes: set[str]
 ) -> list[str]:
-    resource = _volume_resource_name(project.name, source)
+    volume = _volume_resource(project, source)
+    resource = volume.name
+    readonly = _mount_readonly(mode, target)
     if resource not in ensured_volumes:
-        _ensure_named_volume(resource, project.name)
+        if volume.managed:
+            declared = project.volumes.get(source) if isinstance(project.volumes, dict) else None
+            labels = declared.get("labels") if isinstance(declared, dict) else None
+            _ensure_named_volume(resource, project.name, labels, key=volume.key)
         ensured_volumes.add(resource)
-    spec = f"{resource}:{target}"
-    if mode:
-        spec += f":{mode}"
-    return ["-v", spec]
+    spec = f"type=volume,source={resource},target={target}"
+    if readonly:
+        spec += ",readonly"
+    return ["--mount", spec]
+
+
+def _service_network_keys(service: Service) -> list[str]:
+    declared = service.spec.get("networks")
+    if isinstance(declared, dict):
+        return [str(key) for key in declared]
+    if isinstance(declared, list):
+        return [str(item) for item in declared]
+    return ["default"]
 
 
 def _service_networks(service: Service, project: Project) -> list[str]:
-    declared = service.spec.get("networks")
-    names: list[str]
-    if isinstance(declared, dict):
-        names = [str(key) for key in declared]
-    elif isinstance(declared, list):
-        names = [str(item) for item in declared]
-    else:
-        names = ["default"]
-    return [_network_resource_name(project.name, name) for name in names]
+    return [_network_resource(project, key).name for key in _service_network_keys(service)]
+
+
+def _service_volume_keys(service: Service) -> list[str]:
+    """Keys of the named volumes a service mounts (host paths and tmpfs excluded)."""
+    keys: list[str] = []
+    for entry in _as_list(service.spec.get("volumes")):
+        if isinstance(entry, dict):
+            if entry.get("type") not in (None, "volume"):
+                continue
+            source = _as_str(entry.get("source"))
+        else:
+            source = _as_str(entry).split(":")[0]
+        if source and not _is_host_path(source):
+            keys.append(source)
+    return keys
 
 
 def _build_run_args(
@@ -998,8 +1098,6 @@ def _build_run_args(
     for volume in _as_list(spec.get("volumes")):
         args.extend(_classify_and_translate_volume(volume, project, ensured_volumes))
 
-    _warn_unsupported(service, warned)
-
     # Compose entrypoint follows the same string-splitting rules as command.
     entrypoint = _command_list(spec["entrypoint"]) if spec.get("entrypoint") is not None else None
     command = _command_list(spec.get("command"))
@@ -1085,49 +1183,40 @@ def _resource_limits(spec: dict[str, Any]) -> tuple[str, str]:
     return cpus, memory
 
 
-def _warn_unsupported(service: Service, warned: set[str]) -> None:
-    for key, reason in UNSUPPORTED_SERVICE_KEYS.items():
-        marker = f"{service.name}:{key}"
-        if key in service.spec and marker not in warned:
-            _warn(f"service {service.name!r}: '{key}' ignored — {reason}")
-            warned.add(marker)
-    deploy = service.spec.get("deploy")
-    replicas_marker = f"{service.name}:deploy.replicas"
-    if (
-        isinstance(deploy, dict)
-        and deploy.get("replicas") not in (None, 1)
-        and replicas_marker not in warned
-    ):
-        _warn(
-            f"service {service.name!r}: 'deploy.replicas' ignored — "
-            "the shim supports one container per service"
+def _validate_plan(project: Project, services: list[Service]) -> None:
+    """Validate every service about to be acted on, before any side effect.
+
+    One pass collects all refusals (capability table, security decisions and
+    dependency rules), prints them together as ``REFUSED:`` lines, and raises
+    exit 64. Partial applications are printed as ``NOT APPLIED:`` lines before
+    anything is provisioned. Nothing here talks to the runtime.
+    """
+    report = compose_capabilities.validate(
+        {"networks": project.networks, "volumes": project.volumes},
+        services,
+        os.environ,
+    )
+    problems = [
+        compose_capabilities.refused(f"service {f.service!r}: {f.key}: {f.message}")
+        for f in report.refusals
+    ]
+    dependency_notices: list[str] = []
+    try:
+        dependency_notices = _validate_dependencies(services)
+    except ShimError as exc:
+        problems.append(compose_capabilities.refused(str(exc)))
+    if problems:
+        for line in problems:
+            print(line, file=sys.stderr)
+        raise ShimError("compose: nothing was created; fix the problems above", 64)
+    for line in dependency_notices:
+        _warn(line)
+    for f in report.notices:
+        print(
+            compose_capabilities.not_applied(f"service {f.service!r}: {f.key}: {f.message}"),
+            file=sys.stderr,
         )
-        warned.add(replicas_marker)
-    networks = service.spec.get("networks")
-    aliases_marker = f"{service.name}:network.aliases"
-    if isinstance(networks, dict) and aliases_marker not in warned:
-        if any(
-            isinstance(config, dict) and config.get("aliases")
-            for config in networks.values()
-        ):
-            _warn(
-                f"service {service.name!r}: network aliases ignored — "
-                "service-name discovery remains available"
-            )
-            warned.add(aliases_marker)
 
-
-# Compose keys that map onto the security decision table (security.RULES).
-# Unlike the other UNSUPPORTED_SERVICE_KEYS, these are enforced by
-# security.decide(): a requested value is refused (or warned about when
-# explicitly allowed unenforced) before `up` creates anything.
-SECURITY_OPTION_KEYS = {
-    "privileged": "privileged",
-    "security_opt": "security-opt",
-    "pids_limit": "pids-limit",
-    "sysctls": "sysctls",
-    "devices": "devices",
-}
 
 
 def _counts_as_requested(value: Any) -> bool:
@@ -1141,37 +1230,16 @@ def _counts_as_requested(value: Any) -> bool:
     return value not in ("", [], {}, "false", "False", "0", "-1", 0, -1)
 
 
-def _enforce_run_security(services: list[Service]) -> None:
-    """Apply security.decide() to every requested security key, all-or-nothing.
-
-    Walks all services first, accumulating every "skip" warning; if any option
-    must be refused, raises before any network or container is created.
-    """
-    skips: list[str] = []
-    refuses: list[str] = []
-    for service in services:
-        for key, option in SECURITY_OPTION_KEYS.items():
-            if key not in service.spec or not _counts_as_requested(service.spec[key]):
-                continue
-            decision = security.decide(option)
-            if decision.action == "refuse":
-                refuses.append(f"service {service.name!r}: '{key}': {decision.message}")
-            elif decision.action == "skip":
-                skips.append(f"service {service.name!r}: '{key}': {decision.message}")
-    for message in skips:
-        _warn(message)
-    if refuses:
-        raise ShimError(refuses[0], 64)
-
-
-def _validate_dependencies(services: list[Service]) -> None:
+def _validate_dependencies(services: list[Service]) -> list[str]:
     """Reject `service_healthy` depends_on conditions with no usable healthcheck.
 
     A dependency without an enabled healthcheck would start before it could
     ever report healthy, so the request is refused (all-or-nothing, like
-    `_enforce_run_security`). Dependencies not defined in the selected set
-    are ignored, matching the rest of the file.
+    `_validate_plan`). For an optional entry (``required: false``) that is a
+    notice instead, returned for the caller to print. Dependencies not
+    defined in the selected set are ignored, matching the rest of the file.
     """
+    notices: list[str] = []
     for service in services:
         try:
             compose_health.parse_healthcheck(service.spec.get("healthcheck"))
@@ -1192,11 +1260,15 @@ def _validate_dependencies(services: list[Service]) -> None:
             except ValueError as exc:
                 raise ShimError(f"compose: service {dep!r}: invalid healthcheck: {exc}", 64)
             if check is None or check.disabled:
-                raise ShimError(
-                    f"compose: service {service.name!r} depends_on {dep!r} with "
-                    f"condition service_healthy, but {dep!r} has no enabled healthcheck",
-                    64,
+                message = (
+                    f"service {service.name!r} depends_on {dep!r} with "
+                    f"condition service_healthy, but {dep!r} has no enabled healthcheck"
                 )
+                if not service.depends_required.get(dep, True):
+                    notices.append(f"{message}; not waiting, because the dependency is optional")
+                    continue
+                raise ShimError(f"compose: {message}", 64)
+    return notices
 
 
 def _warn_ungated_healthchecks(
@@ -1577,16 +1649,124 @@ def _container_net(name: str) -> tuple[str | None, str | None]:
 # ========================================================================== #
 
 
-def _ensure_network(project: str, network: str) -> None:
-    resource = _network_resource_name(project, network)
+def _list_resources(family: str) -> dict[str, dict[str, str]]:
+    """Name -> labels of every runtime ``network``/``volume``; read-only.
+
+    A runtime that cannot answer is an error, never "nothing exists": the
+    caller would otherwise create objects on top of a failed check.
+    """
+    import json
+
+    result = _run_container_capture([family, "list", "--format", "json"])
+    if result.returncode != 0:
+        raise ShimError(
+            f"compose: cannot check {family}s: {(result.stderr or result.stdout).strip()}",
+            result.returncode,
+        )
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError as exc:
+        raise ShimError(f"compose: cannot read the {family} list: {exc}", 1) from exc
+    found: dict[str, dict[str, str]] = {}
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        config = item.get("configuration") if isinstance(item.get("configuration"), dict) else item
+        name = config.get("name") or item.get("id")
+        labels = config.get("labels")
+        if name:
+            found[str(name)] = (
+                {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
+            )
+    return found
+
+
+def _check_resources(project: Project, services: list[Service]) -> list[str]:
+    """Verify every resource the planned services use before anything is created.
+
+    External resources must exist (exit 1 otherwise). A managed name that
+    already exists must not belong to another project (exit 1); one with no
+    Compose label is reused. Returns the notices for ``cmd_up`` to print.
+    Only ``list`` calls are made, so nothing is created or changed here.
+    """
+    uses: dict[str, dict[str, tuple[compose_resources.Resource, str]]] = {
+        "network": {},
+        "volume": {},
+    }
+    for service in services:
+        for key in _service_network_keys(service):
+            uses["network"].setdefault(key, (_network_resource(project, key), service.name))
+        for key in _service_volume_keys(service):
+            uses["volume"].setdefault(key, (_volume_resource(project, key), service.name))
+    uses["network"].setdefault("default", (_network_resource(project, "default"), ""))
+
+    notices: list[str] = []
+    for family, used in uses.items():
+        if not used:
+            continue
+        existing = _list_resources(family)
+        for key, (resource, service_name) in used.items():
+            labels = existing.get(resource.name)
+            if resource.external:
+                if labels is None:
+                    where = f"service {service_name!r}: " if service_name else ""
+                    detail = (
+                        f'external volume "{resource.name}" not found'
+                        if family == "volume"
+                        else f'network {resource.name} declared as external, but could not be found'
+                    )
+                    raise ShimError(f"compose: {where}{detail}", 1)
+                notices.extend(_legacy_copy_notices(project, family, key, resource, existing))
+            elif labels is not None:
+                owner = labels.get(LABEL_PROJECT)
+                if owner and owner != project.name:
+                    raise ShimError(
+                        f'compose: {family} "{resource.name}" belongs to project '
+                        f'"{owner}", not "{project.name}"',
+                        1,
+                    )
+                if not owner:
+                    notices.append(
+                        f'{family} "{resource.name}" already exists without a Compose '
+                        "label; reusing it, and down -v will not remove it"
+                    )
+    return notices
+
+
+def _legacy_copy_notices(
+    project: Project,
+    family: str,
+    key: str,
+    resource: compose_resources.Resource,
+    existing: dict[str, dict[str, str]],
+) -> list[str]:
+    """Earlier versions created ``<project>_<key>`` for an external key; report it."""
+    legacy = f"{project.name}_{key}"
+    labels = existing.get(legacy)
+    if legacy == resource.name or labels is None or labels.get(LABEL_PROJECT) != project.name:
+        return []
+    return [
+        f'{family} "{legacy}" is a copy left by an earlier version; the external '
+        f'{family} "{resource.name}" is used instead, and the copy is left in place'
+    ]
+
+
+def _ensure_network(project: Project, network: str) -> None:
+    declared = _resource_spec(project.networks, network)
+    resource_info = _network_resource(project, network)
+    if resource_info.external:
+        return  # never created or removed by this project
+    resource = resource_info.name
     existing = _run_container_capture(["network", "inspect", resource])
     if existing.returncode == 0:
         return
-    spec = (_project_network_spec(project, network))
-    if spec.get("external"):
-        _warn(f"network {network!r} declared external — not created")
-        return
-    args = ["network", "create", "--label", f"{LABEL_PROJECT}={project}"]
+    spec = declared
+    args = [
+        "network", "create",
+        "--label", f"{LABEL_PROJECT}={project.name}",
+        "--label", f"{compose_resources.LABEL_NETWORK}={network}",
+    ]
+    args.extend(_resource_label_args(spec.get("labels")))
     if spec.get("internal") is True:
         args.append("--internal")
     args.append(resource)
@@ -1599,19 +1779,35 @@ def _ensure_network(project: str, network: str) -> None:
         )
 
 
-_NETWORK_SPECS: dict[tuple[str, str], dict[str, Any]] = {}
+def _resource_spec(declared: Any, key: str) -> dict[str, Any]:
+    """The top-level spec of a network or volume, ``{}`` when absent or null."""
+    if isinstance(declared, dict) and isinstance(declared.get(key), dict):
+        return declared[key]
+    return {}
 
 
-def _project_network_spec(project: str, network: str) -> dict[str, Any]:
-    return _NETWORK_SPECS.get((project, network), {})
+def _resource_label_args(labels: Any) -> list[str]:
+    """``--label`` arguments for the user labels of a network or volume."""
+    if isinstance(labels, dict):
+        labels = [f"{key}={_as_str(value)}" for key, value in labels.items()]
+    args: list[str] = []
+    for label in _as_list(labels):
+        args.extend(["--label", _as_str(label)])
+    return args
 
 
-def _ensure_named_volume(resource: str, project: str) -> None:
+def _ensure_named_volume(
+    resource: str, project: str, labels: Any = None, key: str | None = None
+) -> None:
     existing = _run_container_capture(["volume", "inspect", resource])
     if existing.returncode == 0:
         return
+    key_label = ["--label", f"{compose_resources.LABEL_VOLUME}={key}"] if key else []
     result = _run_container_capture(
-        ["volume", "create", "--label", f"{LABEL_PROJECT}={project}", resource]
+        [
+            "volume", "create", "--label", f"{LABEL_PROJECT}={project}",
+            *key_label, *_resource_label_args(labels), resource,
+        ]
     )
     if result.returncode != 0:
         raise ShimError(
@@ -2037,23 +2233,26 @@ def cmd_up(
     force_recreate: bool = False,
     no_recreate: bool = False,
     remove_orphans: bool = False,
+    no_deps: bool = False,
 ) -> int:
-    services = project.topo_sorted()
-    if only:
-        wanted = set(only)
-        services = [svc for svc in services if svc.name in wanted]
-        if not services:
-            return _die(f"compose: no such service(s): {', '.join(only)}", 1)
+    # The plan is the single source of truth for what this `up` acts on: the
+    # set that is validated and checked is the set that is created.
+    service_plan = compose_plan.plan(project, only, no_deps=no_deps)
+    services = [project.services[name] for name in service_plan.ordered]
+    for notice in service_plan.notices:
+        _warn(notice)
 
-    _enforce_run_security(services)
-    _validate_dependencies(services)
+    _validate_plan(project, services)
     detach = detach or wait  # --wait implies --detach
+
+    # Read-only: external resources must exist and managed names must be ours,
+    # before the first network, volume or container is created.
+    for notice in _check_resources(project, services):
+        _warn(notice)
 
     # Provision declared networks (record specs for ensure-on-attach), defaulting
     # to the implicit project network every service joins.
-    for net_name, net_spec in _network_dict(project).items():
-        _NETWORK_SPECS[(project.name, net_name)] = net_spec if isinstance(net_spec, dict) else {}
-    _ensure_network(project.name, "default")
+    _ensure_network(project, "default")
     referenced: set[str] = {"default"}
     for service in services:
         declared = service.spec.get("networks")
@@ -2062,7 +2261,7 @@ def cmd_up(
         elif isinstance(declared, list):
             referenced.update(str(k) for k in declared)
     for net in referenced:
-        _ensure_network(project.name, net)
+        _ensure_network(project, net)
 
     # Reconcile instead of clearing: containers whose configuration and image
     # are unchanged stay untouched, stopped ones are started, changed ones are
@@ -2087,6 +2286,16 @@ def cmd_up(
         for svc in services
         for dep, condition in svc.depends_conditions.items()
         if condition == "service_healthy"
+    }
+    # A gate only softens when every dependent that waits on it marked it optional.
+    optional_gates = {
+        dep
+        for dep in needs_healthy
+        if not any(
+            svc.depends_required.get(dep, True)
+            for svc in services
+            if svc.depends_conditions.get(dep) == "service_healthy"
+        )
     }
     _warn_ungated_healthchecks(services, needs_healthy, wait)
     needs_completed = {
@@ -2162,9 +2371,14 @@ def cmd_up(
             nets_by_service[service.name] = networks
         if service.name in needs_healthy:
             rc = _wait_service_healthy(service, name, wait_timeout)
-            if rc != 0:
+            if rc != 0 and service.name in optional_gates:
+                _warn(
+                    f"optional dependency {service.name!r} did not become healthy; "
+                    "continuing because it is not required"
+                )
+            elif rc != 0:
                 return rc
-            healthy_waited.add(service.name)
+            healthy_waited.add(service.name)  # waited once; `--wait` must not wait again
 
     # Whole project, not just `started`: a partial `up <svc>` must give the
     # fresh container ALL peer names, and rewrite the recreated service's new
@@ -2183,7 +2397,35 @@ def cmd_up(
     return _stream_logs(project, started, follow=True)
 
 
-def cmd_down(project_name: str, *, remove_volumes: bool, only: list[str]) -> int:
+def _removable_names(
+    family: str, project_name: str, declared: dict[str, compose_resources.Resource]
+) -> list[str]:
+    """Names of the declared, managed ``family`` resources this project labels."""
+    labelled = {
+        name: labels.get(LABEL_PROJECT, "") for name, labels in _list_resources(family).items()
+    }
+    return [r.name for r in compose_resources.removable(declared.values(), labelled, project_name)]
+
+
+def cmd_down(
+    project_name: str,
+    *,
+    remove_volumes: bool,
+    only: list[str],
+    project: Project | None = None,
+) -> int:
+    """Remove the project's containers, then the networks (and volumes) it owns.
+
+    Ownership is the current model AND the project label (design D3): without
+    the model, volumes are never removed (``-v`` is refused up front, before
+    anything is touched) and networks fall back to the label alone.
+    """
+    if remove_volumes and project is None:
+        return _die(
+            "compose: down -v needs the Compose file to know which volumes the project "
+            "owns; run it where the file is (or pass -f), or run down without -v",
+            64,
+        )
     rows = _project_containers(project_name)
     if only:
         wanted = set(only)
@@ -2195,7 +2437,20 @@ def cmd_down(project_name: str, *, remove_volumes: bool, only: list[str]) -> int
     if only:
         return rc  # partial down never tears down shared infrastructure
 
-    for network in _load_labeled_resources("network", project_name):
+    try:
+        if project is not None:
+            networks = _removable_names("network", project_name, project.resources.networks)
+        else:
+            networks = _load_labeled_resources("network", project_name)
+        volumes = (
+            _removable_names("volume", project_name, project.resources.volumes)
+            if remove_volumes and project is not None
+            else []
+        )
+    except ShimError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return rc or exc.code
+    for network in networks:
         result = _run_container_capture(["network", "rm", network])
         if result.returncode == 0:
             print(f"Removed network {network}")
@@ -2203,14 +2458,13 @@ def cmd_down(project_name: str, *, remove_volumes: bool, only: list[str]) -> int
             sys.stderr.write(result.stderr or result.stdout)
             rc = rc or result.returncode
 
-    if remove_volumes:
-        for volume in _load_labeled_resources("volume", project_name):
-            result = _run_container_capture(["volume", "rm", volume])
-            if result.returncode == 0:
-                print(f"Removed volume {volume}")
-            else:
-                sys.stderr.write(result.stderr or result.stdout)
-                rc = rc or result.returncode
+    for volume in volumes:
+        result = _run_container_capture(["volume", "rm", volume])
+        if result.returncode == 0:
+            print(f"Removed volume {volume}")
+        else:
+            sys.stderr.write(result.stderr or result.stdout)
+            rc = rc or result.returncode
     return rc
 
 
@@ -2290,6 +2544,7 @@ def cmd_build(project: Project, *, only: list[str]) -> int:
     if only:
         wanted = set(only)
         services = [svc for svc in services if svc.name in wanted]
+    _validate_plan(project, services)
     built = 0
     for service in services:
         if "build" not in service.spec:
@@ -2563,46 +2818,88 @@ def _image_id(image: str) -> str:
     return str(item.get("id") or "")
 
 
+def _build_secret_args(service: Service, project: Project, build: dict[str, Any]) -> list[str]:
+    """``--secret`` arguments for ``build.secrets``; the shim never reads the files."""
+    definitions = project.doc.get("secrets")
+    if not isinstance(definitions, dict):
+        definitions = {}
+    args: list[str] = []
+    for item in _as_list(build.get("secrets")):
+        name = _as_str(item.get("source") if isinstance(item, dict) else item)
+        definition = definitions.get(name)
+        if not isinstance(definition, dict):
+            raise ShimError(
+                f"compose: service {service.name!r} build.secrets names {name!r}, "
+                "which is not defined in the top-level 'secrets'",
+                64,
+            )
+        if definition.get("file"):
+            path = _as_str(definition["file"])
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(project.directory, path))
+            args.extend(["--secret", f"id={name},src={path}"])
+        elif definition.get("environment"):
+            args.extend(["--secret", f"id={name},env={_as_str(definition['environment'])}"])
+        else:
+            raise ShimError(
+                f"compose: service {service.name!r} build secret {name!r} needs a "
+                "'file' or 'environment' source",
+                64,
+            )
+    return args
+
+
 def _run_build(service: Service, project: Project, tag: str) -> None:
     build = service.spec["build"]
     if isinstance(build, str):
         context = build
-        dockerfile = None
-        build_args: dict[str, Any] = {}
+        build = {}
     elif isinstance(build, dict):
         context = _as_str(build.get("context") or ".")
-        dockerfile = build.get("dockerfile")
-        raw_args = build.get("args") or {}
-        build_args = raw_args if isinstance(raw_args, dict) else {}
     else:
         raise ShimError(f"compose: service {service.name!r} has an invalid 'build'", 64)
 
     context_path = context if os.path.isabs(context) else os.path.join(project.directory, context)
-    args = ["build", "--tag", tag]
+    # Express the Compose keys as the equivalent `docker build` arguments and
+    # translate them with the same code `docker build` uses.
+    argv = ["--tag", tag]
+    dockerfile = build.get("dockerfile")
     if dockerfile:
         df = _as_str(dockerfile)
-        df_path = df if os.path.isabs(df) else os.path.join(context_path, df)
-        args.extend(["--file", df_path])
-    for key, value in build_args.items():
-        args.extend(["--build-arg", f"{key}={_as_str(value)}"])
-    platforms = build.get("platforms") if isinstance(build, dict) else None
+        argv.extend(["--file", df if os.path.isabs(df) else os.path.join(context_path, df)])
+    raw_args = build.get("args") or {}
+    for key, value in (raw_args.items() if isinstance(raw_args, dict) else ()):
+        argv.extend(["--build-arg", f"{key}={_as_str(value)}"])
+    if build.get("target"):
+        argv.extend(["--target", _as_str(build["target"])])
+    labels = build.get("labels") or {}
+    if isinstance(labels, dict):
+        labels = [f"{key}={_as_str(value)}" for key, value in labels.items()]
+    for label in _as_list(labels):
+        argv.extend(["--label", _as_str(label)])
+    if build.get("no_cache") is True:
+        argv.append("--no-cache")
+    if build.get("pull") is True:
+        argv.append("--pull")
+    platforms = build.get("platforms")
     if platforms:
-        args.extend(["--platform", ",".join(_as_str(p) for p in _as_list(platforms))])
+        argv.extend(["--platform", ",".join(_as_str(p) for p in _as_list(platforms))])
     elif service.spec.get("platform"):
-        args.extend(["--platform", _as_str(service.spec["platform"])])
-    args.append(context_path)
+        argv.extend(["--platform", _as_str(service.spec["platform"])])
+    argv.extend(_build_secret_args(service, project, build))
+    if build.get("ssh"):
+        argv.extend(["--ssh", "default"])
+    argv.append(context_path)
+
+    translated = translate_build_argv(argv)
+    assert translated is not None
+    opts, context_arg = translated
+    args = ["build", *opts, context_arg]
 
     print(f"Building {tag} for service {service.name} ...")
     result = _run_container_passthrough(args)
     if result != 0:
         raise ShimError(f"compose: build failed for service {service.name!r}", result)
-
-
-def _network_dict(project: Project) -> dict[str, Any]:
-    networks = project.networks
-    if isinstance(networks, dict):
-        return networks
-    return {}
 
 
 # ========================================================================== #
@@ -2819,7 +3116,7 @@ def _dispatch(
             up_args,
             bools={
                 "-d", "--detach", "--build", "--no-build", "--wait",
-                "--force-recreate", "--no-recreate", "--remove-orphans",
+                "--force-recreate", "--no-recreate", "--remove-orphans", "--no-deps",
             },
         )
         if opts.flag("--force-recreate") and opts.flag("--no-recreate"):
@@ -2830,6 +3127,7 @@ def _dispatch(
             force_recreate=opts.flag("--force-recreate"),
             no_recreate=opts.flag("--no-recreate"),
             remove_orphans=opts.flag("--remove-orphans"),
+            no_deps=opts.flag("--no-deps"),
             detach=opts.flag("-d") or opts.flag("--detach"),
             build=opts.flag("--build"),
             no_build=opts.flag("--no-build"),
@@ -2838,10 +3136,19 @@ def _dispatch(
         )
     if sub == "down":
         opts = _parse_flags(sub_args, bools={"-v", "--volumes"})
+        remove_volumes = opts.flag("-v") or opts.flag("--volumes")
+        model: Project | None
+        try:
+            model = optional_project()
+        except ShimError:
+            if remove_volumes:
+                raise  # ownership needs a model that loads
+            model = None  # a broken file must not block a plain teardown
         return cmd_down(
-            resolved_name(),
-            remove_volumes=opts.flag("-v") or opts.flag("--volumes"),
+            model.name if model is not None else resolved_name(),
+            remove_volumes=remove_volumes,
             only=opts.positionals,
+            project=model,
         )
     if sub == "ps":
         opts = _parse_flags(sub_args, bools={"-q", "--quiet", "-a", "--all"})

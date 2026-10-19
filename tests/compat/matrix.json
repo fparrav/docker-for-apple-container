@@ -252,6 +252,33 @@
     "note": "Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag."
   },
   {
+    "id": "compose annotations",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose attach",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose blkio_config",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose build",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -261,6 +288,15 @@
     "note": "Translates to `container build` of the service context, tagging the service image."
   },
   {
+    "id": "compose build.additional_contexts",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
     "id": "compose build.args",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -268,6 +304,24 @@
     "evidence": "fake",
     "test": null,
     "note": "Each entry forwards as Apple --build-arg."
+  },
+  {
+    "id": "compose build.cache_from",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.cache_to",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
   },
   {
     "id": "compose build.context",
@@ -288,6 +342,69 @@
     "note": "Forwarded as Apple --file, resolved against the context."
   },
   {
+    "id": "compose build.dockerfile_inline",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.entitlements",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.extra_hosts",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.isolation",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.labels",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
+    "id": "compose build.network",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.no_cache",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
     "id": "compose build.platforms",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -295,6 +412,96 @@
     "evidence": "fake",
     "test": null,
     "note": "Comma-joined into Apple --platform, falling back to the service platform."
+  },
+  {
+    "id": "compose build.privileged",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.provenance",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.pull",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
+    "id": "compose build.sbom",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.secrets",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
+    "id": "compose build.shm_size",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.ssh",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
+    "id": "compose build.tags",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
+  },
+  {
+    "id": "compose build.target",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Forwarded to the build."
+  },
+  {
+    "id": "compose build.ulimits",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build."
   },
   {
     "id": "compose cap_add",
@@ -315,6 +522,24 @@
     "note": "Each entry forwards as Apple --cap-drop."
   },
   {
+    "id": "compose cgroup",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cgroup_parent",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose command",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -326,11 +551,11 @@
   {
     "id": "compose configs",
     "kind": "compose-key",
-    "status": "PARTIAL",
+    "status": "UNSUPPORTED",
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Ignored with a warning — configs are a Swarm feature with no Apple container equivalent."
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Compose configs are not supported yet: Apple container 1.5.0 cannot mount a single file."
   },
   {
     "id": "compose container_name",
@@ -342,6 +567,69 @@
     "note": "Used for Apple --name; defaults to <project>-<service>-1 when absent."
   },
   {
+    "id": "compose cpu_count",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_percent",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_period",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_quota",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_rt_period",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_rt_runtime",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose cpu_shares",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose cpus",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -349,6 +637,24 @@
     "evidence": "fake",
     "test": null,
     "note": "Forwards to Apple --cpus, with fractional values normalized."
+  },
+  {
+    "id": "compose cpuset",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose credential_spec",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose depends_on",
@@ -360,13 +666,121 @@
     "note": "Starts dependencies first and honors the service_started, service_healthy and service_completed_successfully conditions."
   },
   {
+    "id": "compose depends_on required",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "`required: false` keeps the dependency out of a partial `up` and turns a failed or impossible healthy gate into a notice; the default is required."
+  },
+  {
     "id": "compose deploy",
     "kind": "compose-key",
     "status": "PARTIAL",
     "apple": "--cpus",
     "evidence": "fake",
     "test": null,
-    "note": "Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is ignored with a warning."
+    "note": "Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is reported with a NOT APPLIED line."
+  },
+  {
+    "id": "compose deploy.endpoint_mode",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.labels",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.mode",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.placement",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.replicas",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: the shim supports one container per service."
+  },
+  {
+    "id": "compose deploy.resources",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.restart_policy",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: restart policies are not supported by Apple container."
+  },
+  {
+    "id": "compose deploy.rollback_config",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose deploy.update_config",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted; only resources.limits translates."
+  },
+  {
+    "id": "compose develop",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose device_cgroup_rules",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose devices",
@@ -405,6 +819,15 @@
     "note": "Each entry forwards as Apple --dns-search."
   },
   {
+    "id": "compose domainname",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: domainname is not supported by Apple container."
+  },
+  {
     "id": "compose entrypoint",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -432,13 +855,58 @@
     "note": "Map and list forms flatten into Apple -e pairs."
   },
   {
+    "id": "compose expose",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose extends",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose external_links",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: external_links are not applied."
+  },
+  {
     "id": "compose extra_hosts",
     "kind": "compose-key",
     "status": "PARTIAL",
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Ignored with a warning — extra_hosts is not yet translated."
+    "note": "Accepted and reported with a NOT APPLIED line: extra_hosts is not translated."
+  },
+  {
+    "id": "compose gpus",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose group_add",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose healthcheck",
@@ -456,7 +924,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Ignored with a warning — custom hostname is not supported by Apple container."
+    "note": "Accepted and reported with a NOT APPLIED line: custom hostname is not supported by Apple container."
   },
   {
     "id": "compose image",
@@ -477,6 +945,24 @@
     "note": "Forwards to Apple --init."
   },
   {
+    "id": "compose ipc",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose isolation",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose labels",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -484,6 +970,33 @@
     "evidence": "fake",
     "test": null,
     "note": "Map and list forms translate to Apple --label alongside the shim's bookkeeping labels."
+  },
+  {
+    "id": "compose links",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: links are not applied; service names resolve through the project network."
+  },
+  {
+    "id": "compose logging",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: logging drivers are not applied."
+  },
+  {
+    "id": "compose mac_address",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: mac_address is not applied."
   },
   {
     "id": "compose mem_limit",
@@ -495,13 +1008,94 @@
     "note": "Forwards to Apple --memory."
   },
   {
+    "id": "compose mem_reservation",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose mem_swappiness",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose memswap_limit",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose models",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose name",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose network_mode",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 cannot share, disable or replace the project network; the service would otherwise gain connectivity it did not request."
+  },
+  {
     "id": "compose networks",
     "kind": "compose-key",
     "status": "PARTIAL",
     "apple": "--network",
     "evidence": "live",
     "test": "test_live_fixtures.LiveFixtureTests.test_fixture_e_services_resolve_only_peers_on_a_shared_network",
-    "note": "Each declared network joins via Apple --network; per-network aliases are ignored with a warning."
+    "note": "Each declared network joins via Apple --network; per-network aliases are reported with a NOT APPLIED line."
+  },
+  {
+    "id": "compose oom_kill_disable",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose oom_score_adj",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose pid",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose pids_limit",
@@ -531,6 +1125,24 @@
     "note": "Publishes via Apple -p; bare container ports map to the identical host port, as Apple has no random-host-port mode."
   },
   {
+    "id": "compose post_start",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: lifecycle hooks are not run."
+  },
+  {
+    "id": "compose pre_stop",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: lifecycle hooks are not run."
+  },
+  {
     "id": "compose privileged",
     "kind": "compose-key",
     "status": "UNSUPPORTED",
@@ -538,6 +1150,33 @@
     "evidence": "fake",
     "test": null,
     "note": "Refused with exit 64; Apple container 1.5.0 has no privileged mode."
+  },
+  {
+    "id": "compose profiles",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "No runtime effect; accepted and ignored as Compose does."
+  },
+  {
+    "id": "compose provider",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose pull_policy",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: pull_policy is not applied."
   },
   {
     "id": "compose read_only",
@@ -555,16 +1194,34 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Ignored with a warning — restart policies are not supported by Apple container."
+    "note": "Accepted and reported with a NOT APPLIED line: restart policies are not supported by Apple container."
+  },
+  {
+    "id": "compose runtime",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose scale",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: the shim supports one container per service."
   },
   {
     "id": "compose secrets",
     "kind": "compose-key",
-    "status": "PARTIAL",
+    "status": "UNSUPPORTED",
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Ignored with a warning — secrets are a Swarm feature with no Apple container equivalent."
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Compose secrets are not supported yet: Apple container 1.5.0 cannot mount a single file and the shim will not expose a secret any other way."
   },
   {
     "id": "compose security_opt",
@@ -592,6 +1249,33 @@
     "evidence": "fake",
     "test": null,
     "note": "Forwards to Apple -i."
+  },
+  {
+    "id": "compose stop_grace_period",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: stop_grace_period is not applied; the runtime default is used."
+  },
+  {
+    "id": "compose stop_signal",
+    "kind": "compose-key",
+    "status": "PARTIAL",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted and reported with a NOT APPLIED line: stop_signal is not applied; the runtime default is used."
+  },
+  {
+    "id": "compose storage_opt",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose sysctls",
@@ -630,6 +1314,96 @@
     "note": "Declared networks are created at up time honoring --internal; external networks are warned and not created."
   },
   {
+    "id": "compose top-level networks.attachable",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level networks.driver",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Honoured when creating the resource."
+  },
+  {
+    "id": "compose top-level networks.driver_opts",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level networks.enable_ipv4",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level networks.enable_ipv6",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level networks.external",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Attached by its own name (`name:` or the key); never created or removed. `up` exits 1 when it does not exist, before creating anything."
+  },
+  {
+    "id": "compose top-level networks.internal",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Honoured when creating the resource."
+  },
+  {
+    "id": "compose top-level networks.ipam",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level networks.labels",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Honoured when creating the resource."
+  },
+  {
+    "id": "compose top-level networks.name",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Used verbatim as the runtime network name, without the project prefix."
+  },
+  {
     "id": "compose top-level services",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -646,6 +1420,51 @@
     "evidence": "live",
     "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
     "note": "Parsed and shown by `config`; named volumes are created on demand from service references."
+  },
+  {
+    "id": "compose top-level volumes.driver",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Honoured when creating the resource."
+  },
+  {
+    "id": "compose top-level volumes.driver_opts",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: changes where the data lives and has no Apple equivalent."
+  },
+  {
+    "id": "compose top-level volumes.external",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_o_external_volume_survives_down_v_and_is_reused",
+    "note": "Mounted by its own name (`name:` or the key); never created, relabelled or removed. `up` exits 1 naming the volume and service when it does not exist; a leftover `<project>_<key>` copy from earlier versions only gets a notice."
+  },
+  {
+    "id": "compose top-level volumes.labels",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Honoured when creating the resource."
+  },
+  {
+    "id": "compose top-level volumes.name",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Used verbatim as the runtime volume name, without the project prefix."
   },
   {
     "id": "compose tty",
@@ -666,6 +1485,15 @@
     "note": "Map or list form translates to Apple --ulimit as type=soft[:hard]."
   },
   {
+    "id": "compose use_api_socket",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose user",
     "kind": "compose-key",
     "status": "SUPPORTED",
@@ -675,6 +1503,24 @@
     "note": "Forwards to Apple --user."
   },
   {
+    "id": "compose userns_mode",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose uts",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
+  },
+  {
     "id": "compose volumes",
     "kind": "compose-key",
     "status": "PARTIAL",
@@ -682,6 +1528,177 @@
     "evidence": "live",
     "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
     "note": "Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v."
+  },
+  {
+    "id": "compose volumes.Z",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.bind",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.cached",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.consistency",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.delegated",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.image",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: image mounts are not supported."
+  },
+  {
+    "id": "compose volumes.nocopy",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose volumes.propagation",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose volumes.read_only",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.ro",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.rw",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.source",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.subpath",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent."
+  },
+  {
+    "id": "compose volumes.target",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.tmpfs",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: tmpfs mounts in `volumes` are not translated; use the service `tmpfs` key."
+  },
+  {
+    "id": "compose volumes.type",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.volume",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.z",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes_from",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent."
   },
   {
     "id": "compose working_dir",
@@ -834,7 +1851,16 @@
     "apple": null,
     "evidence": "live",
     "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
-    "note": "No background monitoring or restarts; keys with no Apple equivalent are ignored with a warning."
+    "note": "No background monitoring or restarts; every key is validated first, and keys with no Apple equivalent are refused (REFUSED) or reported (NOT APPLIED)."
+  },
+  {
+    "id": "compose up --no-deps",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Creates only the named services and prints a notice listing the skipped dependencies."
   },
   {
     "id": "docker compose version",

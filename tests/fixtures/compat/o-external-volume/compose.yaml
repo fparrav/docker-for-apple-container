@@ -1,0 +1,15 @@
+# tiers: live, conformance
+# images: postgres:17
+# Apple volumes are ext4 mounts with lost+found, so PGDATA must be a subdirectory.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: shim
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgext:/var/lib/postgresql/data
+volumes:
+  pgext:
+    external: true
+    name: ${EXT_VOLUME}

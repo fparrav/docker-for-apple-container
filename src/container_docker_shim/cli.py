@@ -12,6 +12,7 @@ import sys
 import uuid
 from typing import Any
 
+from . import compose_capabilities
 from . import security
 
 
@@ -1511,7 +1512,13 @@ def _parse_run_options(
         elif arg == "--network":
             value, i = _take_value(argv, i, arg)
             if value == "none":
-                raise ShimError("Docker --network=none has no verified Apple container equivalent; refusing unsafe translation", 64)
+                raise ShimError(
+                    compose_capabilities.refused(
+                        "Docker --network=none has no verified Apple container "
+                        "equivalent; refusing unsafe translation"
+                    ),
+                    64,
+                )
             opts.extend(["--network", value])
             continue
         elif arg in ("--security-opt", "--pids-limit", "--privileged", "--storage-opt"):
@@ -1521,9 +1528,9 @@ def _parse_run_options(
                 _, i = _take_value(argv, i, arg)
             decision = security.decide(arg)
             if decision.action == "refuse":
-                raise ShimError(decision.message, 64)
+                raise ShimError(compose_capabilities.refused(decision.message), 64)
             if decision.action == "skip":
-                print(decision.message, file=sys.stderr)
+                print(compose_capabilities.not_applied(decision.message), file=sys.stderr)
             continue
         elif arg in unsupported_apple_options:
             raise ShimError(f"unsupported docker run option for Apple container: {current}", 64)
@@ -1623,7 +1630,12 @@ BUILD_EXPLICIT_OPTIONS = frozenset(
 )
 
 
-def cmd_build(argv: list[str]) -> int:
+def translate_build_argv(argv: list[str]) -> tuple[list[str], str] | None:
+    """Translate Docker build arguments into Apple options and the context.
+
+    Shared by ``docker build`` and Compose ``build:``. Returns ``None`` when
+    help was requested; raises ``ShimError`` (exit 64) for refused options.
+    """
     opts: list[str] = []
     context = "."
     saw_context = False
@@ -1635,19 +1647,19 @@ def cmd_build(argv: list[str]) -> int:
     while i < len(argv):
         current = argv[i]
         if current in ("-h", "--help"):
-            return _run_container_passthrough(["build", "--help"])
+            return None
         if current == "--":
             if i + 1 < len(argv):
                 if saw_context:
-                    return _die("build accepts only one context directory", 64)
+                    raise ShimError("build accepts only one context directory", 64)
                 context = argv[i + 1]
                 saw_context = True
                 if i + 2 < len(argv):
-                    return _die("build accepts only one context directory", 64)
+                    raise ShimError("build accepts only one context directory", 64)
             break
         if not current.startswith("-"):
             if saw_context:
-                return _die("build accepts only one context directory", 64)
+                raise ShimError("build accepts only one context directory", 64)
             context = current
             saw_context = True
             i += 1
@@ -1679,7 +1691,7 @@ def cmd_build(argv: list[str]) -> int:
             # Apple `container build --ssh` takes only `default` (the host
             # agent); Docker's `id=path` forms have no equivalent.
             if value != "default":
-                return _die(
+                raise ShimError(
                     f"unsupported docker build option for Apple container: "
                     f"--ssh {value} (only --ssh default is supported)",
                     64,
@@ -1695,11 +1707,22 @@ def cmd_build(argv: list[str]) -> int:
         elif arg in BUILD_NOOP_OPTIONS:
             _debug(f"accepted no-op build option {arg}")
         elif arg in BUILD_REFUSED_OPTIONS:
-            return _die(f"unsupported docker build option for Apple container: {current}", 64)
+            raise ShimError(f"unsupported docker build option for Apple container: {current}", 64)
         else:
-            return _die(f"unsupported docker build option: {current}", 64)
+            raise ShimError(f"unsupported docker build option: {current}", 64)
         i += 1
 
+    return opts, context
+
+
+def cmd_build(argv: list[str]) -> int:
+    try:
+        translated = translate_build_argv(argv)
+    except ShimError as exc:
+        return _die(str(exc), exc.code)
+    if translated is None:
+        return _run_container_passthrough(["build", "--help"])
+    opts, context = translated
     return _run_container_passthrough(["build", *opts, context])
 
 
@@ -2235,6 +2258,12 @@ def main(argv: list[str] | None = None) -> int:
 
         command = argv[0]
         rest = argv[1:]
+        unknown_waivers = compose_capabilities.unknown_waivers()
+        if unknown_waivers:
+            print(
+                f"warning: {security.ENV_ALLOW} names no waivable option: {', '.join(unknown_waivers)}",
+                file=sys.stderr,
+            )
         if command == "version":
             return cmd_version(rest)
         if command == "info":

@@ -244,12 +244,41 @@ when available, then fall back to stable service-name order from labels.
   Bare `docker run` is left alone, since injecting into a possibly short-lived
   container would race its exit (Apple has no `--add-host` flag to set it at
   creation, so it must be done via a post-start `exec`).
-- **Named volumes** map onto Apple-native volumes (`container volume create`),
-  scoped as `<project>_<volume>`. Host-path mounts become bind mounts, with
-  relative paths resolved against the compose file's directory.
+- **Named volumes and networks** map onto Apple-native resources
+  (`container volume create`, `container network create`). A managed one is
+  named `<project>_<key>` unless the file gives `name:`, which is used as
+  written. An `external: true` resource is used by its own name (`name:` or the
+  key): the shim never creates, relabels or removes it, and `up` exits 1 naming
+  it, before creating anything, when it does not exist. A managed name that
+  already exists under another project's label also exits 1; one without any
+  Compose label is reused with a notice and never removed. Host-path mounts
+  become bind mounts, with relative paths resolved against the compose file's
+  directory.
+- **Migrating external volumes.** Earlier versions created and mounted
+  `<project>_<key>` even for an `external: true` volume, so the data of such a
+  stack may sit in that copy. The shim now mounts the real external volume and
+  prints a notice naming the old copy; it neither deletes nor mounts it. Copy
+  what you need into the external volume, then remove the old one yourself
+  (`container volume rm <project>_<key>`).
 - **Teardown is self-coherent.** `down` removes the project's containers (found
-  by label), then removes the network (and with `-v`, the volumes) **only if the
-  shim created them** (verified via the project label), never external ones.
+  by label), then the networks (and with `-v`, the volumes) that the current
+  Compose file declares as managed **and** that carry the project label. External
+  resources, resources the file no longer declares, and other projects' resources
+  are never removed. `down -v` needs the Compose file to know what the project
+  owns: without one it exits 64 and removes nothing (plain `down` still works
+  from labels).
+- **`up [SERVICE...]` acts on the selection and what it needs.** The named
+  services are created together with their `depends_on` closure, dependencies
+  first, and unrelated services are left alone; unknown names exit 1 and
+  cycles or dependencies on undefined services exit 64, all before anything is
+  created. `--no-deps` creates only the named services and prints a notice
+  listing the dependencies it skipped. A dependency that sits in an inactive
+  profile is reported with the profile that enables it.
+- **Optional dependencies.** `depends_on` entries with `required: false` are not
+  pulled into the selection; when their service is part of the plan they still
+  order and gate their dependent, but a dependency that never becomes healthy,
+  or a `service_healthy` gate on a service without a healthcheck, is a notice
+  instead of an error.
 - **`up` is idempotent and converges.** Each container carries
   `com.docker.compose.config-hash` (a SHA-256 over the normalized service
   definition plus the image ID) and `com.docker.compose.image`. Re-running `up`
@@ -283,21 +312,44 @@ when available, then fall back to stable service-name order from labels.
   restart on failure, and `up` warns about a declared healthcheck that nothing
   evaluates.
 - **Volumes survive recreation.** Recreating a service never removes a volume.
-  `down` removes no volume; `down -v` removes only the named volumes the shim
-  created for that project (verified by label), never external or other-project
-  volumes.
+  `down` removes no volume; `down -v` removes only the managed volumes the Compose
+  file declares and that carry the project label, never external or
+  other-project volumes.
 - **The Compose model comes from the official `docker-compose` when it is
   installed**, and from a small built-in parser otherwise. See
   [Compose normalizer](#compose-normalizer) below; `docker compose version`
   reports which one is active.
 
-Compose keys with no Apple equivalent (the service-level `restart` policy,
-`hostname`, `secrets`, `configs`, `deploy` replicas, `extra_hosts`, and network
-aliases) are parsed but ignored, with a one-line warning per service so
-behavior is never silently misrepresented. Security keys are different:
-`privileged`, `security_opt`, `pids_limit`, `sysctls`, and `devices` make `up`
-fail with exit 64 before any network or container is created (see
-[Security options](#security-options)).
+Before `up` or `build` creates anything, the shim classifies every key of the
+normalized model against one capability table (`compose_capabilities.py`) and
+reports every problem in a single run. A key is applied, reported, or refused:
+
+- `REFUSED:` (standard error, exit 64): the key would weaken a restriction or an
+  isolation request the shim cannot honour, or it is unknown. Nothing is created.
+  Restrictions can be waived by naming the key in
+  `CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED`; `network_mode` (every value),
+  `secrets`, `configs`, and unsupported volume or resource attributes cannot.
+- `NOT APPLIED:` (standard error): the key changes behaviour but not isolation
+  or data safety, and Apple `container` has no equivalent. The service still
+  starts; standard output carries only the Compose progress.
+
+**Breaking change:** projects that used to run with these keys silently ignored
+(`network_mode`, `secrets`, `configs`, unknown keys, unsupported build or volume
+options) now exit 64. Remove the key, or for waivable restrictions name it in
+`CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED`. Read-only volumes and bind mounts are
+translated to `--mount ...,readonly` and `build.target`, `labels`, `no_cache`,
+`pull`, `secrets` and `ssh: default` reach the build.
+
+Compose keys that change behaviour but have no Apple equivalent (the
+service-level `restart` policy, `hostname`, `deploy` replicas, `extra_hosts`,
+and network aliases) are accepted, and `up` prints one `NOT APPLIED:` line per
+key on standard error so behavior is never silently misrepresented. Security
+keys are different: `privileged`, `security_opt`, `pids_limit`, `sysctls`, and
+`devices` make `up` fail with exit 64 before any network or container is
+created (see [Security options](#security-options)). `secrets` and `configs` are
+refused the same way and cannot be waived: they are Compose features, not
+Swarm-only ones, and Apple `container` 1.5.0 cannot mount a single file, so the
+shim has no safe way to deliver them. The shim never opens the files they name.
 `compose run`, scaling, network aliases, continuous healthchecks and
 anonymous-volume removal remain intentionally out of scope.
 
@@ -414,7 +466,10 @@ To run a workload whose restriction cannot be enforced, opt in explicitly by
 naming the option in `CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED` (comma-separated;
 there is no wildcard). Allowed names: `security-opt`, `pids-limit`,
 `storage-opt`, `privileged`, `sysctls`, `devices`. The option is skipped with a
-warning on every use and the restriction is **not** enforced:
+`NOT APPLIED:` line on standard error on every use and the restriction is
+**not** enforced. Isolation requests (`hostname`, `add-host`, `network-none`,
+and Compose `network_mode`) cannot be waived: naming them has no effect, and
+the shim prints a warning that the name matches no waivable option:
 
 ```bash
 CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED=security-opt,pids-limit docker run ...
@@ -452,7 +507,7 @@ API). Known differences are called out in the `note` column.
 | docker compose rm | SUPPORTED | - | fake | Never prompts; -f is accepted and -s/--stop stops services first. |
 | docker compose start | SUPPORTED | - | fake | Starts dependencies first, falling back to service-name order without a file. |
 | docker compose stop | SUPPORTED | - | fake | Stops services in reverse dependency order. |
-| docker compose up | PARTIAL | - | live | No background monitoring or restarts; keys with no Apple equivalent are ignored with a warning. |
+| docker compose up | PARTIAL | - | live | No background monitoring or restarts; every key is validated first, and keys with no Apple equivalent are refused (REFUSED) or reported (NOT APPLIED). |
 | docker compose version | SUPPORTED | - | fake | Reports the active normalizer (official docker-compose or built-in subset). |
 | docker container inspect | SUPPORTED | container inspect | fake | Alias for docker inspect. |
 | docker container port | SUPPORTED | container inspect | fake | Alias for docker port; published bindings come from Apple inspect. |
@@ -510,54 +565,167 @@ API). Known differences are called out in the `note` column.
 | docker volume ls | PARTIAL | container volume list | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
 | docker volume prune | PARTIAL | container volume prune | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
 | docker volume rm | PARTIAL | container volume delete | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| compose annotations | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose attach | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose blkio_config | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose build | SUPPORTED | build | fake | Translates to `container build` of the service context, tagging the service image. |
+| compose build.additional_contexts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
 | compose build.args | SUPPORTED | --build-arg | fake | Each entry forwards as Apple --build-arg. |
+| compose build.cache_from | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.cache_to | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
 | compose build.context | SUPPORTED | - | fake | Context directory, defaulting to the project directory; passed as the build's positional argument. |
 | compose build.dockerfile | SUPPORTED | --file | fake | Forwarded as Apple --file, resolved against the context. |
+| compose build.dockerfile_inline | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.entitlements | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.extra_hosts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.isolation | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.labels | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.network | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.no_cache | SUPPORTED | - | unit | Forwarded to the build. |
 | compose build.platforms | SUPPORTED | --platform | fake | Comma-joined into Apple --platform, falling back to the service platform. |
+| compose build.privileged | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.provenance | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.pull | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.sbom | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.secrets | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.shm_size | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.ssh | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.tags | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
+| compose build.target | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.ulimits | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
 | compose cap_add | SUPPORTED | --cap-add | fake | Each entry forwards as Apple --cap-add. |
 | compose cap_drop | SUPPORTED | --cap-drop | fake | Each entry forwards as Apple --cap-drop. |
+| compose cgroup | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cgroup_parent | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose command | SUPPORTED | - | live | Shell-lexically split and appended as positional args after the image. |
-| compose configs | PARTIAL | - | fake | Ignored with a warning — configs are a Swarm feature with no Apple container equivalent. |
+| compose configs | UNSUPPORTED | - | fake | Refused with exit 64 (REFUSED line), not waivable: Compose configs are not supported yet: Apple container 1.5.0 cannot mount a single file. |
 | compose container_name | SUPPORTED | --name | fake | Used for Apple --name; defaults to <project>-<service>-1 when absent. |
+| compose cpu_count | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_percent | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_period | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_quota | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_rt_period | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_rt_runtime | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose cpu_shares | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose cpus | SUPPORTED | --cpus | fake | Forwards to Apple --cpus, with fractional values normalized. |
+| compose cpuset | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose credential_spec | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose depends_on | SUPPORTED | - | live | Starts dependencies first and honors the service_started, service_healthy and service_completed_successfully conditions. |
-| compose deploy | PARTIAL | --cpus | fake | Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is ignored with a warning. |
+| compose depends_on required | SUPPORTED | - | fake | `required: false` keeps the dependency out of a partial `up` and turns a failed or impossible healthy gate into a notice; the default is required. |
+| compose deploy | PARTIAL | --cpus | fake | Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is reported with a NOT APPLIED line. |
+| compose deploy.endpoint_mode | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.labels | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.mode | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.placement | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.replicas | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: the shim supports one container per service. |
+| compose deploy.resources | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.restart_policy | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: restart policies are not supported by Apple container. |
+| compose deploy.rollback_config | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose deploy.update_config | SUPPORTED | - | unit | Accepted; only resources.limits translates. |
+| compose develop | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose device_cgroup_rules | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose devices | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no host device passthrough. |
 | compose dns | SUPPORTED | --dns | fake | Each entry forwards as Apple --dns. |
 | compose dns_opt | SUPPORTED | --dns-option | fake | Each entry forwards as Apple --dns-option. |
 | compose dns_search | SUPPORTED | --dns-search | fake | Each entry forwards as Apple --dns-search. |
+| compose domainname | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: domainname is not supported by Apple container. |
 | compose entrypoint | SUPPORTED | --entrypoint | fake | String form is shell-lexically split and forwarded as Apple --entrypoint, discarding the image CMD. |
 | compose env_file | SUPPORTED | -e | fake | Files are read at up time and flattened into -e pairs. |
 | compose environment | SUPPORTED | -e | live | Map and list forms flatten into Apple -e pairs. |
-| compose extra_hosts | PARTIAL | - | fake | Ignored with a warning — extra_hosts is not yet translated. |
+| compose expose | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose extends | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose external_links | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: external_links are not applied. |
+| compose extra_hosts | PARTIAL | - | fake | Accepted and reported with a NOT APPLIED line: extra_hosts is not translated. |
+| compose gpus | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose group_add | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose healthcheck | PARTIAL | - | live | 'healthcheck' is only evaluated to gate depends_on service_healthy or 'up --wait'; there is no continuous monitoring and no restart on failure. |
-| compose hostname | PARTIAL | - | fake | Ignored with a warning — custom hostname is not supported by Apple container. |
+| compose hostname | PARTIAL | - | fake | Accepted and reported with a NOT APPLIED line: custom hostname is not supported by Apple container. |
 | compose image | SUPPORTED | - | live | Used as the run's positional image; required when no build section is present. |
 | compose init | SUPPORTED | --init | fake | Forwards to Apple --init. |
+| compose ipc | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose isolation | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose labels | SUPPORTED | --label | fake | Map and list forms translate to Apple --label alongside the shim's bookkeeping labels. |
+| compose links | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: links are not applied; service names resolve through the project network. |
+| compose logging | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: logging drivers are not applied. |
+| compose mac_address | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: mac_address is not applied. |
 | compose mem_limit | SUPPORTED | --memory | fake | Forwards to Apple --memory. |
-| compose networks | PARTIAL | --network | live | Each declared network joins via Apple --network; per-network aliases are ignored with a warning. |
+| compose mem_reservation | UNSUPPORTED | - | fake | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose mem_swappiness | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose memswap_limit | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose models | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose name | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose network_mode | UNSUPPORTED | - | fake | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 cannot share, disable or replace the project network; the service would otherwise gain connectivity it did not request. |
+| compose networks | PARTIAL | --network | live | Each declared network joins via Apple --network; per-network aliases are reported with a NOT APPLIED line. |
+| compose oom_kill_disable | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose oom_score_adj | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose pid | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose pids_limit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no process-count limit. |
 | compose platform | SUPPORTED | --platform | fake | Forwards to Apple --platform on run and on build (unless build.platforms is set); an image without that platform variant fails at run time. |
 | compose ports | PARTIAL | -p | live | Publishes via Apple -p; bare container ports map to the identical host port, as Apple has no random-host-port mode. |
+| compose post_start | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: lifecycle hooks are not run. |
+| compose pre_stop | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: lifecycle hooks are not run. |
 | compose privileged | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no privileged mode. |
+| compose profiles | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
+| compose provider | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose pull_policy | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: pull_policy is not applied. |
 | compose read_only | SUPPORTED | --read-only | fake | Forwards to Apple --read-only. |
-| compose restart | PARTIAL | - | fake | Ignored with a warning — restart policies are not supported by Apple container. |
-| compose secrets | PARTIAL | - | fake | Ignored with a warning — secrets are a Swarm feature with no Apple container equivalent. |
+| compose restart | PARTIAL | - | fake | Accepted and reported with a NOT APPLIED line: restart policies are not supported by Apple container. |
+| compose runtime | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose scale | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: the shim supports one container per service. |
+| compose secrets | UNSUPPORTED | - | fake | Refused with exit 64 (REFUSED line), not waivable: Compose secrets are not supported yet: Apple container 1.5.0 cannot mount a single file and the shim will not expose a secret any other way. |
 | compose security_opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no seccomp/AppArmor/no-new-privileges knob. |
 | compose shm_size | SUPPORTED | --shm-size | fake | Forwards to Apple --shm-size. |
 | compose stdin_open | SUPPORTED | -i | fake | Forwards to Apple -i. |
+| compose stop_grace_period | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: stop_grace_period is not applied; the runtime default is used. |
+| compose stop_signal | PARTIAL | - | unit | Accepted and reported with a NOT APPLIED line: stop_signal is not applied; the runtime default is used. |
+| compose storage_opt | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose sysctls | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no sysctl passthrough. |
 | compose tmpfs | SUPPORTED | --tmpfs | fake | Each entry forwards as Apple --tmpfs. |
 | compose top-level name | SUPPORTED | - | fake | Sanitized into the project name that scopes container, network and volume resources. |
 | compose top-level networks | PARTIAL | network create | live | Declared networks are created at up time honoring --internal; external networks are warned and not created. |
+| compose top-level networks.attachable | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.driver | SUPPORTED | - | unit | Honoured when creating the resource. |
+| compose top-level networks.driver_opts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.enable_ipv4 | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.enable_ipv6 | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.external | SUPPORTED | - | fake | Attached by its own name (`name:` or the key); never created or removed. `up` exits 1 when it does not exist, before creating anything. |
+| compose top-level networks.internal | SUPPORTED | - | unit | Honoured when creating the resource. |
+| compose top-level networks.ipam | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.labels | SUPPORTED | - | unit | Honoured when creating the resource. |
+| compose top-level networks.name | SUPPORTED | - | fake | Used verbatim as the runtime network name, without the project prefix. |
 | compose top-level services | SUPPORTED | - | fake | Each entry becomes a service, started in topological (dependency) order. |
 | compose top-level volumes | PARTIAL | - | live | Parsed and shown by `config`; named volumes are created on demand from service references. |
+| compose top-level volumes.driver | SUPPORTED | - | unit | Honoured when creating the resource. |
+| compose top-level volumes.driver_opts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes where the data lives and has no Apple equivalent. |
+| compose top-level volumes.external | SUPPORTED | - | live | Mounted by its own name (`name:` or the key); never created, relabelled or removed. `up` exits 1 naming the volume and service when it does not exist; a leftover `<project>_<key>` copy from earlier versions only gets a notice. |
+| compose top-level volumes.labels | SUPPORTED | - | unit | Honoured when creating the resource. |
+| compose top-level volumes.name | SUPPORTED | - | fake | Used verbatim as the runtime volume name, without the project prefix. |
 | compose tty | SUPPORTED | -t | fake | Forwards to Apple -t. |
 | compose ulimits | SUPPORTED | --ulimit | fake | Map or list form translates to Apple --ulimit as type=soft[:hard]. |
+| compose use_api_socket | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose user | SUPPORTED | --user | fake | Forwards to Apple --user. |
+| compose userns_mode | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
+| compose uts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
+| compose volumes.Z | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.bind | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.cached | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.consistency | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.delegated | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.image | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: image mounts are not supported. |
+| compose volumes.nocopy | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
+| compose volumes.propagation | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
+| compose volumes.read_only | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.ro | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.rw | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.source | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.subpath | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
+| compose volumes.target | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.tmpfs | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: tmpfs mounts in `volumes` are not translated; use the service `tmpfs` key. |
+| compose volumes.type | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.volume | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.z | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes_from | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose working_dir | SUPPORTED | -w | fake | Forwards to Apple -w. |
 | compose x-shim-boot-hosts | SUPPORTED | - | fake | Shim extension: false skips the boot-time /etc/hosts entrypoint wrapper for the service. |
 | build --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
@@ -588,6 +756,7 @@ API). Known differences are called out in the `note` column.
 | build --tag | SUPPORTED | --tag | fake | Forwarded verbatim to Apple --tag. |
 | build --target | SUPPORTED | --target | fake | Forwarded verbatim to Apple --target. |
 | build --ulimit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag. |
+| compose up --no-deps | SUPPORTED | - | fake | Creates only the named services and prints a notice listing the skipped dependencies. |
 | run --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
 | run --arch | SUPPORTED | --arch | fake | Forwarded verbatim to Apple --arch. |
 | run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. |

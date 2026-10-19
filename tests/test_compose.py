@@ -30,6 +30,7 @@ DOCKER = ROOT / "bin" / "docker"
 sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose  # noqa: E402
+from container_docker_shim import compose_capabilities  # noqa: E402
 
 TIER = "fake"
 
@@ -622,6 +623,38 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertIn("web", joined)
         self.assertIn("db", joined)
 
+    def test_external_network_is_attached_by_its_own_name_and_peers_resolve(self) -> None:
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["edge"] = {"configuration": {"name": "edge", "labels": {}}, "id": "edge"}
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+                networks: [edge]
+            networks:
+              edge:
+                external: true
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        state = self.load_state()
+        for name in ("demo-web-1", "demo-db-1"):
+            argv = state["containers"][name]["run_argv"]
+            self.assertEqual(argv[argv.index("--network") + 1], "edge")
+        self.assertNotIn("demo_edge", state["networks"])
+        self.assertNotIn(["network", "create"], [a[:2] for a in state["action_log"]])
+        hosts_writes = [e for e in state["exec_log"] if "/etc/hosts" in " ".join(e["cmd"])]
+        joined = " ".join(" ".join(e["cmd"]) for e in hosts_writes)
+        self.assertIn("web", joined)
+        self.assertIn("db", joined)
+
     def test_up_injects_host_docker_internal(self) -> None:
         # Multi-service /etc/hosts writes must also publish the host-gateway
         # aliases (Docker Desktop parity), pointing at the network gateway,
@@ -1109,8 +1142,9 @@ class ComposeE2ETests(unittest.TestCase):
         )
 
     def _seed_demo_volumes(self) -> None:
-        # `shared` is external: it pre-exists with no project label. `other`
-        # owns `other_data`. A `demo` down must never touch either.
+        # `shared` is external: it pre-exists with no project label and is
+        # mounted by that exact name. `other` owns `other_data`. A `demo` down
+        # must never touch either, and no `demo_shared` copy may ever appear.
         self._seed_state()
         state = self.load_state()
         state["volumes"]["shared"] = {
@@ -1134,7 +1168,11 @@ class ComposeE2ETests(unittest.TestCase):
         state = self.load_state()
         self.assertIn("demo-db-1", state["containers"])
         before = set(state["volumes"])
-        self.assertEqual(before, {"demo_data", "demo_shared", "shared", "other_data"})
+        self.assertEqual(before, {"demo_data", "shared", "other_data"})
+        self.assertNotIn("demo_shared", before)
+        run_argv = state["containers"]["demo-db-1"]["run_argv"]
+        self.assertIn("type=volume,source=shared,target=/shared", run_argv)
+        self.assertIn("type=volume,source=demo_data,target=/var/lib/postgresql/data", run_argv)
         down = self.docker("compose", "down")
         self.assertEqual(down.returncode, 0, down.stderr)
         state = self.load_state()
@@ -1158,13 +1196,13 @@ class ComposeE2ETests(unittest.TestCase):
             )
             == "demo"
         }
-        self.assertEqual(labeled, {"demo_data", "demo_shared"})
+        self.assertEqual(labeled, {"demo_data"})
         down = self.docker("compose", "down", "-v")
         self.assertEqual(down.returncode, 0, down.stderr)
         state = self.load_state()
         self.assertNotIn("demo_data", state["volumes"])
         self.assertNotIn("demo_shared", state["volumes"])
-        self.assertIn("shared", state["volumes"])  # external: no project label
+        self.assertIn("shared", state["volumes"])  # external: survives -v
         self.assertIn("other_data", state["volumes"])  # another project
         for name, vol in state["volumes"].items():
             self.assertNotEqual(
@@ -1184,6 +1222,208 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertNotIn("demo-db-1", state["containers"])
         # No `up` ran, so no project volume exists; the set must be untouched.
         self.assertEqual(set(state["volumes"]), {"shared", "other_data"})
+
+    # -- Existence pass before creation (external / foreign / unlabelled) --- #
+
+    def _seed_resource(self, family: str, name: str, labels: dict) -> None:
+        self._seed_state() if not self.state.exists() else None
+        state = self.load_state()
+        state[family][name] = {"configuration": {"name": name, "labels": labels}, "id": name}
+        self.state.write_text(json.dumps(state))
+
+    def _write_external_volume_compose(self) -> None:
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                volumes:
+                  - shared:/shared
+            volumes:
+              shared:
+                external: true
+            """
+        )
+
+    def _assert_nothing_created(self) -> None:
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertNotIn("demo_default", state["networks"])
+        self.assertFalse([n for n in state["volumes"] if n.startswith("demo_")])
+
+    def test_missing_external_volume_exits_1_and_creates_nothing(self) -> None:
+        self._seed_state()
+        self._write_external_volume_compose()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("shared", up.stderr)
+        self.assertIn("'db'", up.stderr)
+        self._assert_nothing_created()
+
+    def test_missing_external_network_exits_1_and_creates_nothing(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+            networks:
+              edge:
+                external: true
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("edge", up.stderr)
+        self._assert_nothing_created()
+
+    def test_managed_volume_labelled_for_another_project_is_refused(self) -> None:
+        self._seed_resource("volumes", "demo_data", {"com.docker.compose.project": "other"})
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                volumes:
+                  - data:/data
+            volumes:
+              data: {}
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("belongs to project", up.stderr)
+        self.assertIn("other", up.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertNotIn("demo_default", state["networks"])
+
+    def test_unlabelled_managed_volume_is_reused_with_a_notice_and_kept_by_down(self) -> None:
+        self._seed_resource("volumes", "demo_data", {})
+        self.write_compose(
+            """
+            services:
+              db:
+                image: postgres:16
+                volumes:
+                  - data:/data
+            volumes:
+              data: {}
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertIn("without a Compose label", up.stderr)
+        down = self.docker("compose", "down", "-v")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("demo_data", self.load_state()["volumes"])
+
+    def test_existing_external_resource_is_used_untouched(self) -> None:
+        self._seed_resource("volumes", "shared", {"keep": "me"})
+        self._write_external_volume_compose()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        vol = self.load_state()["volumes"]["shared"]
+        self.assertEqual(vol["configuration"]["labels"], {"keep": "me"})
+
+    def test_legacy_copy_gets_one_notice_and_is_left_in_place(self) -> None:
+        self._seed_resource("volumes", "shared", {})
+        self._seed_resource("volumes", "demo_shared", {"com.docker.compose.project": "demo"})
+        self._write_external_volume_compose()
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertEqual(up.stderr.count("demo_shared"), 1)
+        state = self.load_state()
+        self.assertIn("demo_shared", state["volumes"])
+        run_argv = state["containers"]["demo-db-1"]["run_argv"]
+        self.assertIn("type=volume,source=shared,target=/shared", run_argv)
+
+
+    # -- Teardown ownership: model AND label ------------------------------- #
+
+    def _managed_data_compose(self, external: bool = False) -> None:
+        declaration = "\n                external: true" if external else " {}"
+        self.write_compose(
+            f"""
+            services:
+              db:
+                image: postgres:16
+                volumes:
+                  - data:/data
+            volumes:
+              data:{declaration}
+            """
+        )
+
+    def test_down_v_protects_a_volume_now_declared_external(self) -> None:
+        self._managed_data_compose()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.assertIn("demo_data", self.load_state()["volumes"])
+        # The file now declares `data` external, so `demo_data` is not ours to remove.
+        self._managed_data_compose(external=True)
+        self._seed_resource("volumes", "data", {})
+        down = self.docker("compose", "down", "-v")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        volumes = self.load_state()["volumes"]
+        self.assertIn("demo_data", volumes)
+        self.assertIn("data", volumes)
+
+    def test_down_v_does_not_remove_a_labelled_volume_the_file_does_not_declare(self) -> None:
+        self._seed_resource("volumes", "demo_stray", {"com.docker.compose.project": "demo"})
+        self._managed_data_compose()
+        down = self.docker("compose", "down", "-v")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("demo_stray", self.load_state()["volumes"])
+
+    def test_down_v_without_a_file_exits_64_and_removes_nothing(self) -> None:
+        self._managed_data_compose()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        (self.project / "docker-compose.yml").unlink()
+        down = self.docker("compose", "-p", "demo", "down", "-v")
+        self.assertEqual(down.returncode, 64, down.stderr)
+        self.assertIn("Compose file", down.stderr)
+        state = self.load_state()
+        self.assertIn("demo-db-1", state["containers"])
+        self.assertIn("demo_data", state["volumes"])
+        self.assertIn("demo_default", state["networks"])
+
+    def test_down_v_with_a_service_and_no_file_is_refused_too(self) -> None:
+        self._managed_data_compose()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        (self.project / "docker-compose.yml").unlink()
+        down = self.docker("compose", "-p", "demo", "down", "-v", "db")
+        self.assertEqual(down.returncode, 64, down.stderr)
+        self.assertIn("demo-db-1", self.load_state()["containers"])
+
+    def test_plain_down_without_a_file_still_works_from_labels(self) -> None:
+        self._managed_data_compose()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        (self.project / "docker-compose.yml").unlink()
+        down = self.docker("compose", "-p", "demo", "down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        state = self.load_state()
+        self.assertNotIn("demo-db-1", state["containers"])
+        self.assertNotIn("demo_default", state["networks"])
+        self.assertIn("demo_data", state["volumes"])
+
+    def test_down_never_removes_an_external_network(self) -> None:
+        self._seed_resource("networks", "edge", {"com.docker.compose.project": "demo"})
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+            networks:
+              edge:
+                external: true
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        down = self.docker("compose", "down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("edge", self.load_state()["networks"])
 
     def test_up_is_idempotent(self) -> None:
         self.write_compose(
@@ -1412,7 +1652,8 @@ class ComposeE2ETests(unittest.TestCase):
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("deploy.replicas", result.stderr)
-        self.assertIn("network aliases ignored", result.stderr)
+        self.assertIn("networks.aliases", result.stderr)
+        self.assertIn("NOT APPLIED:", result.stderr)
         # conditions are enforced, not ignored: `web` waits for `db` to be
         # healthy (the fake exec passes, so the wait resolves at once), and
         # the gated healthcheck of `db` triggers no ungated-check warning.
@@ -1422,6 +1663,63 @@ class ComposeE2ETests(unittest.TestCase):
             set(self.load_state()["containers"]),
             {"demo-web-1", "demo-db-1"},
         )
+
+    # -- Service selection (`up <service>` pulls in its dependencies) ------- #
+
+    def _write_selective_compose(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                depends_on:
+                  db:
+                    condition: service_healthy
+              db:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "true"]
+              worker:
+                image: alpine:3.20
+            """
+        )
+
+    def _runs(self) -> list:
+        return [a[1] for a in self.load_state()["action_log"] if a[0] == "run"]
+
+    def test_up_service_creates_its_dependencies_in_order_and_skips_others(self) -> None:
+        self._write_selective_compose()
+        up = self.docker("compose", "up", "-d", "api")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertEqual(self._runs(), ["demo-db-1", "demo-api-1"])
+        self.assertIn("Waiting for demo-db-1 to become healthy", up.stdout)
+        self.assertNotIn("demo-worker-1", self.load_state()["containers"])
+
+    def test_up_no_deps_creates_only_the_named_service_with_a_notice(self) -> None:
+        self._write_selective_compose()
+        up = self.docker("compose", "up", "-d", "--no-deps", "api")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertEqual(self._runs(), ["demo-api-1"])
+        self.assertIn("--no-deps", up.stderr)
+        self.assertIn("db", up.stderr)
+
+    def test_up_unknown_service_exits_1_and_creates_nothing(self) -> None:
+        self._seed_state()
+        self._write_selective_compose()
+        up = self.docker("compose", "up", "-d", "apii")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("apii", up.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertEqual(state["networks"], {})
+
+    def test_up_service_starts_a_stopped_dependency(self) -> None:
+        self._write_selective_compose()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.assertEqual(self.docker("compose", "stop", "db").returncode, 0)
+        up = self.docker("compose", "up", "-d", "api")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertIn("Starting demo-db-1", up.stdout)
 
     def test_down_without_compose_file(self) -> None:
         # down must work from labels alone, even with no compose file present.
@@ -1455,6 +1753,251 @@ class ComposeE2ETests(unittest.TestCase):
                 }
             )
         )
+
+    def test_refused_project_creates_nothing(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                volumes: ["data:/d"]
+              worker:
+                image: alpine:3.20
+                network_mode: none
+            volumes:
+              data: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertIn("worker", result.stderr)
+        self.assertIn("network_mode", result.stderr)
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertEqual(state["networks"], {})
+        self.assertEqual(state["volumes"], {})
+        self.assertEqual(state["action_log"], [])
+
+    def test_refused_build_creates_nothing(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              worker:
+                build: .
+                network_mode: none
+            """
+        )
+        result = self.docker("compose", "build")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertEqual(self.load_state()["action_log"], [])
+
+    def test_refused_edit_leaves_running_project_untouched(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        before = self.load_state()
+        self.clear_action_log()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                network_mode: none
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        after = self.load_state()
+        self.assertEqual(after["containers"], before["containers"])
+        self.assertEqual(after["networks"], before["networks"])
+        self.assertEqual(after["action_log"], [])
+
+    def test_all_problems_are_reported_in_one_run(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              a:
+                image: alpine:3.20
+                network_mode: none
+              b:
+                image: alpine:3.20
+                secrets: [pw]
+            secrets:
+              pw:
+                file: ./pw.txt
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        refused = [line for line in result.stderr.splitlines() if line.startswith("REFUSED:")]
+        self.assertEqual(len(refused), 2, result.stderr)
+        self.assertTrue(any("'a'" in line and "network_mode" in line for line in refused))
+        self.assertTrue(any("'b'" in line and "secrets" in line for line in refused))
+
+    def test_up_refuses_secrets_without_opening_the_secret_file(self) -> None:
+        self._seed_state()
+        before = self.load_state()
+        secret = self.project / "pw.txt"
+        secret.write_text("hunter2\n")
+        self.write_compose(
+            """
+            services:
+              db:
+                image: alpine:3.20
+                secrets: [pw]
+            secrets:
+              pw:
+                file: ./pw.txt
+            """
+        )
+        log = self.root / "opened.log"
+        harness = (
+            "import builtins, sys\n"
+            "real = builtins.open\n"
+            "def guard(file, *a, **k):\n"
+            "    with real(%r, 'a') as out:\n"
+            "        out.write(str(file) + '\\n')\n"
+            "    return real(file, *a, **k)\n"
+            "builtins.open = guard\n"
+            "sys.path.insert(0, %r)\n"
+            "from container_docker_shim.cli import main\n"
+            "raise SystemExit(main())\n"
+        ) % (str(log), str(ROOT / "src"))
+        result = subprocess.run(
+            [sys.executable, "-c", harness, "compose", "up", "-d"],
+            text=True,
+            capture_output=True,
+            env=self.env,
+            cwd=str(self.project),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertNotIn("hunter2", result.stdout + result.stderr)
+        opened = log.read_text().splitlines() if log.exists() else []
+        self.assertNotIn(str(secret), opened)
+        self.assertNotIn("pw.txt", " ".join(opened))
+        after = self.load_state()
+        self.assertEqual(after["action_log"], [])
+        self.assertEqual(after["containers"], before["containers"])
+
+    def test_volume_driver_opts_exit_64_without_creating_a_volume(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              db:
+                image: alpine:3.20
+                volumes:
+                  - data:/data
+            volumes:
+              data:
+                driver_opts:
+                  type: nfs
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertEqual(self.load_state()["action_log"], [])
+
+    def test_notices_print_before_anything_is_created(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                restart: always
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("NOT APPLIED:"), 1, result.stderr)
+        self.assertNotIn("NOT APPLIED:", result.stdout)
+
+    def test_network_mode_values_are_refused(self) -> None:
+        for value in ("none", "host", "service:db", "container:x"):
+            with self.subTest(value=value):
+                self._seed_state()
+                db = (
+                    "\n                    db:\n                      image: alpine:3.20\n"
+                    if value == "service:db"
+                    else ""
+                )
+                self.write_compose(
+                    """
+                    services:
+                      worker:
+                        image: alpine:3.20
+                        network_mode: %s
+                    """
+                    % value
+                    + db
+                )
+                result = self.docker("compose", "up", "-d")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                refused = [
+                    line
+                    for line in result.stderr.splitlines()
+                    if line.startswith("REFUSED:")
+                ]
+                self.assertTrue(
+                    any(
+                        "'worker'" in line and "network_mode" in line
+                        for line in refused
+                    ),
+                    result.stderr,
+                )
+                state = self.load_state()
+                self.assertEqual(state["containers"], {})
+                self.assertEqual(state["networks"], {})
+                self.assertEqual(state["action_log"], [])
+
+    def test_network_mode_waiver_has_no_effect(self) -> None:
+        self._seed_state()
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = (
+            "network_mode,network-none"
+        )
+        self.write_compose(
+            """
+            services:
+              worker:
+                image: alpine:3.20
+                network_mode: none
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("cannot be waived", result.stderr)
+        self.assertIn("names no waivable option", result.stderr)
+        self.assertEqual(self.load_state()["containers"], {})
+
+    def test_unselected_service_with_network_mode_is_not_refused(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: nginx:latest
+              legacy:
+                image: alpine:3.20
+                network_mode: host
+            """
+        )
+        result = self.docker("compose", "up", "-d", "api")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        containers = self.load_state()["containers"]
+        self.assertIn("demo-api-1", containers)
+        self.assertNotIn("demo-legacy-1", containers)
 
     def test_up_refuses_privileged_service(self) -> None:
         self._seed_state()
@@ -1798,6 +2341,68 @@ class ComposeE2ETests(unittest.TestCase):
         state = self.load_state()
         self.assertIn("demo-db-1", state["containers"])
         self.assertNotIn("demo-web-1", state["containers"])
+
+    def _write_gate(self, required: str, healthcheck: bool = True) -> None:
+        check = (
+            """
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+                  interval: 0.05
+                  timeout: 5
+                  retries: 2"""
+            if healthcheck
+            else ""
+        )
+        self.write_compose(
+            f"""
+            services:
+              web:
+                image: nginx:latest
+                depends_on:
+                  db:
+                    condition: service_healthy{required}
+              db:
+                image: postgres:16{check}
+            """
+        )
+
+    def test_optional_unhealthy_dependency_is_a_notice_and_the_dependent_starts(self) -> None:
+        self._write_gate("\n                    required: false")
+        self.script_exec("demo-db-1", [1])
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("optional dependency 'db'", result.stderr)
+        self.assertIn("demo-web-1", self.load_state()["containers"])
+
+    def test_optional_unhealthy_dependency_is_not_waited_on_again_by_up_wait(self) -> None:
+        self._write_gate("\n                    required: false")
+        self.script_exec("demo-db-1", [1])
+        result = self.docker("compose", "up", "-d", "--wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("became unhealthy"), 1)
+
+    def test_required_unhealthy_dependency_still_fails_up(self) -> None:
+        self._write_gate("\n                    required: true")
+        self.script_exec("demo-db-1", [1])
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("demo-web-1", self.load_state()["containers"])
+
+    def test_optional_gate_without_healthcheck_is_a_notice_not_a_refusal(self) -> None:
+        self._write_gate("\n                    required: false", healthcheck=False)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dependency is optional", result.stderr)
+        self.assertEqual(
+            set(self.load_state()["containers"]), {"demo-web-1", "demo-db-1"}
+        )
+
+    def test_required_gate_without_healthcheck_is_still_refused(self) -> None:
+        self._seed_state()
+        self._write_gate("", healthcheck=False)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertEqual(self.load_state()["containers"], {})
 
     def test_up_wait_timeout_bounds_service_healthy_wait(self) -> None:
         # A slow healthcheck (30s interval, 50 retries) must still be cut
@@ -3317,6 +3922,430 @@ class BuildPlatformTests(unittest.TestCase):
             """
         )
         self.assertNotIn("--platform", args)
+
+
+class BuildKeyForwardingTests(unittest.TestCase):
+    """`_run_build` forwards every classified build key through the docker build translator."""
+
+    build_args = BuildPlatformTests.build_args
+
+    def test_target_reaches_the_build(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  target: runtime
+            """
+        )
+        self.assertEqual(args[args.index("--target") + 1], "runtime")
+
+    def test_labels_map_from_a_mapping_and_a_list(self) -> None:
+        mapping = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  labels:
+                    team: core
+            """
+        )
+        listed = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  labels:
+                    - team=core
+            """
+        )
+        self.assertEqual(mapping[mapping.index("--label") + 1], "team=core")
+        self.assertEqual(listed[listed.index("--label") + 1], "team=core")
+
+    def test_no_cache_and_pull_map_to_flags(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  no_cache: true
+                  pull: true
+            """
+        )
+        self.assertIn("--no-cache", args)
+        self.assertIn("--pull", args)
+
+    def test_false_no_cache_and_pull_add_no_flag(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  no_cache: false
+                  pull: false
+            """
+        )
+        self.assertNotIn("--no-cache", args)
+        self.assertNotIn("--pull", args)
+
+    def test_file_secret_becomes_a_secret_argument_without_reading_the_file(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  secrets:
+                    - npmrc
+            secrets:
+              npmrc:
+                file: ./npmrc.txt
+            """
+        )
+        self.assertEqual(args[args.index("--secret") + 1], "id=npmrc,src=/tmp/p/npmrc.txt")
+
+    def test_environment_secret_becomes_an_env_secret(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  secrets:
+                    - source: token
+            secrets:
+              token:
+                environment: API_TOKEN
+            """
+        )
+        self.assertEqual(args[args.index("--secret") + 1], "id=token,env=API_TOKEN")
+
+    def test_undefined_build_secret_exits_64(self) -> None:
+        with self.assertRaises(compose.ShimError) as caught:
+            self.build_args(
+                """
+                services:
+                  web:
+                    build:
+                      context: .
+                      secrets:
+                        - missing
+                """
+            )
+        self.assertEqual(caught.exception.code, 64)
+        self.assertIn("missing", str(caught.exception))
+
+    def test_ssh_default_is_forwarded(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  ssh:
+                    - default
+            """
+        )
+        self.assertEqual(args[args.index("--ssh") + 1], "default")
+
+    def test_unclassified_cache_from_is_refused_by_the_gate(self) -> None:
+        doc = compose.parse_yaml(
+            textwrap.dedent(
+                """
+                services:
+                  web:
+                    build:
+                      context: .
+                      cache_from:
+                        - img:cache
+                """
+            )
+        )
+        proj = compose.Project("p", doc, "/tmp/p")
+        report = compose_capabilities.validate(proj.doc, proj.services.values(), {})
+        self.assertEqual(
+            [(f.service, f.key) for f in report.refusals], [("web", "build.cache_from")]
+        )
+
+
+class VolumeMountTranslationTests(unittest.TestCase):
+    """Short and long volume syntax translate to one `--mount` form with `readonly`."""
+
+    def translate(self, entry) -> list:
+        proj = compose.Project("p", {"services": {}}, "/tmp/p")
+        original = compose._ensure_named_volume
+        compose._ensure_named_volume = lambda *args, **kwargs: None
+        try:
+            return compose._classify_and_translate_volume(entry, proj, set())
+        finally:
+            compose._ensure_named_volume = original
+
+    def test_translation_table(self) -> None:
+        cases = [
+            ("data:/d", ["--mount", "type=volume,source=p_data,target=/d"]),
+            ("data:/d:ro", ["--mount", "type=volume,source=p_data,target=/d,readonly"]),
+            ("data:/d:rw", ["--mount", "type=volume,source=p_data,target=/d"]),
+            ("data:/d:z", ["--mount", "type=volume,source=p_data,target=/d"]),
+            ("data:/d:ro,z", ["--mount", "type=volume,source=p_data,target=/d,readonly"]),
+            ("data:/d:cached", ["--mount", "type=volume,source=p_data,target=/d"]),
+            ("/abs:/d", ["--mount", "type=bind,source=/abs,target=/d"]),
+            ("/abs:/d:ro", ["--mount", "type=bind,source=/abs,target=/d,readonly"]),
+            ("./rel:/d", ["--mount", "type=bind,source=/tmp/p/rel,target=/d"]),
+            (
+                {"type": "volume", "source": "data", "target": "/d", "read_only": True},
+                ["--mount", "type=volume,source=p_data,target=/d,readonly"],
+            ),
+            (
+                {"type": "volume", "source": "data", "target": "/d"},
+                ["--mount", "type=volume,source=p_data,target=/d"],
+            ),
+            (
+                {"type": "bind", "source": "/abs", "target": "/d", "read_only": True},
+                ["--mount", "type=bind,source=/abs,target=/d,readonly"],
+            ),
+        ]
+        for entry, expected in cases:
+            with self.subTest(entry=entry):
+                self.assertEqual(self.translate(entry), expected)
+
+    def test_unsupported_option_exits_64_naming_the_target(self) -> None:
+        with self.assertRaises(compose.ShimError) as caught:
+            self.translate("data:/d:nocopy")
+        self.assertEqual(caught.exception.code, 64)
+        self.assertIn("nocopy", str(caught.exception))
+        self.assertIn("/d", str(caught.exception))
+
+    def test_unsupported_option_on_a_bind_exits_64(self) -> None:
+        with self.assertRaises(compose.ShimError) as caught:
+            self.translate("/abs:/d:nocopy")
+        self.assertEqual(caught.exception.code, 64)
+
+    def test_bind_noop_modes_are_dropped(self) -> None:
+        self.assertEqual(
+            self.translate("/abs:/d:rw,z"), ["--mount", "type=bind,source=/abs,target=/d"]
+        )
+
+
+class ResourceProvisioningTests(unittest.TestCase):
+    """Top-level `internal` and `labels` reach `network create` and `volume create`."""
+
+    def capture(self, call):
+        calls: list = []
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake(args):
+            calls.append(args)
+            result = Result()
+            result.returncode = 1 if args[1] == "inspect" else 0
+            return result
+
+        original = compose._run_container_capture
+        compose._run_container_capture = fake
+        try:
+            call()
+        finally:
+            compose._run_container_capture = original
+        return [args for args in calls if args[1] == "create"]
+
+    def test_internal_network_with_labels(self) -> None:
+        proj = compose.Project(
+            "p",
+            {"services": {}, "networks": {"private": {"internal": True, "labels": {"tier": "db"}}}},
+            "/tmp/p",
+        )
+        created = self.capture(lambda: compose._ensure_network(proj, "private"))
+        args = created[0]
+        self.assertIn("--internal", args)
+        self.assertIn("tier=db", args)
+        self.assertIn("com.docker.compose.network=private", args)
+        self.assertEqual(args[-1], "p_private")
+
+    def test_external_network_is_never_created(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "networks": {"edge": {"external": True}}}, "/tmp/p"
+        )
+        self.assertEqual(self.capture(lambda: compose._ensure_network(proj, "edge")), [])
+
+    def test_explicit_network_name_is_the_created_name(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "networks": {"back": {"name": "shared-back"}}}, "/tmp/p"
+        )
+        created = self.capture(lambda: compose._ensure_network(proj, "back"))
+        self.assertEqual(created[0][-1], "shared-back")
+
+    def test_volume_labels_are_forwarded(self) -> None:
+        created = self.capture(
+            lambda: compose._ensure_named_volume("p_data", "p", {"tier": "db"})
+        )
+        self.assertIn("tier=db", created[0])
+        self.assertEqual(created[0][-1], "p_data")
+
+    def test_volume_labels_come_from_the_project_declaration(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "volumes": {"data": {"labels": ["tier=db"]}}}, "/tmp/p"
+        )
+        created = self.capture(
+            lambda: compose._classify_and_translate_volume("data:/d", proj, set())
+        )
+        self.assertIn("tier=db", created[0])
+        self.assertIn("com.docker.compose.volume=data", created[0])
+
+    def test_external_volume_is_mounted_by_its_own_name_and_never_created(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "volumes": {"data": {"external": True, "name": "shared_data"}}},
+            "/tmp/p",
+        )
+        out: list = []
+        created = self.capture(
+            lambda: out.append(compose._classify_and_translate_volume("data:/d", proj, set()))
+        )
+        self.assertEqual(created, [])
+        self.assertEqual(out[0], ["--mount", "type=volume,source=shared_data,target=/d"])
+
+    def test_external_volume_without_name_keeps_the_key(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "volumes": {"shared": {"external": True}}}, "/tmp/p"
+        )
+        out: list = []
+        created = self.capture(
+            lambda: out.append(compose._classify_and_translate_volume("shared:/s", proj, set()))
+        )
+        self.assertEqual(created, [])
+        self.assertEqual(out[0], ["--mount", "type=volume,source=shared,target=/s"])
+
+    def test_explicit_volume_name_replaces_the_project_prefix(self) -> None:
+        proj = compose.Project(
+            "p", {"services": {}, "volumes": {"data": {"name": "fixed"}}}, "/tmp/p"
+        )
+        created = self.capture(
+            lambda: compose._classify_and_translate_volume("data:/d", proj, set())
+        )
+        self.assertEqual(created[0][-1], "fixed")
+
+    def test_service_networks_use_resolved_runtime_names(self) -> None:
+        proj = compose.Project(
+            "p",
+            {
+                "services": {"web": {"image": "x", "networks": ["edge", "back"]}},
+                "networks": {"edge": {"external": True}, "back": {}},
+            },
+            "/tmp/p",
+        )
+        self.assertEqual(
+            compose._service_networks(proj.services["web"], proj), ["edge", "p_back"]
+        )
+
+    def test_unlabelled_volume_gets_only_the_project_label(self) -> None:
+        created = self.capture(lambda: compose._ensure_named_volume("p_data", "p"))
+        labels = [created[0][i + 1] for i, a in enumerate(created[0]) if a == "--label"]
+        self.assertEqual(len(labels), 1)
+
+
+class InactiveProfileHintTests(unittest.TestCase):
+    ERROR = 'compose: service "api" depends on undefined service "db": invalid compose project'
+
+    def hint(self, services):
+        original = compose.compose_normalizer.load_normalized
+        compose.compose_normalizer.load_normalized = lambda *a, **k: ({"services": services}, "")
+        try:
+            return compose._inactive_profile_hint(
+                "/bin/true", compose.compose_normalizer.Inputs(), self.ERROR
+            )
+        finally:
+            compose.compose_normalizer.load_normalized = original
+
+    def test_names_the_dependency_and_its_profile(self) -> None:
+        text = self.hint({"api": {}, "db": {"profiles": ["debug"]}})
+        self.assertIn('"db"', text)
+        self.assertIn("profile debug", text)
+        self.assertIn("--profile debug", text)
+
+    def test_a_truly_undefined_dependency_keeps_the_original_message(self) -> None:
+        self.assertIsNone(self.hint({"api": {}}))
+
+    def test_other_errors_are_left_alone(self) -> None:
+        self.assertIsNone(
+            compose._inactive_profile_hint(
+                "/bin/true", compose.compose_normalizer.Inputs(), "compose: boom"
+            )
+        )
+
+
+class CheckResourcesRuntimeErrorTests(unittest.TestCase):
+    def test_a_failing_list_aborts_before_any_creation(self) -> None:
+        calls: list = []
+
+        class Result:
+            returncode = 3
+            stdout = ""
+            stderr = "runtime unavailable"
+
+        def fake(args):
+            calls.append(args)
+            return Result()
+
+        proj = compose.Project(
+            "p", {"services": {"db": {"image": "x", "volumes": ["data:/d"]}}}, "/tmp/p"
+        )
+        original = compose._run_container_capture
+        compose._run_container_capture = fake
+        try:
+            with self.assertRaises(compose.ShimError) as caught:
+                compose._check_resources(proj, proj.topo_sorted())
+        finally:
+            compose._run_container_capture = original
+        self.assertEqual(caught.exception.code, 3)
+        self.assertIn("runtime unavailable", str(caught.exception))
+        self.assertTrue(all(a[1] == "list" for a in calls))
+
+
+class DependsRequiredParsingTests(unittest.TestCase):
+    """`depends_on.required` is parsed into `Service.depends_required`."""
+
+    def parse(self, depends_on) -> dict:
+        service = compose.Service("api", {"image": "x", "depends_on": depends_on})
+        return service.depends_required
+
+    def test_list_form_is_required(self) -> None:
+        self.assertEqual(self.parse(["db", "cache"]), {"db": True, "cache": True})
+
+    def test_string_form_is_required(self) -> None:
+        self.assertEqual(self.parse("db"), {"db": True})
+
+    def test_map_form_defaults_to_required(self) -> None:
+        self.assertEqual(self.parse({"db": {"condition": "service_healthy"}}), {"db": True})
+
+    def test_required_false_is_optional(self) -> None:
+        parsed = self.parse({"db": {"required": False}, "cache": {"required": True}})
+        self.assertEqual(parsed, {"db": False, "cache": True})
+
+    def test_required_false_as_text_is_optional(self) -> None:
+        self.assertEqual(self.parse({"db": {"required": "false"}}), {"db": False})
+
+    def test_invalid_required_exits_64(self) -> None:
+        with self.assertRaises(compose.ShimError) as caught:
+            self.parse({"db": {"required": "maybe"}})
+        self.assertEqual(caught.exception.code, 64)
+
+    def test_conditions_are_unchanged(self) -> None:
+        service = compose.Service(
+            "api",
+            {"image": "x", "depends_on": {"db": {"condition": "service_healthy", "required": False}}},
+        )
+        self.assertEqual(service.depends_conditions, {"db": "service_healthy"})
+        self.assertEqual(service.depends_on, ["db"])
+
+    def test_no_depends_on(self) -> None:
+        self.assertEqual(self.parse(None), {})
 
 
 if __name__ == "__main__":

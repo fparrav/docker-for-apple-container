@@ -15,6 +15,7 @@ class OptionRule:
     status: str
     reason: str
     apple_flag: str | None
+    waivable: bool = True
 
 
 RULES: dict[str, OptionRule] = {
@@ -106,18 +107,21 @@ RULES: dict[str, OptionRule] = {
             UNSUPPORTED,
             "not a restriction; Apple container 1.5.0 documents no hostname flag",
             None,
+            waivable=False,
         ),
         OptionRule(
             "add-host",
             UNSUPPORTED,
             "not a restriction; Apple container 1.5.0 documents no add-host flag",
             None,
+            waivable=False,
         ),
         OptionRule(
             "network-none",
             UNSUPPORTED,
             "not a restriction; Apple container 1.5.0 has no none network",
             None,
+            waivable=False,
         ),
     )
 }
@@ -155,6 +159,13 @@ def decide(name: str, environ=None) -> Decision:
     rule = RULES.get(key)
     if rule is None or rule.status != UNSUPPORTED:
         return Decision("ok", "")
+    if not rule.waivable:
+        return Decision(
+            "refuse",
+            "--%s is not supported by Apple container: %s. Isolation requests "
+            "cannot be waived, even when named in %s."
+            % (key, rule.reason, ENV_ALLOW),
+        )
     if key in unenforced_allowed(environ):
         return Decision(
             "skip",
@@ -167,3 +178,20 @@ def decide(name: str, environ=None) -> Decision:
         "without it; the restriction will NOT be enforced."
         % (key, rule.reason, ENV_ALLOW, key),
     )
+
+
+def unknown_waivers(environ=None) -> list[str]:
+    """Names in ``ENV_ALLOW`` that match no waivable rule, sorted, no duplicates.
+
+    A name matches no waivable rule when it names no known option (a typo)
+    or only a non-waivable one, so listing it cannot grant anything and every
+    command should name it in a warning.
+    """
+    if environ is None:
+        environ = os.environ
+    unknown: set[str] = set()
+    for name in unenforced_allowed(environ):
+        rule = lookup(name)
+        if rule is None or not rule.waivable:
+            unknown.add(name)
+    return sorted(unknown)

@@ -1,0 +1,9 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# `network_mode: none` is an isolation request: the shim refuses it (exit 64)
+# instead of giving the service a default network; real Docker honours it.
+services:
+  isolated:
+    image: alpine:3.20
+    network_mode: none
+    command: ["sleep", "3600"]
