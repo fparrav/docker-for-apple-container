@@ -1,0 +1,10 @@
+# tiers: live, conformance
+# images: alpine:3.20 (linux/amd64 variant, run under emulation on Apple silicon)
+# Findings 1.1: the image only runs with an explicit platform; the service
+# declares it so the build and `docker compose up` select the amd64 variant.
+services:
+  probe:
+    build:
+      context: .
+    image: shimtest-fixture-g:amd64
+    platform: linux/amd64

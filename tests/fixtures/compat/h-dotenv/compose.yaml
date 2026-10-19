@@ -1,0 +1,11 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  greeter:
+    image: alpine:3.20
+    environment:
+      GREETING: ${GREETING:-hello}
+    command:
+      - "sh"
+      - "-c"
+      - "echo $$GREETING"

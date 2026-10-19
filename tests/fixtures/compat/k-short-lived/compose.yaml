@@ -1,0 +1,10 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  brief:
+    image: alpine:3.20
+    command:
+      - "sh"
+      - "-c"
+      - "exit 3"
+    restart: "no"

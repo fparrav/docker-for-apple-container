@@ -1,0 +1,13 @@
+# tiers: live, conformance
+# images: nginx:1.27-alpine, alpine:3.20
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8081:80"
+  flaky:
+    image: alpine:3.20
+    command:
+      - "sh"
+      - "-c"
+      - "exit 1"

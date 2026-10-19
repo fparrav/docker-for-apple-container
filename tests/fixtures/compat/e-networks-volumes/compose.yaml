@@ -1,0 +1,27 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    networks:
+      - front
+      - back
+    volumes:
+      - data:/data
+      - ./conf:/etc/conf:ro
+  edge:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    networks:
+      - front
+  store:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    networks:
+      - back
+networks:
+  front: {}
+  back: {}
+volumes:
+  data: {}

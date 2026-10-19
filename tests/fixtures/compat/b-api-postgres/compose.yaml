@@ -1,0 +1,19 @@
+# tiers: live, conformance
+# images: alpine:3.20, postgres:17
+# Apple volumes are ext4 mounts with lost+found, so PGDATA must be a subdirectory.
+services:
+  api:
+    image: alpine:3.20
+    command:
+      - "sh"
+      - "-c"
+      - "while true; do printf 'HTTP/1.1 200 OK\\r\\n\\r\\nok' | nc -l -p 8000; done"
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: shim
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata: {}

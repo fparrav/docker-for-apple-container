@@ -1,0 +1,11 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  hardened:
+    image: alpine:3.20
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    read_only: true
+    mem_limit: 64m
+    command: ["sleep", "infinity"]

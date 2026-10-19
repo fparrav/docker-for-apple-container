@@ -1,0 +1,7 @@
+# tiers: live, conformance
+# images: nginx:1.27-alpine
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"

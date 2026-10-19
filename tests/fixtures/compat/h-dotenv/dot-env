@@ -1,0 +1,3 @@
+# tiers: live, conformance
+# images: alpine:3.20
+GREETING=hi

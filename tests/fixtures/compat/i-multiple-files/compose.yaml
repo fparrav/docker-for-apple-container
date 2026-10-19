@@ -1,0 +1,6 @@
+# tiers: live, conformance
+# images: alpine:3.20
+services:
+  web:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
