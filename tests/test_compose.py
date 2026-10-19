@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -128,7 +129,7 @@ if a[:1] == ["run"]:
         "id": name, "name": name, "image": image or "",
         "labels": labels, "networks": networks, "dns": dns,
         "dns_search": dns_search, "dns_opt": dns_opt,
-        "entrypoint": entry, "cmd": cmd,
+        "entrypoint": entry, "cmd": cmd, "run_argv": a,
         "configuration": {"id": name, "labels": labels,
                           "image": {"reference": image or ""}},
         "status": {"state": "running", "networks": status_networks},
@@ -498,6 +499,16 @@ class ComposeE2ETests(unittest.TestCase):
         )
         # Keep project name deterministic regardless of the temp dir name.
         self.env["COMPOSE_PROJECT_NAME"] = "demo"
+        # These tests exercise the built-in parser, so hide any installed
+        # `docker-compose` from PATH and drop inherited compose variables.
+        for variable in ("COMPOSE_FILE", "COMPOSE_PROFILES", "COMPOSE_PATH_SEPARATOR"):
+            self.env.pop(variable, None)
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = ""
+        self.env["PATH"] = os.pathsep.join(
+            entry
+            for entry in self.env.get("PATH", "").split(os.pathsep)
+            if not os.path.exists(os.path.join(entry, "docker-compose"))
+        )
 
     def write_compose(self, body: str) -> None:
         (self.project / "docker-compose.yml").write_text(textwrap.dedent(body))
@@ -2457,6 +2468,505 @@ class ComposeE2ETests(unittest.TestCase):
         state = self.load_state()
         self.assertEqual(state["containers"]["demo-db-1"]["status"]["state"], "running")
 
+    # -- Global flags: repeatable -f, --profile, COMPOSE_FILE/PROFILES ------ #
+
+    def _write_named_compose(self, name: str, image: str = "nginx:latest") -> None:
+        (self.project / name).write_text(
+            f"services:\n  web:\n    image: {image}\n"
+        )
+
+    def test_file_flag_in_both_spellings_selects_the_file(self) -> None:
+        self._write_named_compose("custom.yml", "custom:1")
+        for flags in (["-f", "custom.yml"], ["--file=custom.yml"]):
+            result = self.docker("compose", *flags, "config")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("custom:1", result.stdout)
+
+    def test_several_file_flags_exit_64_without_merging(self) -> None:
+        self._write_named_compose("one.yml")
+        self._write_named_compose("two.yml")
+        result = self.docker("compose", "-f", "one.yml", "-f", "two.yml", "config")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-f", result.stderr)
+
+    def test_profile_flag_exits_64_in_both_spellings(self) -> None:
+        self._write_named_compose("one.yml")
+        for flags in (["--profile", "debug"], ["--profile=debug"]):
+            result = self.docker("compose", "-f", "one.yml", *flags, "config")
+            self.assertEqual(result.returncode, 64, result.stderr)
+            self.assertIn("--profile", result.stderr)
+
+    def test_compose_profiles_environment_reaches_the_loader(self) -> None:
+        self._write_named_compose("one.yml")
+        self.env["COMPOSE_PROFILES"] = "debug"
+        result = self.docker("compose", "-f", "one.yml", "config")
+        self.assertEqual(result.returncode, 64, result.stderr)
+
+    def test_compose_file_environment_selects_the_file(self) -> None:
+        self._write_named_compose("custom.yml", "fromenv:1")
+        self.env["COMPOSE_FILE"] = "custom.yml"
+        result = self.docker("compose", "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fromenv:1", result.stdout)
+
+    def test_compose_file_environment_with_two_files_exits_64(self) -> None:
+        self._write_named_compose("one.yml")
+        self._write_named_compose("two.yml")
+        self.env["COMPOSE_FILE"] = os.pathsep.join(["one.yml", "two.yml"])
+        result = self.docker("compose", "config")
+        self.assertEqual(result.returncode, 64, result.stderr)
+
+    def test_file_flag_wins_over_compose_file_environment(self) -> None:
+        self._write_named_compose("flag.yml", "fromflag:1")
+        self._write_named_compose("env.yml", "fromenv:1")
+        self.env["COMPOSE_FILE"] = "env.yml"
+        result = self.docker("compose", "-f", "flag.yml", "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fromflag:1", result.stdout)
+        self.assertNotIn("fromenv:1", result.stdout)
+
+    # -- Official normalizer source (fake `docker-compose`) ---------------- #
+
+    FAKE_COMPOSE = textwrap.dedent(
+        """\
+        #!/usr/bin/env python3
+        import json, os, sys
+        with open(os.environ["FAKE_COMPOSE_LOG"], "a") as handle:
+            handle.write(json.dumps({
+                "argv": sys.argv[1:],
+                "marker": os.environ.get("CONTAINER_DOCKER_SHIM_NORMALIZING"),
+            }) + "\\n")
+        if sys.argv[1:] == ["version", "--short"]:
+            print("5.6.0")
+            sys.exit(0)
+        sys.stderr.write(os.environ.get("FAKE_COMPOSE_STDERR", ""))
+        if os.environ.get("FAKE_COMPOSE_FAIL"):
+            sys.exit(int(os.environ["FAKE_COMPOSE_FAIL"]))
+        print(open(os.environ["FAKE_COMPOSE_MODEL"]).read())
+        """
+    )
+
+    def install_fake_normalizer(self, model: dict, *, explicit: bool = True) -> Path:
+        """Install a fake `docker-compose` printing `model`; returns its argv log.
+
+        With ``explicit`` the executable is named by CONTAINER_DOCKER_SHIM_COMPOSE,
+        otherwise it is found on PATH.
+        """
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        executable = bin_dir / "docker-compose"
+        executable.write_text(self.FAKE_COMPOSE)
+        executable.chmod(0o755)
+        model_file = self.root / "model.json"
+        model_file.write_text(json.dumps(model))
+        log = self.root / "compose-argv.log"
+        self.env["FAKE_COMPOSE_MODEL"] = str(model_file)
+        self.env["FAKE_COMPOSE_LOG"] = str(log)
+        if explicit:
+            self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = str(executable)
+        else:
+            self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
+        return log
+
+    def normalizer_calls(self, log: Path) -> list[dict]:
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def web_model(self, **service: object) -> dict:
+        spec: dict = {"image": "nginx:latest"}
+        spec.update(service)
+        return {"name": "demo", "services": {"web": spec}}
+
+    def test_official_normalizer_supplies_the_model(self) -> None:
+        self.write_compose("services:\n  ignored:\n    image: busybox\n")
+        log = self.install_fake_normalizer(
+            self.web_model(
+                ports=[{"mode": "ingress", "target": 80, "published": "8080", "protocol": "tcp"}],
+                environment={"A": "1"},
+                command=None,
+            )
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        containers = self.load_state()["containers"]
+        self.assertEqual(list(containers), ["demo-web-1"])  # the YAML file was not read
+        argv = containers["demo-web-1"]["run_argv"]
+        self.assertIn("0.0.0.0:8080:80", argv)
+        self.assertIn("A=1", argv)
+        calls = self.normalizer_calls(log)
+        self.assertEqual(calls[0]["argv"], ["config", "--format", "json"])
+        self.assertEqual(calls[0]["marker"], "1")
+
+    def test_official_normalizer_is_found_on_path(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        log = self.install_fake_normalizer(self.web_model(), explicit=False)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.normalizer_calls(log)[0]["argv"], ["config", "--format", "json"])
+
+    def test_official_normalizer_receives_the_forwarded_flags(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        log = self.install_fake_normalizer(self.web_model())
+        result = self.docker(
+            "compose",
+            "--env-file", "e.env",
+            "-p", "custom",
+            "--project-directory", str(self.project),
+            "-f", "docker-compose.yml",
+            "--profile", "debug",
+            "up", "-d",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.normalizer_calls(log)[0]["argv"],
+            [
+                "-f", os.path.join(os.path.realpath(self.project), "docker-compose.yml"),
+                "--env-file", "e.env",
+                "--profile", "debug",
+                "-p", "custom",
+                "--project-directory", str(self.project),
+                "config", "--format", "json",
+            ],
+        )
+
+    def test_official_normalizer_accepts_several_files_and_profiles(self) -> None:
+        self._write_named_compose("one.yml")
+        self._write_named_compose("two.yml")
+        log = self.install_fake_normalizer(self.web_model())
+        result = self.docker(
+            "compose", "-f", "one.yml", "-f", "two.yml", "--profile", "a", "--profile", "b", "up", "-d"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.normalizer_calls(log)[0]["argv"],
+            [
+                "-f", os.path.join(os.path.realpath(self.project), "one.yml"),
+                "-f", os.path.join(os.path.realpath(self.project), "two.yml"),
+                "--profile", "a", "--profile", "b",
+                "config", "--format", "json",
+            ],
+        )
+
+    def test_official_normalizer_failure_is_reported(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.install_fake_normalizer(self.web_model())
+        self.env["FAKE_COMPOSE_FAIL"] = "1"
+        self.env["FAKE_COMPOSE_STDERR"] = "validating x.yml: services.web.nope is invalid\n"
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("services.web.nope is invalid", result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_official_normalizer_warnings_pass_through(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.install_fake_normalizer(self.web_model())
+        self.env["FAKE_COMPOSE_STDERR"] = 'level=warning msg="The NOPE variable is not set"\n'
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("The NOPE variable is not set", result.stderr)
+
+    def test_explicit_normalizer_that_does_not_exist_fails(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = str(self.root / "missing-compose")
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CONTAINER_DOCKER_SHIM_COMPOSE", result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_normalizer_that_resolves_to_the_shim_is_refused_as_a_loop(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = str(DOCKER)
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("loop", result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_malformed_normalized_model_names_the_compose_version(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.install_fake_normalizer({"services": {"web": {"image": "nginx:latest"}}})
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docker Compose 5.6.0", result.stderr)
+
+    def test_explicit_file_is_relative_to_the_working_directory(self) -> None:
+        # Compose resolves -f against the cwd; --project-directory only moves
+        # the project root, so the file below must not be looked up inside it.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "docker-compose.yml").write_text("services:\n  web:\n    image: other:1\n")
+        self._write_named_compose("custom.yml", "cwdfile:1")
+        (elsewhere / "custom.yml").write_text("services:\n  web:\n    image: wrong:1\n")
+        result = self.docker(
+            "compose", "--project-directory", str(elsewhere), "-f", "custom.yml", "config"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cwdfile:1", result.stdout)
+
+    def test_official_model_name_is_sanitized(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        model = self.web_model()
+        model["name"] = "My App!"
+        self.install_fake_normalizer(model)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.load_state()["containers"]), ["my_app_-web-1"])
+
+    # -- config / config -q / version through each source ------------------ #
+
+    def test_official_config_prints_the_normalized_json(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        model = self.web_model(
+            ports=[{"mode": "ingress", "target": 80, "published": "8080", "protocol": "tcp"}],
+            command=None,
+        )
+        self.install_fake_normalizer(model)
+        result = self.docker("compose", "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), model)
+
+    def test_official_config_quiet_validates_without_output(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.install_fake_normalizer(self.web_model())
+        for flag in ("-q", "--quiet"):
+            result = self.docker("compose", "config", flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+    def test_official_config_failure_is_reported_and_prints_nothing(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        self.install_fake_normalizer(self.web_model())
+        self.env["FAKE_COMPOSE_FAIL"] = "1"
+        self.env["FAKE_COMPOSE_STDERR"] = "services.web.nope is invalid\n"
+        for args in (["config"], ["config", "-q"]):
+            result = self.docker("compose", *args)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("services.web.nope is invalid", result.stderr)
+
+    def test_builtin_config_prints_the_model_and_quiet_is_silent(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        result = self.docker("compose", "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = json.loads(result.stdout)
+        self.assertEqual(rendered["name"], "demo")
+        self.assertEqual(rendered["services"]["web"]["image"], "nginx:latest")
+        quiet = self.docker("compose", "config", "-q")
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(quiet.stdout, "")
+
+    def test_builtin_config_quiet_still_validates(self) -> None:
+        self.write_compose(
+            "services:\n  a:\n    image: x\n    depends_on: [b]\n"
+            "  b:\n    image: y\n    depends_on: [a]\n"
+        )
+        result = self.docker("compose", "config", "-q")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_version_reports_the_builtin_subset(self) -> None:
+        result = self.docker("compose", "version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "normalizer: built-in subset\n")
+
+    def test_version_reports_the_official_release(self) -> None:
+        self.install_fake_normalizer(self.web_model())
+        result = self.docker("compose", "version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "normalizer: official 5.6.0\n")
+
+    def test_version_with_a_missing_explicit_normalizer_fails(self) -> None:
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = str(self.root / "missing-compose")
+        result = self.docker("compose", "version")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CONTAINER_DOCKER_SHIM_COMPOSE", result.stderr)
+
+    # -- Built-in source refuses what it cannot read (exit 64) ------------- #
+
+    REFUSED_CONSTRUCTS = {
+        "anchor": "x-base: &base\n  restart: always\nservices:\n  web:\n    image: nginx\n",
+        "alias": "services:\n  web:\n    image: nginx\n    command: *cmd\n",
+        "merge key": "services:\n  web:\n    <<: {image: nginx}\n",
+        "block scalar": "services:\n  web:\n    image: nginx\n    command: |\n      echo hi\n",
+        "multi-document stream": "services:\n  web:\n    image: nginx\n---\nservices: {}\n",
+        "include": "include:\n  - other.yml\nservices:\n  web:\n    image: nginx\n",
+        "extends": "services:\n  web:\n    image: nginx\n    extends:\n      service: base\n",
+        "profiles": "services:\n  web:\n    image: nginx\n    profiles: [debug]\n",
+    }
+
+    def test_builtin_source_refuses_each_unsupported_construct(self) -> None:
+        for construct, body in self.REFUSED_CONSTRUCTS.items():
+            with self.subTest(construct=construct):
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn(construct, result.stderr)
+                self.assertIn("brew install docker-compose", result.stderr)
+                self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_builtin_source_error_names_file_and_line(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n    command: *cmd\n")
+        result = self.docker("compose", "config")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("docker-compose.yml", result.stderr)
+        self.assertIn("line 4", result.stderr)
+
+    def test_builtin_source_refuses_several_files_with_the_install_hint(self) -> None:
+        self._write_named_compose("one.yml")
+        self._write_named_compose("two.yml")
+        result = self.docker("compose", "-f", "one.yml", "-f", "two.yml", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("brew install docker-compose", result.stderr)
+
+    def test_builtin_source_refuses_profiles_with_the_install_hint(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        for flags, env in ((["--profile", "debug"], {}), ([], {"COMPOSE_PROFILES": "debug"})):
+            with self.subTest(flags=flags, env=env):
+                self.env.pop("COMPOSE_PROFILES", None)
+                self.env.update(env)
+                result = self.docker("compose", *flags, "up", "-d")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("brew install docker-compose", result.stderr)
+                self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_builtin_source_refuses_an_automatic_override_file(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        (self.project / "docker-compose.override.yml").write_text(
+            "services:\n  web:\n    image: other\n"
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("docker-compose.override.yml", result.stderr)
+        self.assertIn("brew install docker-compose", result.stderr)
+        # An explicit -f opts out of the automatic merge, so it still works.
+        explicit = self.docker("compose", "-f", "docker-compose.yml", "up", "-d")
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+
+    def test_builtin_source_still_reads_the_supported_subset(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                command: ["sh", "-c", "a && b | c"]
+                environment:
+                  URL: http://x?a=1&b=2
+                  NAME: ${NAME:-fallback}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("demo-web-1", self.load_state()["containers"])
+
+    # -- Both sources drive the runtime identically ------------------------ #
+
+    EQUIVALENCE_YAML = """
+        services:
+          db:
+            image: postgres:16
+            environment:
+              POSTGRES_PASSWORD: secret
+            volumes:
+              - data:/var/lib/postgresql/data
+          web:
+            image: nginx:latest
+            ports:
+              - "8080:80"
+              - "127.0.0.1:9090:90/udp"
+            environment:
+              MODE: prod
+            depends_on:
+              - db
+        volumes:
+          data: {}
+    """
+
+    def equivalence_model(self) -> dict:
+        """What `docker-compose config --format json` prints for EQUIVALENCE_YAML."""
+        return {
+            "name": "demo",
+            "networks": {"default": {"name": "demo_default", "ipam": {}}},
+            "services": {
+                "db": {
+                    "command": None,
+                    "entrypoint": None,
+                    "environment": {"POSTGRES_PASSWORD": "secret"},
+                    "image": "postgres:16",
+                    "networks": {"default": None},
+                    "volumes": [
+                        {
+                            "type": "volume",
+                            "source": "data",
+                            "target": "/var/lib/postgresql/data",
+                            "volume": {},
+                        }
+                    ],
+                },
+                "web": {
+                    "command": None,
+                    "depends_on": {"db": {"condition": "service_started", "required": True}},
+                    "entrypoint": None,
+                    "environment": {"MODE": "prod"},
+                    "image": "nginx:latest",
+                    "networks": {"default": None},
+                    "ports": [
+                        {"mode": "ingress", "target": 80, "published": "8080", "protocol": "tcp"},
+                        {
+                            "mode": "ingress",
+                            "host_ip": "127.0.0.1",
+                            "target": 90,
+                            "published": "9090",
+                            "protocol": "udp",
+                        },
+                    ],
+                },
+            },
+            "volumes": {"data": {"name": "demo_data"}},
+        }
+
+    def runtime_trace(self) -> tuple[list, dict]:
+        """`up -d`, then the runtime commands and `run` argv it produced.
+
+        The config-hash label is masked: it fingerprints the model dictionary,
+        which legitimately differs in shape between the two sources.
+        """
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        runs = {}
+        for name, container in state["containers"].items():
+            argv = []
+            for item in container["run_argv"]:
+                if item.startswith("com.docker.compose.config-hash="):
+                    item = "com.docker.compose.config-hash=<hash>"
+                argv.append(item)
+            runs[name] = argv
+        return state["action_log"], runs
+
+    def test_builtin_and_official_sources_produce_the_same_runtime_commands(self) -> None:
+        self.write_compose(self.EQUIVALENCE_YAML)
+        builtin = self.runtime_trace()
+        self.state.unlink()
+        self.install_fake_normalizer(self.equivalence_model())
+        official = self.runtime_trace()
+        self.assertEqual(official[0], builtin[0])
+        self.assertEqual(official[1], builtin[1])
+        self.assertIn("0.0.0.0:8080:80", builtin[1]["demo-web-1"])
+        self.assertIn("127.0.0.1:9090:90/udp", builtin[1]["demo-web-1"])
+
+    def test_real_official_binary_matches_the_builtin_source(self) -> None:
+        real = shutil.which("docker-compose")
+        if real is None or subprocess.run(
+            [real, "version", "--short"], capture_output=True, text=True
+        ).stdout.strip() != "5.6.0":
+            self.skipTest("docker-compose 5.6.0 is not on PATH")
+        self.write_compose(self.EQUIVALENCE_YAML)
+        builtin = self.runtime_trace()
+        self.state.unlink()
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = real
+        self.env["DOCKER_HOST"] = "unix:///nonexistent.sock"
+        official = self.runtime_trace()
+        self.assertEqual(official[0], builtin[0])
+        self.assertEqual(official[1], builtin[1])
+
 
 class DependsConditionTests(unittest.TestCase):
     def project(self, body: str) -> compose.Project:
@@ -2562,6 +3072,52 @@ class DependsConditionTests(unittest.TestCase):
         self.assertIn("web", message)
         self.assertIn("db", message)
         self.assertIn("bogus", message)
+
+
+class ComposeEnvironmentFlagTests(unittest.TestCase):
+    def apply(self, files, profiles, environ):
+        return compose._apply_compose_environment(files, profiles, environ)
+
+    def test_nothing_set_keeps_flags_untouched(self) -> None:
+        self.assertEqual(self.apply(["a.yml"], ["p"], {}), (["a.yml"], ["p"]))
+
+    def test_compose_file_is_split_on_the_path_separator(self) -> None:
+        env = {"COMPOSE_FILE": os.pathsep.join(["a.yml", "b.yml", ""])}
+        self.assertEqual(self.apply([], [], env), (["a.yml", "b.yml"], []))
+
+    def test_compose_path_separator_overrides_the_default(self) -> None:
+        env = {"COMPOSE_FILE": "a.yml,b.yml", "COMPOSE_PATH_SEPARATOR": ","}
+        self.assertEqual(self.apply([], [], env), (["a.yml", "b.yml"], []))
+
+    def test_explicit_files_win_over_compose_file(self) -> None:
+        env = {"COMPOSE_FILE": "env.yml"}
+        self.assertEqual(self.apply(["flag.yml"], [], env), (["flag.yml"], []))
+
+    def test_compose_profiles_are_appended_after_flags(self) -> None:
+        env = {"COMPOSE_PROFILES": "b, c,,"}
+        self.assertEqual(self.apply([], ["a"], env), ([], ["a", "b", "c"]))
+
+
+class RunNormalizerTests(unittest.TestCase):
+    def test_timeout_becomes_an_oserror_for_load_normalized(self) -> None:
+        original = compose.NORMALIZER_TIMEOUT_SECONDS
+        compose.NORMALIZER_TIMEOUT_SECONDS = 0.2
+        self.addCleanup(setattr, compose, "NORMALIZER_TIMEOUT_SECONDS", original)
+        with self.assertRaises(OSError) as raised:
+            compose._run_normalizer([sys.executable, "-c", "import time; time.sleep(5)"], dict(os.environ))
+        self.assertIn("did not finish", str(raised.exception))
+
+    def test_timeout_is_reported_as_a_shim_error(self) -> None:
+        original = compose.NORMALIZER_TIMEOUT_SECONDS
+        compose.NORMALIZER_TIMEOUT_SECONDS = 0.2
+        self.addCleanup(setattr, compose, "NORMALIZER_TIMEOUT_SECONDS", original)
+        with tempfile.TemporaryDirectory() as tmp:
+            slow = Path(tmp) / "docker-compose"
+            slow.write_text("#!/bin/sh\nsleep 5\n")
+            slow.chmod(0o755)
+            with self.assertRaises(compose.ShimError) as raised:
+                compose._load_normalized_model(str(slow), compose.compose_normalizer.Inputs())
+        self.assertIn("did not finish", str(raised.exception))
 
 
 class WaitTimeoutFlagTests(unittest.TestCase):

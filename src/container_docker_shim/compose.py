@@ -54,6 +54,8 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -78,7 +80,9 @@ from .cli import (
 )
 from . import security
 from . import compose_health
+from . import compose_normalizer
 from . import compose_reconcile
+from . import compose_subset
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +512,8 @@ class Project:
             self.services[str(svc_name)] = Service(str(svc_name), spec)
         self.networks = doc.get("networks") or {}
         self.volumes = doc.get("volumes") or {}
+        # The official normalizer's JSON as received; None for the built-in parser.
+        self.normalized: dict[str, Any] | None = None
 
     def topo_sorted(self) -> list[Service]:
         """Services in dependency order (dependencies first), cycle-detected."""
@@ -542,7 +548,9 @@ class Project:
 
 def _find_compose_file(explicit: str | None, directory: str) -> str:
     if explicit:
-        path = explicit if os.path.isabs(explicit) else os.path.join(directory, explicit)
+        # Like Compose, an explicit -f path is relative to the working directory;
+        # only the default file is searched for in the project directory.
+        path = os.path.abspath(explicit)
         if not os.path.isfile(path):
             raise ShimError(f"compose: file not found: {explicit}", 1)
         return path
@@ -557,19 +565,165 @@ def _find_compose_file(explicit: str | None, directory: str) -> str:
     )
 
 
+def _find_compose_files(files: list[str], directory: str) -> list[str]:
+    """Resolve every explicit ``-f`` file, or discover the default one."""
+    if files:
+        return [_find_compose_file(item, directory) for item in files]
+    return [_find_compose_file(None, directory)]
+
+
+def _launcher_paths() -> list[str]:
+    """Paths that identify this shim, so a normalizer cannot resolve back to it."""
+    source_launcher = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "bin",
+        "docker",
+    )
+    return [path for path in (sys.argv[0], source_launcher) if path]
+
+
+def _resolve_normalizer() -> str | None:
+    """The official `docker-compose` to normalize with, or None for the built-in parser."""
+    try:
+        return compose_normalizer.resolve_executable(
+            os.environ, shutil.which, _launcher_paths()
+        )
+    except compose_normalizer.NormalizerError as exc:
+        raise ShimError(f"compose: {exc}", exc.code)
+
+
+NORMALIZER_TIMEOUT_SECONDS = 120
+
+
+def _run_normalizer(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=NORMALIZER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # load_normalized reports an OSError as a NormalizerError.
+        raise OSError(
+            f"{os.path.basename(argv[0])} did not finish within "
+            f"{NORMALIZER_TIMEOUT_SECONDS} seconds"
+        )
+
+
+def _normalizer_inputs(
+    files: list[str],
+    profiles: list[str],
+    compose_paths: list[str],
+    project_name: str | None,
+    project_dir: str | None,
+    env_file: str | None,
+) -> compose_normalizer.Inputs:
+    """Flags for the official binary; defaults are left to it so overrides still merge."""
+    return compose_normalizer.Inputs(
+        files=tuple(compose_paths) if files else (),
+        env_files=(env_file,) if env_file else (),
+        profiles=tuple(profiles),
+        project_name=project_name,
+        project_dir=project_dir,
+    )
+
+
+def _load_normalized_model(
+    executable: str, inputs: compose_normalizer.Inputs
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run `docker-compose config`; return the orchestrator model and the raw JSON."""
+    try:
+        raw, warnings = compose_normalizer.load_normalized(
+            executable, inputs, _run_normalizer, os.environ
+        )
+        if warnings.strip():
+            sys.stderr.write(warnings if warnings.endswith("\n") else warnings + "\n")
+        version = compose_normalizer.executable_version(
+            executable, _run_normalizer, os.environ
+        )
+        return compose_normalizer.convert_model(raw, version), raw
+    except compose_normalizer.NormalizerError as exc:
+        raise ShimError(f"compose: {exc}", exc.code)
+
+
+_INSTALL_HINT = "install the official docker-compose (brew install docker-compose)"
+_OVERRIDE_FILENAMES = (
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+)
+
+
+def _require_builtin_subset_inputs(
+    files: list[str], profiles: list[str], compose_paths: list[str]
+) -> None:
+    """Refuse inputs only the official normalizer can honour (exit 64).
+
+    Several files, profiles and an automatically merged override file all
+    change the model, and the built-in parser would silently ignore them.
+    """
+    if len(compose_paths) > 1:
+        raise ShimError(
+            "compose: merging several -f files is not supported by the built-in "
+            f"parser; {_INSTALL_HINT}",
+            64,
+        )
+    if profiles:
+        raise ShimError(
+            "compose: --profile and COMPOSE_PROFILES are not supported by the "
+            f"built-in parser; {_INSTALL_HINT}",
+            64,
+        )
+    if not files:
+        directory = os.path.dirname(compose_paths[0])
+        for name in _OVERRIDE_FILENAMES:
+            if os.path.isfile(os.path.join(directory, name)):
+                raise ShimError(
+                    f"compose: {name} would be merged by Docker Compose, but the "
+                    f"built-in parser ignores it; {_INSTALL_HINT}",
+                    64,
+                )
+
+
 def _load_project(
     *,
-    file: str | None,
+    files: list[str],
+    profiles: list[str],
     project_name: str | None,
     project_dir: str | None,
     env_file: str | None,
 ) -> Project:
     directory = os.path.abspath(project_dir or os.getcwd())
-    compose_path = _find_compose_file(file, directory)
-    project_dir_resolved = os.path.abspath(project_dir or os.path.dirname(compose_path))
+    compose_paths = _find_compose_files(files, directory)
+    project_dir_resolved = os.path.abspath(project_dir or os.path.dirname(compose_paths[0]))
+
+    executable = _resolve_normalizer()
+    if executable is not None:
+        model, raw = _load_normalized_model(
+            executable,
+            _normalizer_inputs(
+                files, profiles, compose_paths, project_name, project_dir, env_file
+            ),
+        )
+        name = _sanitize_project_name(model["name"])
+        project = Project(name, model, project_dir_resolved)
+        project.normalized = raw
+        return project
+
+    _require_builtin_subset_inputs(files, profiles, compose_paths)
+    compose_path = compose_paths[0]
 
     with open(compose_path, encoding="utf-8") as handle:
-        raw_doc = parse_yaml(handle.read())
+        text = handle.read()
+    try:
+        compose_subset.check_subset(text)
+    except compose_subset.SubsetError as exc:
+        raise ShimError(f"compose: {compose_path}: {exc}", 64)
+    raw_doc = parse_yaml(text)
     if not isinstance(raw_doc, dict):
         raise ShimError("compose: top-level document must be a mapping", 64)
 
@@ -2061,10 +2215,15 @@ def cmd_ls() -> int:
     return 0
 
 
-def cmd_config(project: Project) -> int:
+def cmd_config(project: Project, *, quiet: bool = False) -> int:
     import json
 
-    services = {svc.name: svc.spec for svc in project.topo_sorted()}
+    services = {svc.name: svc.spec for svc in project.topo_sorted()}  # rejects cycles
+    if quiet:
+        return 0
+    if project.normalized is not None:
+        print(json.dumps(project.normalized, indent=2))
+        return 0
     rendered = {
         "name": project.name,
         "services": services,
@@ -2072,6 +2231,19 @@ def cmd_config(project: Project) -> int:
         "volumes": project.volumes,
     }
     print(json.dumps(rendered, indent=2, default=_as_str))
+    return 0
+
+
+def cmd_version() -> int:
+    """Report which normalizer is active (the Compose release when official)."""
+    executable = _resolve_normalizer()
+    if executable is None:
+        print("normalizer: built-in subset")
+    else:
+        version = compose_normalizer.executable_version(
+            executable, _run_normalizer, os.environ
+        )
+        print(f"normalizer: official {version}")
     return 0
 
 
@@ -2469,13 +2641,31 @@ def _warn(message: str) -> None:
 
 _USAGE = (
     "docker compose [-f FILE] [-p NAME] "
-    "<up|down|ps|logs|build|pull|exec|start|stop|restart|rm|config|ls> [options]"
+    "<up|down|ps|logs|build|pull|exec|start|stop|restart|rm|config|ls|version> [options]"
 )
+
+
+def _apply_compose_environment(
+    files: list[str], profiles: list[str], environ: Any
+) -> tuple[list[str], list[str]]:
+    """Fold ``COMPOSE_FILE`` and ``COMPOSE_PROFILES`` into the parsed flags.
+
+    ``COMPOSE_FILE`` only applies when no ``-f`` was given and is split on
+    ``COMPOSE_PATH_SEPARATOR`` (default ``os.pathsep``); ``COMPOSE_PROFILES``
+    is comma-separated and adds to the ``--profile`` values.
+    """
+    if not files:
+        raw = environ.get("COMPOSE_FILE", "")
+        separator = environ.get("COMPOSE_PATH_SEPARATOR") or os.pathsep
+        files = [item for item in raw.split(separator) if item]
+    extra = [item.strip() for item in environ.get("COMPOSE_PROFILES", "").split(",")]
+    return list(files), list(profiles) + [item for item in extra if item]
 
 
 def main(argv: list[str]) -> int:
     """Parse `docker compose` global flags, then dispatch the subcommand."""
-    file: str | None = None
+    files: list[str] = []
+    profiles: list[str] = []
     project_name: str | None = None
     project_dir: str | None = None
     env_file: str | None = None
@@ -2484,7 +2674,12 @@ def main(argv: list[str]) -> int:
     while i < len(argv):
         arg = argv[i]
         if arg in ("-f", "--file"):
-            file, i = _take(argv, i, arg)
+            value, i = _take(argv, i, arg)
+            files.append(value)
+            continue
+        if arg == "--profile":
+            value, i = _take(argv, i, arg)
+            profiles.append(value)
             continue
         if arg in ("-p", "--project-name"):
             project_name, i = _take(argv, i, arg)
@@ -2496,7 +2691,11 @@ def main(argv: list[str]) -> int:
             env_file, i = _take(argv, i, arg)
             continue
         if arg.startswith("--file="):
-            file = arg.split("=", 1)[1]
+            files.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg.startswith("--profile="):
+            profiles.append(arg.split("=", 1)[1])
             i += 1
             continue
         if arg.startswith("--project-name="):
@@ -2513,12 +2712,14 @@ def main(argv: list[str]) -> int:
         print(_USAGE)
         return 0
     sub, sub_args = rest[0], rest[1:]
+    files, profiles = _apply_compose_environment(files, profiles, os.environ)
 
     try:
         return _dispatch(
             sub,
             sub_args,
-            file=file,
+            files=files,
+            profiles=profiles,
             project_name=project_name,
             project_dir=project_dir,
             env_file=env_file,
@@ -2531,22 +2732,27 @@ def _dispatch(
     sub: str,
     sub_args: list[str],
     *,
-    file: str | None,
+    files: list[str],
+    profiles: list[str],
     project_name: str | None,
     project_dir: str | None,
     env_file: str | None,
 ) -> int:
     def project() -> Project:
         return _load_project(
-            file=file, project_name=project_name, project_dir=project_dir, env_file=env_file
+            files=files,
+            profiles=profiles,
+            project_name=project_name,
+            project_dir=project_dir,
+            env_file=env_file,
         )
 
     def optional_project() -> Project | None:
         directory = os.path.abspath(project_dir or os.getcwd())
         try:
-            _find_compose_file(file, directory)
+            _find_compose_files(files, directory)
         except ShimError:
-            if file is not None:
+            if files:
                 raise
             return None
         return project()
@@ -2659,7 +2865,10 @@ def _dispatch(
             ),
         )
     if sub == "config":
-        return cmd_config(project())
+        opts = _parse_flags(sub_args, bools={"-q", "--quiet"})
+        return cmd_config(project(), quiet=opts.flag("-q") or opts.flag("--quiet"))
+    if sub == "version":
+        return cmd_version()
     if sub == "ls":
         return cmd_ls()
     return _die(f"compose: unsupported subcommand: {sub}", 64)
