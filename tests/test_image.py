@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import platform
+import subprocess
+import sys
 
 import test_cli
+
+TIER = "fake"
 
 
 class ImagePresentationTests(test_cli.ShimCLITestCase):
@@ -24,6 +29,27 @@ class ImagePresentationTests(test_cli.ShimCLITestCase):
                     self.assertEqual(result.stdout, "")
                     self.assertIn("expected", result.stderr)
 
+    def _default_image_payload(self, image: str) -> list[dict]:
+        result = subprocess.run(
+            [sys.executable, str(self.fake), "image", "inspect", image],
+            text=True,
+            capture_output=True,
+            env=self.env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def _rewrite_variant_architecture(
+        self, payload: list[dict], architecture: str
+    ) -> list[dict]:
+        for item in payload:
+            for variant in item.get("variants") or []:
+                for section in (variant.get("platform"), variant.get("config")):
+                    if isinstance(section, dict):
+                        section["architecture"] = architecture
+        return payload
+
     def test_image_inspect_default_is_docker_shaped(self) -> None:
         result = self.docker("image", "inspect", "example/app:1.0")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -42,6 +68,44 @@ class ImagePresentationTests(test_cli.ShimCLITestCase):
         self.assertEqual(obj["Config"]["Cmd"], ["serve"])
         self.assertEqual(obj["Config"]["WorkingDir"], "/app")
         self.assertEqual(obj["RootFS"]["Layers"], ["sha256:" + "f" * 64])
+
+    def test_image_inspect_reports_arm64_architecture(self) -> None:
+        self.docker("create", "--name", "fixture", "alpine", "true")
+        payload = self._rewrite_variant_architecture(
+            self._default_image_payload("example/app:1.0"), "arm64"
+        )
+        self.update_fake_state(image_payload=payload)
+
+        result = self.docker("image", "inspect", "example/app:1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [obj] = json.loads(result.stdout)
+        self.assertEqual(obj["Architecture"], "arm64")
+        self.assertEqual(obj["Os"], "linux")
+
+        formatted = self.docker(
+            "image", "inspect", "--format", "{{.Architecture}}", "example/app:1.0"
+        )
+        self.assertEqual(formatted.returncode, 0, formatted.stderr)
+        self.assertEqual(formatted.stdout, "arm64\n")
+
+    def test_image_inspect_reports_amd64_architecture(self) -> None:
+        self.docker("create", "--name", "fixture", "alpine", "true")
+        payload = self._rewrite_variant_architecture(
+            self._default_image_payload("example/app:1.0"), "amd64"
+        )
+        self.update_fake_state(image_payload=payload)
+
+        result = self.docker("image", "inspect", "example/app:1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [obj] = json.loads(result.stdout)
+        self.assertEqual(obj["Architecture"], "amd64")
+        self.assertEqual(obj["Os"], "linux")
+
+        formatted = self.docker(
+            "image", "inspect", "--format", "{{.Architecture}}", "example/app:1.0"
+        )
+        self.assertEqual(formatted.returncode, 0, formatted.stderr)
+        self.assertEqual(formatted.stdout, "amd64\n")
 
     def test_image_inspect_formats_multiple_images_in_order(self) -> None:
         result = self.docker(
@@ -97,6 +161,25 @@ class ImagePresentationTests(test_cli.ShimCLITestCase):
         )
         self.assertEqual(missing.returncode, 1)
         self.assertIn("no platform matching linux/s390x", missing.stderr)
+
+    def test_image_inspect_multi_variant_index_reports_matching_variant(self) -> None:
+        # Without --platform the shim selects the variant matching the host
+        # platform and falls back to the first variant when nothing matches.
+        machine = platform.machine().lower()
+        host_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+        entrypoints = {
+            "arm64": ["/arm64-entrypoint"],
+            "amd64": ["/amd64-entrypoint"],
+        }
+        expected_arch = host_arch if host_arch in entrypoints else "arm64"
+        expected_entrypoint = entrypoints.get(host_arch, entrypoints["arm64"])
+
+        result = self.docker("image", "inspect", "example/multi:latest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [obj] = json.loads(result.stdout)
+        self.assertEqual(obj["Architecture"], expected_arch)
+        self.assertEqual(obj["Os"], "linux")
+        self.assertEqual(obj["Config"]["Entrypoint"], expected_entrypoint)
 
     def test_image_inspect_json_format_prints_one_object_per_image(self) -> None:
         result = self.docker(
