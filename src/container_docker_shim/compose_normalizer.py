@@ -229,6 +229,28 @@ def _convert_port(port: Any) -> Any:
     return result
 
 
+def _unescape_dollars(value: Any) -> Any:
+    """Undo the ``$`` -> ``$$`` escaping ``docker-compose config`` applies.
+
+    The normalized output is meant to be fed back to Compose, so every
+    literal ``$`` comes out as ``$$``. The shim consumes the model directly
+    and never re-interpolates it, so the escape has to be removed here;
+    otherwise ``command: echo $$HOME`` would reach the container verbatim.
+    Strings, list items and mapping keys and values are converted
+    recursively; every other value is returned unchanged.
+    """
+    if isinstance(value, str):
+        return value.replace("$$", "$")
+    if isinstance(value, list):
+        return [_unescape_dollars(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _unescape_dollars(key): _unescape_dollars(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _convert_service(service: Mapping[str, Any]) -> dict:
     """Copy a service, dropping top-level ``None`` keys and rendering ports.
 
@@ -254,7 +276,8 @@ def convert_model(raw: Any, version: str) -> dict:
     ``raw`` (missing ``networks``/``volumes`` become ``{}``); inside every
     service, keys whose value is ``None`` are dropped (no recursion) and
     each ``ports`` object becomes a port string (see :func:`_convert_port`);
-    every other service value is copied unchanged, and top-level ``x-*``
+    the ``$$`` escape the normalizer adds is undone in every service string
+    (see :func:`_unescape_dollars`); every other service value is copied unchanged, and top-level ``x-*``
     keys and everything else are ignored.
 
     A ``raw`` that is not a mapping, has no ``name`` string, has
@@ -288,7 +311,7 @@ def convert_model(raw: Any, version: str) -> dict:
                 "Docker Compose %s: service %r must be a mapping, got %s"
                 % (version, service_name, type(service).__name__)
             )
-        converted[service_name] = _convert_service(service)
+        converted[service_name] = _unescape_dollars(_convert_service(service))
     return {
         "name": name,
         "services": converted,

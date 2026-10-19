@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose_normalizer  # noqa: E402
 
+TIER = "unit"
+
 
 class BuildArgvTests(unittest.TestCase):
     def test_no_inputs_keeps_just_executable_and_tail(self):
@@ -462,6 +464,24 @@ class ConvertModelTests(unittest.TestCase):
         self.assertEqual(model["volumes"], {"data": {"name": "full_data"}})
         self.assertNotIn("x-common", model)
         self.assertEqual(set(model["services"]), {"api", "db"})
+
+    def test_dollar_escape_of_the_normalizer_is_undone(self):
+        raw = {
+            "name": "p",
+            "services": {
+                "web": {
+                    "image": "alpine:3.20",
+                    "command": ["sh", "-c", "echo $$GREETING $$$$"],
+                    "environment": {"PRICE": "$$5"},
+                    "labels": {"a.b": "cost $$"},
+                }
+            },
+        }
+        web = compose_normalizer.convert_model(raw, self.VERSION)["services"]["web"]
+        self.assertEqual(web["command"], ["sh", "-c", "echo $GREETING $$"])
+        self.assertEqual(web["environment"], {"PRICE": "$5"})
+        self.assertEqual(web["labels"], {"a.b": "cost $"})
+        self.assertEqual(web["image"], "alpine:3.20")
 
     def test_api_ports_rendered_as_strings(self):
         api = self._convert("full-default.json")["services"]["api"]
