@@ -94,7 +94,11 @@ verified Apple equivalent exists, the shim refuses it explicitly.
 
 - `docker version`
 - `docker info --format "{{.Driver}}"`
-- `docker build -f DOCKERFILE -t TAG CONTEXT`
+- `docker build -f DOCKERFILE -t TAG CONTEXT`, including `--build-arg`,
+  `--target`, `--label`, `--platform`, `--no-cache`, `--pull` and `--secret`;
+  `--ssh` accepts only `default`. Options with no Apple equivalent such as
+  `--cache-from` or `--push` exit 64 naming the option. Dockerfiles and Compose
+  files are never modified or rewritten.
 - `docker image inspect [--platform OS/ARCH] [-f|--format TEMPLATE] IMAGE...`
 - `docker images` / `docker image ls` with Docker-shaped default, quiet,
   digest, no-truncation, JSON, and bounded template output
@@ -351,6 +355,28 @@ the socket, Portainer, Traefik's Docker provider, `docker-in-docker`, tools that
 mount the socket into a container, Docker Swarm and `docker context` remotes.
 `docker info` reports only what Apple `container` provides and never claims
 Engine features such as Swarm.
+
+### Behavior for scripts and agents
+
+The `docker` executable works when launched as a subprocess with a minimal
+environment (`PATH` and `HOME` only, no aliases or shell profile) and what a
+caller observes follows Docker's conventions:
+
+- Standard input, standard output and standard error of the executed command
+  are propagated unchanged and stay separate, so `docker exec -i c cat` echoes
+  its input and container stderr never lands on stdout.
+- `docker run`, `docker exec` and `docker compose exec` return the container
+  process's exit code (`docker exec c sh -c 'exit 7'` exits 7).
+- Termination signals sent to the shim during an attached command are forwarded
+  to the underlying `container` process, so interrupting `docker run` leaves no
+  orphan behind.
+- `docker version`, `docker info`, `docker ps --format`, `docker inspect
+  --format`, `docker images --format`, `docker logs` and
+  `docker compose ps --format json` keep the documented output shapes. The
+  contracts of the named consumers (Hermes and OpenClaw) are pinned by tests.
+- An unsupported command or option exits 64 with a message on standard error
+  that names it and the reason (`docker commit c img` names `commit`), and
+  prints nothing resembling success on standard output.
 
 ### Security options
 
@@ -653,20 +679,38 @@ shim-owned file. See the Compose section above.
 
 ## Tests
 
-Unit tests use a fake `container` binary and do not start real containers. The
-suite separates generic CLI and inspect behavior from focused consumer
-contracts, while compose tests cover parsing, interpolation, dependency order,
-translation, and label-based orchestration:
+Every test belongs to exactly one of four tiers, declared by a `TIER` constant
+in its module:
+
+| Tier | Runs by default | Proves |
+| --- | --- | --- |
+| `unit` | yes | pure translation and parsing logic |
+| `fake` | yes | the generated `container` command, against a fake binary |
+| `live` | no (`SHIM_TIERS=live`) | behavior on Apple `container` 1.5.0 |
+| `conformance` | no (`SHIM_TIERS=conformance`) | the same fixtures on a real Docker Engine |
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-Live tests against Apple `container` and Docker Engine conformance tests are
-opt-in (`SHIM_TIERS=live`, `SHIM_TIERS=conformance`) because they start and
-remove real containers; the default run skips them and says why. A passing
-fake-runtime test proves only that a command was translated correctly, a live
-test proves it works on Apple `container`, and only a conformance test says
-anything about Docker Engine. See [docs/testing.md](docs/testing.md) for the
-tiers, the disposable-name rules and the CI recipe. The current development and
-test-fixture baseline is Apple `container` 1.5.0.
+The default run starts no container; live and conformance tests are reported as
+skipped with the reason (missing runtime, wrong release, no Docker client).
+Live tests use the disposable `shimtest-` prefix, clean up in every outcome and
+never run a global prune. They assert observable behavior (connections,
+persisted data, name resolution, exit codes, cleanup, refusal of unsupported
+options), not only a zero exit status. Compose fixtures A to L in
+`tests/fixtures/compat/` use pinned images and are shared unmodified by both
+opt-in tiers.
+
+A passing fake-runtime test proves only that a command was translated
+correctly, a live test proves it works on Apple `container`, and only a
+conformance test says anything about Docker Engine. A report never claims a
+test passed unless it ran: a tier that did not run is "not run".
+
+To evaluate a candidate Apple `container` release, run
+`python3 scripts/validate-runtime.py`. It runs the read-only parse checks per
+matrix entry and the live tier, reports which evidence still holds and never
+edits `SUPPORTED_CONTAINER_VERSION`. See [docs/testing.md](docs/testing.md) for
+the disposable-name rules, the fixtures, the CI recipe and the steps for
+advancing the supported runtime. The current development and test-fixture
+baseline is Apple `container` 1.5.0.
