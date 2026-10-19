@@ -341,6 +341,17 @@ Commands and flags with no verified Apple equivalent fail loudly:
 `history`/`import` (no Apple equivalent), `docker run --network=none`,
 `docker run --add-host/--hostname`, and any unknown command.
 
+### Tools that need the Docker socket or Engine API
+
+The shim is a command-line translator. It exposes **no `/var/run/docker.sock`,
+no Engine API and no Docker daemon**, and it does not fake one. Anything that
+talks to the socket or the API instead of running the `docker` binary is
+unsupported: Docker SDKs and Testcontainers-style libraries that connect over
+the socket, Portainer, Traefik's Docker provider, `docker-in-docker`, tools that
+mount the socket into a container, Docker Swarm and `docker context` remotes.
+`docker info` reports only what Apple `container` provides and never claims
+Engine features such as Swarm.
+
 ### Security options
 
 Restrictions are applied or refused, never dropped silently. Each option below
@@ -383,6 +394,249 @@ warning on every use and the restriction is **not** enforced:
 CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED=security-opt,pids-limit docker run ...
 ```
 
+### Compatibility matrix
+
+Every `docker run` and `docker build` option and every Compose service key the
+shim knows about has an entry in `tests/compat/matrix.json`. The table below is
+generated from it by `scripts/render_compat_table.py --write README.md` and a
+test fails when it drifts. `status` says whether the shim honors the construct
+(`SUPPORTED`), honors part of it (`PARTIAL`) or refuses it (`UNSUPPORTED`);
+`evidence` is the strongest tier that exercises it (`unit`, `fake`, `live`,
+`conformance`; see `docs/testing.md`).
+
+Success on Apple `container` does not imply Docker Engine compatibility: a
+command that works here can still behave differently from the Docker Engine
+(for example, `container image push` always publishes an OCI index and there is no Engine
+API). Known differences are called out in the `note` column.
+
+<!-- compat-matrix:start -->
+| id | status | apple | evidence | note |
+| --- | --- | --- | --- | --- |
+| docker build | SUPPORTED | container build | live | Translates the -f/-t build form to Apple container build. |
+| docker commit | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
+| docker compose build | SUPPORTED | - | fake | Builds each service with Apple container build; no shim state persists. |
+| docker compose config | PARTIAL | - | fake | The built-in parser refuses anchors, aliases, and block scalars without the official docker-compose binary. |
+| docker compose down | SUPPORTED | - | live | Removes only containers, networks, and volumes the shim created, verified by label. |
+| docker compose exec | SUPPORTED | - | live | Resolves one service to its labeled container; defaults to an interactive TTY. |
+| docker compose logs | SUPPORTED | - | live | Streams each service's logs via Apple container logs. |
+| docker compose ls | SUPPORTED | - | fake | Lists projects reconstructed from Compose labels. |
+| docker compose ps | SUPPORTED | - | live | Reconstructs project membership from Compose labels. |
+| docker compose pull | PARTIAL | - | fake | Build-only services are skipped with a warning instead of being built implicitly. |
+| docker compose restart | SUPPORTED | - | live | Stops in reverse dependency order, then starts forward. |
+| docker compose rm | SUPPORTED | - | fake | Never prompts; -f is accepted and -s/--stop stops services first. |
+| docker compose start | SUPPORTED | - | fake | Starts dependencies first, falling back to service-name order without a file. |
+| docker compose stop | SUPPORTED | - | fake | Stops services in reverse dependency order. |
+| docker compose up | PARTIAL | - | live | No background monitoring or restarts; keys with no Apple equivalent are ignored with a warning. |
+| docker compose version | SUPPORTED | - | fake | Reports the active normalizer (official docker-compose or built-in subset). |
+| docker container inspect | SUPPORTED | container inspect | fake | Alias for docker inspect. |
+| docker container port | SUPPORTED | container inspect | fake | Alias for docker port; published bindings come from Apple inspect. |
+| docker container prune | PARTIAL | container prune | fake | Non-interactive Apple prune; Docker prune filters are refused. |
+| docker cp | PARTIAL | container copy | fake | Maps 1:1 onto Apple container copy; Docker -a and -L are refused. |
+| docker create | SUPPORTED | container create | fake | Same flag translation as run; prints the new container ID. |
+| docker diff | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
+| docker exec | SUPPORTED | container exec | fake | Covers detach, interactive/TTY, user, environment, and working-directory options. |
+| docker export | PARTIAL | container export | fake | Apple requires the container to be stopped. |
+| docker history | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
+| docker image inspect | SUPPORTED | container image inspect | fake | Selects the requested platform, or the host platform when none is given. |
+| docker image load | PARTIAL | container image load | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image ls | SUPPORTED | container image list | fake | Docker-shaped default, quiet, digest, no-truncation, JSON, and bounded template output. |
+| docker image prune | PARTIAL | container image prune | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image pull | PARTIAL | container image pull | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image push | PARTIAL | container image push | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image rm | PARTIAL | container image rm | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image save | PARTIAL | container image save | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker image tag | PARTIAL | container image tag | fake | pull/rm/tag/push/save/load/prune forward 1:1; Go-template --format is refused. |
+| docker images | SUPPORTED | container image list | fake | Top-level alias for image ls with the same output shapes. |
+| docker import | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
+| docker info | SUPPORTED | container system status | fake | Only the {{.Driver}} --format template is translated; other formats are refused. |
+| docker inspect | SUPPORTED | container inspect | fake | Bounded template subset: field paths, literal text, and json rendering. |
+| docker kill | PARTIAL | container kill | fake | Forwards to Apple container kill, including -s SIG. |
+| docker load | PARTIAL | container image load | fake | Basic form only; Docker-only flags are not translated. |
+| docker login | PARTIAL | container registry login | fake | Apple stores the credential; -p/--password is refused in favor of --password-stdin. |
+| docker logout | PARTIAL | container registry logout | fake | Delegates to Apple registry logout; flags are refused. |
+| docker logs | PARTIAL | container logs | fake | --tail maps to Apple -n; --since and --timestamps are refused. |
+| docker network create | PARTIAL | container network create | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker network inspect | PARTIAL | container network inspect | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker network ls | PARTIAL | container network list | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker network prune | PARTIAL | container network prune | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker network rm | PARTIAL | container network delete | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker port | SUPPORTED | container inspect | fake | Published port bindings are derived from Apple inspect. |
+| docker ps | SUPPORTED | container list | fake | Stateless filters cover id, name, label, status, ancestor, network, and volume. |
+| docker pull | PARTIAL | container image pull | live | Basic form only; Docker-only flags are not translated. |
+| docker push | PARTIAL | container image push | live | Basic form only; Docker-only flags are not translated. |
+| docker rename | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
+| docker restart | PARTIAL | - | fake | Composed from Apple stop + start; Apple has no restart. |
+| docker rm | SUPPORTED | container rm | fake | Maps -f force removal to Apple container rm. |
+| docker rmi | PARTIAL | container image rm | fake | Top-level alias for image rm; Docker-only flags are not translated. |
+| docker run | SUPPORTED | container run | live | Unverified options are refused with exit 64 before any container is created. |
+| docker save | PARTIAL | container image save | fake | Basic form only; Docker-only flags are not translated. |
+| docker start | SUPPORTED | container start | fake | Non-attached starts refresh Compose /etc/hosts mappings; attach/interactive stay passthroughs. |
+| docker stats | PARTIAL | container stats | fake | Go-template --format is refused; Apple accepts json\|table\|yaml\|toml. |
+| docker stop | SUPPORTED | container stop | fake | Maps -s SIGNAL and -t N to Apple container stop. |
+| docker system df | PARTIAL | container system df | fake | Maps directly; Go templates and Docker's verbose mode are refused. |
+| docker system events | UNSUPPORTED | - | fake | Stateful watcher with no Apple equivalent; refused with exit 64. |
+| docker system info | PARTIAL | container system status | fake | Maps to docker info; only the {{.Driver}} --format template is translated. |
+| docker system prune | PARTIAL | - | fake | Non-interactive; runs Apple prune, image prune, network prune, and volume prune. |
+| docker tag | PARTIAL | container image tag | live | Basic form only; Docker-only flags are not translated. |
+| docker version | SUPPORTED | - | fake | Renders a Docker-shaped client/server version from Apple CLI and apiserver status. |
+| docker volume create | PARTIAL | container volume create | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker volume inspect | PARTIAL | container volume inspect | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker volume ls | PARTIAL | container volume list | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker volume prune | PARTIAL | container volume prune | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| docker volume rm | PARTIAL | container volume delete | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
+| compose build | SUPPORTED | build | fake | Translates to `container build` of the service context, tagging the service image. |
+| compose build.args | SUPPORTED | --build-arg | fake | Each entry forwards as Apple --build-arg. |
+| compose build.context | SUPPORTED | - | fake | Context directory, defaulting to the project directory; passed as the build's positional argument. |
+| compose build.dockerfile | SUPPORTED | --file | fake | Forwarded as Apple --file, resolved against the context. |
+| compose build.platforms | SUPPORTED | --platform | fake | Comma-joined into Apple --platform, falling back to the service platform. |
+| compose cap_add | SUPPORTED | --cap-add | fake | Each entry forwards as Apple --cap-add. |
+| compose cap_drop | SUPPORTED | --cap-drop | fake | Each entry forwards as Apple --cap-drop. |
+| compose command | SUPPORTED | - | live | Shell-lexically split and appended as positional args after the image. |
+| compose configs | PARTIAL | - | fake | Ignored with a warning — configs are a Swarm feature with no Apple container equivalent. |
+| compose container_name | SUPPORTED | --name | fake | Used for Apple --name; defaults to <project>-<service>-1 when absent. |
+| compose cpus | SUPPORTED | --cpus | fake | Forwards to Apple --cpus, with fractional values normalized. |
+| compose depends_on | SUPPORTED | - | live | Starts dependencies first and honors the service_started, service_healthy and service_completed_successfully conditions. |
+| compose deploy | PARTIAL | --cpus | fake | Only deploy.resources.limits translates to --cpus/--memory; replicas != 1 is ignored with a warning. |
+| compose devices | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no host device passthrough. |
+| compose dns | SUPPORTED | --dns | fake | Each entry forwards as Apple --dns. |
+| compose dns_opt | SUPPORTED | --dns-option | fake | Each entry forwards as Apple --dns-option. |
+| compose dns_search | SUPPORTED | --dns-search | fake | Each entry forwards as Apple --dns-search. |
+| compose entrypoint | SUPPORTED | --entrypoint | fake | String form is shell-lexically split and forwarded as Apple --entrypoint, discarding the image CMD. |
+| compose env_file | SUPPORTED | -e | fake | Files are read at up time and flattened into -e pairs. |
+| compose environment | SUPPORTED | -e | live | Map and list forms flatten into Apple -e pairs. |
+| compose extra_hosts | PARTIAL | - | fake | Ignored with a warning — extra_hosts is not yet translated. |
+| compose healthcheck | PARTIAL | - | live | 'healthcheck' is only evaluated to gate depends_on service_healthy or 'up --wait'; there is no continuous monitoring and no restart on failure. |
+| compose hostname | PARTIAL | - | fake | Ignored with a warning — custom hostname is not supported by Apple container. |
+| compose image | SUPPORTED | - | live | Used as the run's positional image; required when no build section is present. |
+| compose init | SUPPORTED | --init | fake | Forwards to Apple --init. |
+| compose labels | SUPPORTED | --label | fake | Map and list forms translate to Apple --label alongside the shim's bookkeeping labels. |
+| compose mem_limit | SUPPORTED | --memory | fake | Forwards to Apple --memory. |
+| compose networks | PARTIAL | --network | live | Each declared network joins via Apple --network; per-network aliases are ignored with a warning. |
+| compose pids_limit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no process-count limit. |
+| compose platform | SUPPORTED | --platform | fake | Forwards to Apple --platform on run and on build (unless build.platforms is set); an image without that platform variant fails at run time. |
+| compose ports | PARTIAL | -p | live | Publishes via Apple -p; bare container ports map to the identical host port, as Apple has no random-host-port mode. |
+| compose privileged | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no privileged mode. |
+| compose read_only | SUPPORTED | --read-only | fake | Forwards to Apple --read-only. |
+| compose restart | PARTIAL | - | fake | Ignored with a warning — restart policies are not supported by Apple container. |
+| compose secrets | PARTIAL | - | fake | Ignored with a warning — secrets are a Swarm feature with no Apple container equivalent. |
+| compose security_opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no seccomp/AppArmor/no-new-privileges knob. |
+| compose shm_size | SUPPORTED | --shm-size | fake | Forwards to Apple --shm-size. |
+| compose stdin_open | SUPPORTED | -i | fake | Forwards to Apple -i. |
+| compose sysctls | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no sysctl passthrough. |
+| compose tmpfs | SUPPORTED | --tmpfs | fake | Each entry forwards as Apple --tmpfs. |
+| compose top-level name | SUPPORTED | - | fake | Sanitized into the project name that scopes container, network and volume resources. |
+| compose top-level networks | PARTIAL | network create | live | Declared networks are created at up time honoring --internal; external networks are warned and not created. |
+| compose top-level services | SUPPORTED | - | fake | Each entry becomes a service, started in topological (dependency) order. |
+| compose top-level volumes | PARTIAL | - | live | Parsed and shown by `config`; named volumes are created on demand from service references. |
+| compose tty | SUPPORTED | -t | fake | Forwards to Apple -t. |
+| compose ulimits | SUPPORTED | --ulimit | fake | Map or list form translates to Apple --ulimit as type=soft[:hard]. |
+| compose user | SUPPORTED | --user | fake | Forwards to Apple --user. |
+| compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
+| compose working_dir | SUPPORTED | -w | fake | Forwards to Apple -w. |
+| compose x-shim-boot-hosts | SUPPORTED | - | fake | Shim extension: false skips the boot-time /etc/hosts entrypoint wrapper for the service. |
+| build --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
+| build --arch | SUPPORTED | --arch | fake | Forwarded verbatim to Apple --arch. |
+| build --build-arg | SUPPORTED | --build-arg | live | Forwarded verbatim to Apple --build-arg. |
+| build --build-context | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build-context flag. |
+| build --cache-from | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no cache-from flag. |
+| build --cache-to | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no cache-to flag. |
+| build --cpus | SUPPORTED | --cpus | fake | Normalized and forwarded to Apple --cpus as a fractional CPU count. |
+| build --file | SUPPORTED | --file | fake | Forwarded verbatim to Apple --file. |
+| build --force-rm | PARTIAL | - | fake | Accepted and ignored; Apple container 1.5.0 build documents no force-remove flag. |
+| build --help | SUPPORTED | --help | fake | Forwards to Apple container build --help. |
+| build --iidfile | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no iidfile flag. |
+| build --label | SUPPORTED | --label | live | Forwarded verbatim to Apple --label. |
+| build --load | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no load flag. |
+| build --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; sets the builder container memory. |
+| build --network | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build network flag. |
+| build --no-cache | SUPPORTED | --no-cache | fake | Forwarded verbatim to Apple --no-cache. |
+| build --output | SUPPORTED | --output | fake | Forwarded verbatim to Apple --output. |
+| build --platform | SUPPORTED | --platform | live | Forwarded verbatim to Apple --platform, including a comma list (`linux/amd64,linux/arm64`), which Apple 1.5.0 builds into one local tag holding an index with both variants (findings 1.2). |
+| build --progress | SUPPORTED | --progress | fake | Forwarded verbatim to Apple --progress. |
+| build --pull | SUPPORTED | --pull | fake | Forwarded verbatim to Apple --pull. |
+| build --push | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build push flag. |
+| build --quiet | SUPPORTED | --quiet | fake | Forwarded verbatim to Apple --quiet. |
+| build --rm | PARTIAL | - | fake | Accepted and ignored; Apple container 1.5.0 build documents no remove flag. |
+| build --secret | SUPPORTED | --secret | fake | Forwarded verbatim to Apple --secret (`id=<id>,src=<path>` or `id=<id>,env=<VAR>`, verified live in findings 1.5). |
+| build --ssh | PARTIAL | --ssh default | fake | Only `--ssh default` is forwarded (the host agent, as Apple container 1.5.0 build supports); any other form is refused with exit 64. |
+| build --tag | SUPPORTED | --tag | fake | Forwarded verbatim to Apple --tag. |
+| build --target | SUPPORTED | --target | fake | Forwarded verbatim to Apple --target. |
+| build --ulimit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag. |
+| run --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
+| run --arch | SUPPORTED | --arch | fake | Forwarded verbatim to Apple --arch. |
+| run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. |
+| run --cap-drop | SUPPORTED | --cap-drop | live | Forwarded verbatim; the runtime normalizes names to CAP_*. |
+| run --cidfile | SUPPORTED | --cidfile | fake | Forwarded verbatim to Apple --cidfile. |
+| run --cpus | SUPPORTED | --cpus | fake | Normalized and forwarded to Apple --cpus as a fractional CPU count. |
+| run --cwd | SUPPORTED | -w | fake | Alias of --workdir; translated to Apple -w. |
+| run --detach | SUPPORTED | -d | fake | Detached run re-adds -d and generates a --name when none is given; create refuses -d with exit 64. |
+| run --device | UNSUPPORTED | - | fake | Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough. |
+| run --dns | SUPPORTED | --dns | fake | Forwarded verbatim to Apple --dns. |
+| run --dns-option | SUPPORTED | --dns-option | fake | Forwarded verbatim to Apple --dns-option. |
+| run --dns-search | SUPPORTED | --dns-search | fake | Forwarded verbatim to Apple --dns-search. |
+| run --entrypoint | SUPPORTED | --entrypoint | fake | Forwarded verbatim to Apple --entrypoint. |
+| run --env | SUPPORTED | -e | fake | Forwarded verbatim to Apple -e. |
+| run --env-file | SUPPORTED | --env-file | fake | Forwarded verbatim to Apple --env-file. |
+| run --hostname | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no hostname flag. |
+| run --init | SUPPORTED | --init | fake | Forwarded verbatim to Apple --init. |
+| run --interactive | SUPPORTED | -i | fake | Forwarded verbatim to Apple -i. |
+| run --label | SUPPORTED | --label | fake | Forwarded verbatim to Apple --label. |
+| run --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity. |
+| run --mount | SUPPORTED | --mount | fake | Forwarded verbatim to Apple --mount without content validation. |
+| run --name | SUPPORTED | --name | fake | Forwarded verbatim to Apple --name. |
+| run --network | SUPPORTED | --network | fake | Verified networks forward verbatim; --network=none is refused (see run --network none). |
+| run --network none | UNSUPPORTED | - | fake | No verified Apple container equivalent; refused with exit 64 as an unsafe translation. |
+| run --no-dns | SUPPORTED | --no-dns | fake | Forwarded verbatim to Apple --no-dns. |
+| run --pids-limit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no process-count limit. |
+| run --platform | SUPPORTED | --platform | live | Forwarded verbatim to Apple --platform. |
+| run --privileged | UNSUPPORTED | - | live | Refused with exit 64; Apple container 1.5.0 has no privileged mode. |
+| run --publish | SUPPORTED | --publish | fake | Forwarded verbatim to Apple --publish. |
+| run --read-only | SUPPORTED | --read-only | live | Forwarded verbatim; guest writes fail on the read-only root filesystem. |
+| run --rm | SUPPORTED | --rm | fake | Forwarded verbatim to Apple --rm. |
+| run --runtime | SUPPORTED | --runtime | fake | Forwarded verbatim to Apple --runtime. |
+| run --security-opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob. |
+| run --shm-size | SUPPORTED | --shm-size | fake | Forwarded verbatim to Apple --shm-size. |
+| run --storage-opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no storage driver options, and the create probe exits 125. |
+| run --sysctl | UNSUPPORTED | - | fake | Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no sysctl passthrough. |
+| run --tmpfs | SUPPORTED | --tmpfs | live | Forwarded verbatim including options, which the runtime applies to the mount. |
+| run --tty | SUPPORTED | -t | fake | Forwarded verbatim to Apple -t. |
+| run --ulimit | SUPPORTED | --ulimit | fake | Forwarded verbatim to Apple --ulimit. |
+| run --user | SUPPORTED | --user | live | Forwarded verbatim; a numeric user maps to that UID in the guest. |
+| run --volume | PARTIAL | --mount | fake | Bind mounts translate to Apple --mount with ro becoming readonly; other mode flags are dropped. |
+| run --workdir | SUPPORTED | -w | fake | Translated to Apple -w, accepting the --cwd and -w aliases. |
+<!-- compat-matrix:end -->
+
+### Building and publishing for AWS
+
+Apple silicon builds `linux/arm64` natively. What reaches the registry is
+decided by the build and push, not by the machine you run it on:
+
+- **Single manifest versus index.** `docker push` (Apple `container image push`)
+  always publishes an OCI image *index*, even for a single-platform build: an
+  arm64-only build is an index with one `arm64` entry. ECR, ECS and Fargate
+  accept indexes, and the task definition's platform has to match one of the
+  entries.
+- **Build for the platform you deploy.** `docker build --platform
+  linux/amd64 -t app .` produces an amd64 image on an arm64 Mac (under
+  emulation), and `--platform linux/amd64,linux/arm64` produces one tag holding
+  both variants.
+- **ECR login.** `aws ecr get-login-password --region <region> | docker login
+  --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com`.
+  Apple `container` stores the credential in the macOS login keychain; the shim
+  writes no file and does not touch `~/.docker/config.json`. The live tests
+  prove login against a disposable local registry, not ECR token
+  authentication.
+- **Fargate/ECS.** Set the task definition `runtimePlatform` to the
+  architecture you built (`ARM64` or `X86_64`). A Fargate service defaults to
+  `X86_64`, so an arm64-only image fails to start there unless the task
+  definition says `ARM64`.
+- **A local ARM64 run does not validate AMD64.** Running the arm64 variant on
+  your Mac proves nothing about the amd64 variant you ship to an x86_64
+  Fargate service. To exercise the amd64 image locally, pass the platform
+  explicitly (`docker run --platform linux/amd64 ...`); an image that only has
+  an amd64 variant fails to run without it, where Docker Desktop would pick the
+  image's platform with a warning.
+
 ### Caveats
 
 - `docker run -v host:ctr:ro` becomes an Apple `--mount` bind (only `ro` mode is
@@ -408,6 +662,11 @@ translation, and label-based orchestration:
 python3 -m unittest discover -s tests -v
 ```
 
-Live smoke testing against Apple `container` is intentionally manual because it
-starts and removes containers. The current development and test-fixture
-baseline is Apple `container` 1.5.0.
+Live tests against Apple `container` and Docker Engine conformance tests are
+opt-in (`SHIM_TIERS=live`, `SHIM_TIERS=conformance`) because they start and
+remove real containers; the default run skips them and says why. A passing
+fake-runtime test proves only that a command was translated correctly, a live
+test proves it works on Apple `container`, and only a conformance test says
+anything about Docker Engine. See [docs/testing.md](docs/testing.md) for the
+tiers, the disposable-name rules and the CI recipe. The current development and
+test-fixture baseline is Apple `container` 1.5.0.
