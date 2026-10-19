@@ -30,6 +30,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose_normalizer  # noqa: E402
 
+TIER = "fake"
+
 
 SUPPORTED_VERSION = "5.6.0"
 PROJECT_NAME = "full"

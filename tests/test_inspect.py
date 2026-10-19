@@ -5,6 +5,8 @@ import json
 
 import test_cli
 
+TIER = "fake"
+
 
 class InspectTests(test_cli.ShimCLITestCase):
     def test_inspect_rejects_unexpected_runtime_schema(self) -> None:

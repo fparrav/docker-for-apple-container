@@ -1,34 +1,32 @@
 """Live security tests (opt-in "live" tier) for the `docker run` controls.
 
 These tests run the real shim (``bin/docker``) against the real Apple
-``container`` runtime and prove the in-guest effect of each control. The whole
-class is skipped unless:
+``container`` runtime and prove the in-guest effect of each control. Every
+test method is gated with ``tiers.live_tier``: it is skipped unless
+``SHIM_TIERS`` contains ``live`` and the supported ``container`` runtime is
+usable, and the class skips additionally when the ``alpine:3.20`` image is
+not already available locally (never pulled).
 
-* ``SHIM_TIERS`` contains ``live`` (comma-separated list),
-* ``container system status`` exits 0 and reports a running apiserver at the
-  supported version,
-* the ``alpine:3.20`` image is already available locally (never pulled).
-
-Every disposable container is named ``shimtest-sec-<short uuid>`` and removed
-by exact name in ``addCleanup``; the suite never prunes or matches by pattern.
+Every disposable container is named ``shimtest-sec-<short uuid>`` through
+``tiers.disposable_name`` and removed by exact name in ``addCleanup``; the
+suite never prunes or matches by pattern.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import unittest
-import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 
-from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION  # noqa: E402
+import tiers  # noqa: E402
+
+TIER = "live"
 
 SHIM = ROOT / "bin" / "docker"
-NAME_PREFIX = "shimtest-sec-"
 IMAGE = "alpine:3.20"
 TIMEOUT_SECONDS = 120
 
@@ -41,31 +39,8 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 class LiveSecurityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        tiers = {
-            tier.strip()
-            for tier in os.environ.get("SHIM_TIERS", "").split(",")
-            if tier.strip()
-        }
-        if "live" not in tiers:
-            raise unittest.SkipTest(
-                "live tier disabled: set SHIM_TIERS=live to run live security tests"
-            )
-        try:
-            status = _run(["container", "system", "status"])
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise unittest.SkipTest(f"container system status failed: {exc}") from exc
-        output = (status.stdout + status.stderr).strip()
-        if status.returncode != 0:
-            raise unittest.SkipTest(
-                f"container system status exited {status.returncode}: {output}"
-            )
-        if "running" not in output:
-            raise unittest.SkipTest(f"container apiserver is not running: {output}")
-        if SUPPORTED_CONTAINER_VERSION not in output:
-            raise unittest.SkipTest(
-                f"container system status does not report the supported "
-                f"version {SUPPORTED_CONTAINER_VERSION}: {output}"
-            )
+        if "live" not in tiers.enabled_tiers():
+            return
         try:
             images = _run(["container", "image", "ls"])
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -77,7 +52,7 @@ class LiveSecurityTests(unittest.TestCase):
     # -- helpers ---------------------------------------------------------
 
     def _name(self) -> str:
-        return f"{NAME_PREFIX}{uuid.uuid4().hex[:8]}"
+        return tiers.disposable_name("sec")
 
     def _run_shim(self, *args: str) -> subprocess.CompletedProcess:
         return _run([sys.executable, str(SHIM), *args])
@@ -91,6 +66,7 @@ class LiveSecurityTests(unittest.TestCase):
 
     # -- tests -----------------------------------------------------------
 
+    @tiers.live_tier()
     def test_cap_drop_all_leaves_no_effective_capabilities(self) -> None:
         name = self._name()
         self.addCleanup(self._remove, name)
@@ -104,6 +80,7 @@ class LiveSecurityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CapEff:\t0000000000000000", result.stdout)
 
+    @tiers.live_tier()
     def test_tmpfs_options_are_applied_to_the_mount(self) -> None:
         name = self._name()
         self.addCleanup(self._remove, name)
@@ -121,6 +98,7 @@ class LiveSecurityTests(unittest.TestCase):
         self.assertIn("noexec", line)
         self.assertIn("size=65536k", line)
 
+    @tiers.live_tier()
     def test_read_only_root_filesystem_rejects_writes(self) -> None:
         name = self._name()
         self.addCleanup(self._remove, name)
@@ -134,6 +112,7 @@ class LiveSecurityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Read-only file system", result.stdout + result.stderr)
 
+    @tiers.live_tier()
     def test_user_maps_to_uid_1000(self) -> None:
         name = self._name()
         self.addCleanup(self._remove, name)
@@ -147,6 +126,7 @@ class LiveSecurityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "1000")
 
+    @tiers.live_tier()
     def test_privileged_is_refused_before_any_container_is_created(self) -> None:
         name = self._name()
         self.addCleanup(self._remove, name)

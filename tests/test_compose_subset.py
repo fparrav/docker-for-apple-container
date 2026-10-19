@@ -10,6 +10,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose_subset  # noqa: E402
 
+TIER = "unit"
+
 
 class AnchorTests(unittest.TestCase):
     def test_anchor_on_map_key(self):

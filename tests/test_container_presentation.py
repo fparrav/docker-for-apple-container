@@ -4,6 +4,8 @@ import json
 
 import test_cli
 
+TIER = "unit"
+
 
 class ContainerPresentationTests(test_cli.ShimCLITestCase):
     """Docker container inspect, list, filter, and port presentation."""

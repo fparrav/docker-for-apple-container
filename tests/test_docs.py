@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION, print_help  # noqa: E402
 
+TIER = "unit"
+
 
 class DocumentationConsistencyTests(unittest.TestCase):
     def setUp(self) -> None:

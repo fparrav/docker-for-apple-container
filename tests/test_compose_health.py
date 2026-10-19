@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose_health  # noqa: E402
 
+TIER = "unit"
+
 
 class ParseDurationTests(unittest.TestCase):
     def test_single_units(self):

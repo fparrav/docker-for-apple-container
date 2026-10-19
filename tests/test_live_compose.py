@@ -4,17 +4,15 @@ These tests run the real shim (``bin/docker``) against the real Apple
 ``container`` runtime and drive a real two-service project — an API that
 reaches PostgreSQL over the project network, gated by
 ``depends_on: service_healthy`` — through a full ``up`` / ``down`` /
-``up`` cycle, proving the named volume survives ``down``. The whole class
-is skipped unless:
+``up`` cycle, proving the named volume survives ``down``. Every test
+method is gated with ``tiers.live_tier``: it is skipped unless
+``SHIM_TIERS`` contains ``live`` and the supported ``container`` runtime
+is usable, and the class skips additionally when the ``postgres:17`` and
+``alpine:3.20`` images are not already available locally (never pulled).
 
-* ``SHIM_TIERS`` contains ``live`` (comma-separated list),
-* ``container system status`` exits 0 and reports a running apiserver at
-  the supported version,
-* the ``postgres:17`` and ``alpine:3.20`` images are already available
-  locally (never pulled).
-
-Every project is named ``shimtest-cmp-<short uuid>`` and lives in a
-throwaway ``tempfile.TemporaryDirectory`` holding its
+Every project is named ``shimtest-cmp-<short uuid>`` through
+``tiers.disposable_name`` and lives in a throwaway
+``tempfile.TemporaryDirectory`` holding its
 ``docker-compose.yml``; it is torn down with
 ``compose -p <project> -f <file> down -v`` in ``addCleanup`` for that
 project only — the suite never prunes or matches by pattern.
@@ -22,20 +20,20 @@ project only — the suite never prunes or matches by pattern.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-import uuid
 from pathlib import Path
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 
-from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION  # noqa: E402
+import tiers  # noqa: E402
+
+TIER = "live"
 
 SHIM = ROOT / "bin" / "docker"
 NAME_PREFIX = "shimtest-cmp-"
@@ -63,31 +61,8 @@ def _image_available(listing: str, repository: str, tag: str) -> bool:
 class LiveComposeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        tiers = {
-            tier.strip()
-            for tier in os.environ.get("SHIM_TIERS", "").split(",")
-            if tier.strip()
-        }
-        if "live" not in tiers:
-            raise unittest.SkipTest(
-                "live tier disabled: set SHIM_TIERS=live to run live compose tests"
-            )
-        try:
-            status = _run(["container", "system", "status"])
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise unittest.SkipTest(f"container system status failed: {exc}") from exc
-        output = (status.stdout + status.stderr).strip()
-        if status.returncode != 0:
-            raise unittest.SkipTest(
-                f"container system status exited {status.returncode}: {output}"
-            )
-        if "running" not in output:
-            raise unittest.SkipTest(f"container apiserver is not running: {output}")
-        if SUPPORTED_CONTAINER_VERSION not in output:
-            raise unittest.SkipTest(
-                f"container system status does not report the supported "
-                f"version {SUPPORTED_CONTAINER_VERSION}: {output}"
-            )
+        if "live" not in tiers.enabled_tiers():
+            return
         try:
             images = _run(["container", "image", "ls"])
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -134,7 +109,7 @@ class LiveComposeTests(unittest.TestCase):
 
     def _open_project(self, compose_text: Optional[str] = None) -> None:
         """Fresh unique project in a temp dir holding its docker-compose.yml."""
-        self._project = f"{NAME_PREFIX}{uuid.uuid4().hex[:8]}"
+        self._project = tiers.disposable_name("cmp")
         self._tmp = tempfile.TemporaryDirectory(prefix=NAME_PREFIX)
         self.addCleanup(self._tmp.cleanup)
         workdir = Path(self._tmp.name)
@@ -181,6 +156,7 @@ class LiveComposeTests(unittest.TestCase):
 
     # -- tests -----------------------------------------------------------
 
+    @tiers.live_tier()
     def test_api_reaches_postgres_and_data_survives_down_and_up(self) -> None:
         self._open_project()
         project = self._project
@@ -235,6 +211,7 @@ class LiveComposeTests(unittest.TestCase):
         volumes = _run(["container", "volume", "ls"])
         self.assertNotIn(project, volumes.stdout + volumes.stderr)
 
+    @tiers.live_tier()
     def test_restart_db_keeps_api_connectivity(self) -> None:
         self._open_project()
 
@@ -288,6 +265,7 @@ class LiveComposeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("1", result.stdout)
 
+    @tiers.live_tier()
     def test_dependent_waits_for_delayed_healthy_dependency(self) -> None:
         self._open_project(
             "services:\n"
@@ -320,6 +298,7 @@ class LiveComposeTests(unittest.TestCase):
         self.assertIn("slow", result.stdout)
         self.assertIn("app", result.stdout)
 
+    @tiers.live_tier()
     def test_never_healthy_dependency_hits_wait_timeout(self) -> None:
         self._open_project(
             "services:\n"

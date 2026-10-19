@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from container_docker_shim import compose  # noqa: E402
 from container_docker_shim import compose_reconcile  # noqa: E402
 
+TIER = "unit"
+
 
 def _service(yaml_text: str) -> dict:
     """Parse ``yaml_text`` and return the ``web`` service mapping."""

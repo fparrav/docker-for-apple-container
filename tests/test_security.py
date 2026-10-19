@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import security  # noqa: E402
 
+TIER = "unit"
+
 
 class SecurityRulesTests(unittest.TestCase):
     def test_unsupported_rules_have_a_reason(self):
