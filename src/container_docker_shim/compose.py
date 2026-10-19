@@ -114,6 +114,44 @@ UNSUPPORTED_SERVICE_KEYS = {
     "extra_hosts": "extra_hosts is not yet translated",
 }
 
+# Service-level keys the translator reads or tolerates. Together with
+# UNSUPPORTED_SERVICE_KEYS this is the full service-key vocabulary the shim
+# knows about; any other key is parsed and ignored, as in Docker Compose.
+SUPPORTED_SERVICE_KEYS = frozenset({
+    "build",
+    "cap_add",
+    "cap_drop",
+    "command",
+    "container_name",
+    "cpus",
+    "depends_on",
+    "deploy",
+    "dns",
+    "dns_opt",
+    "dns_search",
+    "entrypoint",
+    "env_file",
+    "environment",
+    "healthcheck",
+    "image",
+    "init",
+    "labels",
+    "mem_limit",
+    "networks",
+    "platform",
+    "ports",
+    "read_only",
+    "shm_size",
+    "stdin_open",
+    "tmpfs",
+    "tty",
+    "ulimits",
+    "user",
+    "volumes",
+    "working_dir",
+    "x-shim-boot-hosts",
+})
+
 # Per-service escape hatch: `x-shim-boot-hosts: false` skips the boot-time
 # /etc/hosts entrypoint wrapper for that service (post-start injection still
 # applies). For `depends_on` services whose image has no /bin/sh.
@@ -2547,6 +2585,11 @@ def _run_build(service: Service, project: Project, tag: str) -> None:
         args.extend(["--file", df_path])
     for key, value in build_args.items():
         args.extend(["--build-arg", f"{key}={_as_str(value)}"])
+    platforms = build.get("platforms") if isinstance(build, dict) else None
+    if platforms:
+        args.extend(["--platform", ",".join(_as_str(p) for p in _as_list(platforms))])
+    elif service.spec.get("platform"):
+        args.extend(["--platform", _as_str(service.spec["platform"])])
     args.append(context_path)
 
     print(f"Building {tag} for service {service.name} ...")

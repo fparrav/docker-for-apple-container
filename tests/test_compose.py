@@ -11,6 +11,8 @@ Two layers:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -28,6 +30,8 @@ DOCKER = ROOT / "bin" / "docker"
 sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose  # noqa: E402
+
+TIER = "fake"
 
 
 # A fake `container` that models just enough of Apple's CLI for compose:
@@ -3261,6 +3265,58 @@ class HostsRewriteScriptTests(unittest.TestCase):
                 self._read(path),
                 "192.168.65.3 db\n192.168.65.1 host.docker.internal gateway.docker.internal\n",
             )
+
+
+class BuildPlatformTests(unittest.TestCase):
+    """`_run_build` forwards the service or build platform to `container build`."""
+
+    def build_args(self, body: str) -> list:
+        proj = compose.Project("p", compose.parse_yaml(textwrap.dedent(body)), "/tmp/p")
+        captured: list = []
+        original = compose._run_container_passthrough
+        compose._run_container_passthrough = lambda args: captured.append(args) or 0
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                compose._run_build(proj.services["web"], proj, "p-web:latest")
+        finally:
+            compose._run_container_passthrough = original
+        return captured[0]
+
+    def test_service_platform_reaches_the_build(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build: .
+                platform: linux/amd64
+            """
+        )
+        self.assertEqual(args[args.index("--platform") + 1], "linux/amd64")
+
+    def test_build_platforms_list_is_joined_and_wins(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                platform: linux/arm64
+                build:
+                  context: .
+                  platforms:
+                    - linux/amd64
+                    - linux/arm64
+            """
+        )
+        self.assertEqual(args[args.index("--platform") + 1], "linux/amd64,linux/arm64")
+
+    def test_no_platform_flag_without_a_platform(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build: .
+            """
+        )
+        self.assertNotIn("--platform", args)
 
 
 if __name__ == "__main__":
