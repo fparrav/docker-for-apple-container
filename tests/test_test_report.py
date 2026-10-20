@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,25 @@ def _run(module, enabled) -> list:
 
 
 class TestOutcomeClassification(unittest.TestCase):
+    def test_subtest_failure_is_recorded_as_failed(self):
+        case = _make_module("syn_subtest_failure", "unit", [("test_a", "pass", None)]).Case0()
+        result = test_report.CollectingResult()
+        err = (AssertionError, AssertionError("subtest failed"), None)
+
+        result.addSubTest(case, case, err)
+
+        self.assertEqual(result.records[0]["id"], case.id())
+        self.assertEqual(result.records[0]["outcome"], test_report.FAILED)
+
+    def test_class_setup_skip_holder_can_be_recorded(self):
+        holder = unittest.suite._ErrorHolder("syn_module.TestCase.setUpClass")
+        result = test_report.CollectingResult()
+
+        result.addSkip(holder, "optional dependency missing")
+
+        self.assertEqual(result.records[0]["id"], "syn_module.TestCase.setUpClass")
+        self.assertEqual(result.records[0]["outcome"], test_report.SKIPPED)
+
     def test_disabled_tier_is_not_run(self):
         """A tier that is not enabled reports all of its tests as not run."""
         module = _make_module("syn_live_disabled", "live", [("test_a", "pass", None)])
@@ -131,6 +151,11 @@ class TestOutcomeClassification(unittest.TestCase):
 
 
 class TestMatrixJoin(unittest.TestCase):
+    def test_unreadable_matrix_is_not_treated_as_empty(self):
+        with patch("builtins.open", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(ValueError, "cannot load compatibility matrix"):
+                test_report._load_matrix()
+
     def test_unsupported_with_passing_refusal_is_unsupported(self):
         entries = [
             {

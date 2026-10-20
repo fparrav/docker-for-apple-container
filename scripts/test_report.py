@@ -133,10 +133,13 @@ def _tier_of(test) -> str:
 
 def _case_id(test) -> str:
     """The dotted id of one test case: ``module.Class.method``."""
+    test_id = getattr(test, "id", None)
+    if callable(test_id):
+        return test_id()
     return "%s.%s.%s" % (
         type(test).__module__,
         type(test).__name__,
-        test._testMethodName,
+        getattr(test, "_testMethodName", "<class setup>"),
     )
 
 
@@ -175,6 +178,11 @@ class CollectingResult(unittest.TestResult):
     def addError(self, test, err) -> None:
         super().addError(test, err)
         self._record(test, FAILED, _err_reason(err))
+
+    def addSubTest(self, test, subtest, err) -> None:
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            self._record(test, FAILED, _err_reason(err))
 
     def addSkip(self, test, reason) -> None:
         super().addSkip(test, reason)
@@ -506,13 +514,15 @@ def _supported_version():
 
 
 def _load_matrix() -> list:
-    """Load the compatibility matrix, or an empty list when unreadable."""
+    """Load the compatibility matrix, raising when evidence is unavailable."""
     try:
         with open(MATRIX_PATH, encoding="utf-8") as handle:
             entries = json.load(handle)
-    except (OSError, ValueError):
-        return []
-    return entries if isinstance(entries, list) else []
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot load compatibility matrix at {MATRIX_PATH}: {exc}") from exc
+    if not isinstance(entries, list):
+        raise ValueError(f"compatibility matrix at {MATRIX_PATH} must be a JSON array")
+    return entries
 
 
 def main(argv=None) -> int:
@@ -536,10 +546,16 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    try:
+        matrix = _load_matrix()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     enabled = enabled_tiers(args.tiers)
     modules = discover_test_modules()
     records = run_suite(modules, enabled)
-    report = build_report(enabled, records, _load_matrix(), _supported_version())
+    report = build_report(enabled, records, matrix, _supported_version())
 
     report_path = Path(args.report)
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

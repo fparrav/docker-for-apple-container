@@ -26,7 +26,7 @@ permissions:
 jobs:
   runtime:
     name: Runtime (supported container release)
-    if: github.repository == 'fparrav/docker-for-apple-container'
+    if: github.repository == 'fparrav/docker-for-apple-container' && github.ref == 'refs/heads/main'
     environment: runtime
     runs-on: [self-hosted, macOS, runtime-26]
     steps:
@@ -36,6 +36,8 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
+      - name: Initialize report
+        run: printf '# Runtime validation\n\nValidation did not produce a complete report. Check the workflow log for the failure.\n' > runtime-report.md
       - name: Validate the supported container release
         # The runner's Apple `container` binary (Homebrew, Apple silicon).
         # The read-only matrix check and the live tier both run against it;
