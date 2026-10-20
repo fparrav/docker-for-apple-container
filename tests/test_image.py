@@ -62,7 +62,11 @@ class ImagePresentationTests(test_cli.ShimCLITestCase):
         )
         self.assertEqual(obj["Created"], "2026-01-02T03:04:05Z")
         self.assertEqual(obj["Size"], 12345678)
-        self.assertEqual(obj["Architecture"], "arm64")
+        machine = platform.machine().lower()
+        expected_architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(
+            machine, machine
+        )
+        self.assertEqual(obj["Architecture"], expected_architecture)
         self.assertEqual(obj["Os"], "linux")
         self.assertEqual(obj["Config"]["Entrypoint"], ["docker-entrypoint.sh"])
         self.assertEqual(obj["Config"]["Cmd"], ["serve"])
