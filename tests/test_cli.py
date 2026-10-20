@@ -7,7 +7,9 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from unittest.mock import patch
 
 TIER = "fake"
 
@@ -1372,6 +1374,7 @@ class VersionFormatTests(ShimCLITestCase):
         self.assertEqual(plain.returncode, 0, plain.stderr)
         self.assertEqual(formatted.returncode, 0, formatted.stderr)
         self.assertIn("Client:\n Version:", plain.stdout)
+        self.assertRegex(plain.stdout, r"(?m)^Shim: .+$")
         payload = json.loads(formatted.stdout)
         self.assertEqual(payload, {"Client": {"Version": "1.5.0"}, "Server": {"Version": "1.5.0"}})
 
@@ -1379,6 +1382,22 @@ class VersionFormatTests(ShimCLITestCase):
         result = self.docker("version", "--format", "{{json .}}")
         self.assertEqual(result.returncode, 64)
         self.assertEqual(result.stdout, "")
+
+
+class ShimVersionTests(unittest.TestCase):
+    def test_metadata_missing_uses_source_version(self) -> None:
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from container_docker_shim import shim_version
+        import container_docker_shim
+
+        with patch.object(
+            container_docker_shim,
+            "_pkg_version",
+            side_effect=PackageNotFoundError("missing distribution"),
+        ):
+            self.assertEqual(shim_version(), "0+source")
 
 
 class RunSecurityRefusalTests(ShimCLITestCase):

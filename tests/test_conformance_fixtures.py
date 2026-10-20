@@ -7,8 +7,8 @@ through a real Docker Engine client named by ``SHIM_CONFORMANCE_DOCKER`` and
 read at test time, instead of the shim against the Apple ``container``
 runtime. Every test method is gated with ``tiers.conformance_tier``: it is
 skipped unless ``SHIM_TIERS`` contains ``conformance``, the client variable
-is set, and the supported ``container`` runtime is usable (the other side of
-the comparison).
+is set, and the real Engine answers ``info``. The gate never probes the
+Apple ``container`` runtime, so the tier runs on a Docker-only host.
 
 Each fixture is copied into a throwaway temp directory and driven as a fresh
 project named ``shimtest-conf-<short uuid>``; teardown runs

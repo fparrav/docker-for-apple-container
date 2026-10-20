@@ -1,18 +1,21 @@
-# docker-for-apple-container
+# docker-for-apple-container-fork
 
-[![PyPI version](https://img.shields.io/pypi/v/docker-for-apple-container?style=flat-square)](https://pypi.org/project/docker-for-apple-container/)
-[![Homebrew](https://img.shields.io/badge/homebrew-tap-orange?style=flat-square)](https://github.com/appautomaton/homebrew-tap)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%28Apple%20Silicon%29-lightgrey?style=flat-square)](#requirements)
-[![Website](https://img.shields.io/badge/website-appautomaton.com-blue?style=flat-square)](https://appautomaton.com/docker-for-apple-container/)
 
 > Run `docker` and `docker compose` on macOS, backed by Apple's native `container` CLI. No Docker Desktop.
 
-`docker-for-apple-container` is a small `docker` command wrapper for Apple's
-`container` CLI. It lets tools that expect a `docker` binary run against Apple
-`container` on macOS, without installing Docker Desktop, Podman, or a
-third-party adapter.
+**Fork of [appautomaton/docker-for-apple-container](https://github.com/appautomaton/docker-for-apple-container).**
+This repository is maintained independently: releases are built from its Git
+tags and published as its GitHub Releases. It does not use the upstream
+package index page, Homebrew tap, or website, and nothing here installs from
+or publishes through upstream infrastructure.
+
+`docker-for-apple-container-fork` is a small `docker` command wrapper for
+Apple's `container` CLI. It lets tools that expect a `docker` binary run
+against Apple `container` on macOS, without installing Docker Desktop, Podman,
+or a third-party adapter.
 
 It is a **stateless translator**, not a Docker replacement. It maps each Docker
 command to a clean Apple `container` equivalent and fails loudly on the rest.
@@ -27,41 +30,103 @@ by querying Apple rather than reading shim-owned state.
 Every method below gives you a `docker` command backed by Apple `container`.
 Use them on a Mac that runs Apple `container` rather than Docker Desktop.
 
-With Homebrew:
+### From a release tag
+
+Releases are GitHub Releases of this repository. Install a release tag
+(replace `vX.Y.Z` with the tag you want) with `uv`:
 
 ```bash
-brew install appautomaton/tap/docker-for-apple-container
+uv tool install --from docker-for-apple-container-fork \
+    git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
 ```
 
-With uv:
+or with `pipx`:
 
 ```bash
-uv tool install docker-for-apple-container
+pipx install git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
 ```
 
-From source, symlink the launcher onto your PATH:
+`--from` names the distribution explicitly because the repository is named
+like the upstream project; both commands install
+`docker-for-apple-container-fork`. The executable lands in the tool bin
+directory (`~/.local/bin` by default for both `uv` and `pipx`).
+
+### From source
 
 ```bash
-git clone https://github.com/appautomaton/docker-for-apple-container.git
+git clone https://github.com/fparrav/docker-for-apple-container.git
 cd docker-for-apple-container
-ln -sf "$(pwd)/bin/docker" ~/.local/bin/docker
+uv tool install .
 ```
 
-After any of these, run `docker` as usual. If a tool resolves its Docker binary
-from an environment variable or config setting, point that at the installed
-`docker` (or the repo's `bin/docker`).
+A source install reports a development version, never a release version.
+
+### Verify
+
+```bash
+docker version
+```
+
+prints the Apple `container` version and a `Shim:` line with this project's
+version (the release tag, or a development version from a source install).
+
+### Which `docker` runs
+
+More than one `docker` can sit on `PATH` (this fork, the upstream package, a
+source checkout, Docker Desktop). Reveal the resolution order:
+
+```bash
+command -v -a docker
+```
+
+prints every match in the order the shell resolves it; the first line is what
+runs. Put this fork first by reordering `PATH` in your shell profile, or
+remove the others (below).
+
+### Agents with a minimal environment
+
+Agents and CI runners often start with a minimal environment (no shell
+profile, so no custom `PATH`). Point them at the installed executable by
+absolute path:
+
+```bash
+~/.local/bin/docker version
+```
+
+or extend `PATH` explicitly:
+
+```bash
+PATH="$HOME/.local/bin:$PATH" docker version
+```
+
+If a tool resolves its Docker binary from an environment variable or config
+setting, point that at the same absolute path.
+
+### Switching from the upstream package
+
+If you installed the upstream `docker-for-apple-container` (from its package
+index or Homebrew tap), remove it first — `uv` refuses to overwrite an
+existing `docker` executable and `pipx` only warns:
+
+```bash
+uv tool uninstall docker-for-apple-container
+# or: pipx uninstall docker-for-apple-container
+# or: brew uninstall docker-for-apple-container
+```
+
+Then install this fork with one of the commands above and confirm with
+`command -v -a docker` that the fork's path resolves first.
 
 ## Requirements
 
 - macOS 26 with Apple `container` 1.5.0 only
 - The `container` apiserver running (check with `container system status`)
 
-Only Apple `container` 1.5.0 is supported. There is no backward compatibility
-with older releases or implied support for newer ones.
-The supported version advances explicitly after validation. The shim depends
-on the `container` executable, not directly on Apple's Containerization Swift
-package. Apple selects and bundles Containerization as part of `container`, so
-there is no separate framework to install or manage.
+There is no backward compatibility with older releases and no implied support
+for newer ones; the supported version advances explicitly after validation.
+The shim depends on the `container` executable, not directly on Apple's
+Containerization Swift package. Apple selects and bundles Containerization as
+part of `container`, so there is no separate framework to install or manage.
 
 Nothing else is required. The shim is pure Python standard library with no
 third-party packages, and it runs on the Python that ships with macOS. The
@@ -564,7 +629,7 @@ API). Known differences are called out in the `note` column.
 | docker system info | PARTIAL | container system status | fake | Maps to docker info; only the {{.Driver}} --format template is translated. |
 | docker system prune | PARTIAL | - | fake | Non-interactive; runs Apple prune, image prune, network prune, and volume prune. |
 | docker tag | PARTIAL | container image tag | live | Basic form only; Docker-only flags are not translated. |
-| docker version | SUPPORTED | - | fake | Renders a Docker-shaped client/server version from Apple CLI and apiserver status. |
+| docker version | SUPPORTED | container --version; container system status | unit | Plain output includes the Apple CLI/client-server shape and the shim version. |
 | docker volume create | PARTIAL | container volume create | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
 | docker volume inspect | PARTIAL | container volume inspect | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
 | docker volume ls | PARTIAL | container volume list | fake | create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly. |
@@ -877,7 +942,7 @@ in its module:
 | --- | --- | --- |
 | `unit` | yes | pure translation and parsing logic |
 | `fake` | yes | the generated `container` command, against a fake binary |
-| `live` | no (`SHIM_TIERS=live`) | behavior on Apple `container` 1.5.0 |
+| `live` | no (`SHIM_TIERS=live`) | behavior on the supported Apple `container` release |
 | `conformance` | no (`SHIM_TIERS=conformance`) | the same fixtures on a real Docker Engine |
 
 ```bash
@@ -904,4 +969,4 @@ matrix entry and the live tier, reports which evidence still holds and never
 edits `SUPPORTED_CONTAINER_VERSION`. See [docs/testing.md](docs/testing.md) for
 the disposable-name rules, the fixtures, the CI recipe and the steps for
 advancing the supported runtime. The current development and test-fixture
-baseline is Apple `container` 1.5.0.
+baseline is the supported release stated in [Requirements](#requirements).

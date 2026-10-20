@@ -15,6 +15,7 @@ from typing import Any
 from . import compose_capabilities
 from . import mounts
 from . import security
+from . import shim_version
 
 
 DOCKER_ZERO_TIME = "0001-01-01T00:00:00Z"
@@ -1024,6 +1025,7 @@ def cmd_version(argv: list[str]) -> int:
     print(f" Version: {version}")
     print("Server:")
     print(" Engine: Apple container")
+    print(f"Shim: {shim_version()}")
     return 0
 
 

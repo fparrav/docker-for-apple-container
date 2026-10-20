@@ -46,6 +46,25 @@ def _runner(
     return run
 
 
+def _engine_runner(
+    *,
+    client: str = "/usr/bin/docker",
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+    raises: type[BaseException] | None = None,
+):
+    """Fake runner for the conformance gate's ``<client> info`` probe."""
+
+    def run(args: list[str]) -> FakeProc:
+        assert args == [client, "info"], args
+        if raises is not None:
+            raise raises(client)
+        return FakeProc(returncode, stdout, stderr)
+
+    return run
+
+
 def _status_output(version: str) -> str:
     return (
         "FIELD               VALUE\n"
@@ -118,6 +137,62 @@ class RuntimeSkipReasonTests(unittest.TestCase):
         self.assertIn("no version", reason)
 
 
+class EngineSkipReasonTests(unittest.TestCase):
+    def test_reachable_engine_is_usable(self):
+        with mock.patch.dict(
+            os.environ, {tiers.CONFORMANCE_DOCKER_ENV: "/usr/bin/docker"}
+        ):
+            reason = tiers.engine_skip_reason(run=_engine_runner())
+        self.assertIsNone(reason)
+
+    def test_client_not_set_produces_a_reason(self):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != tiers.CONFORMANCE_DOCKER_ENV
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            reason = tiers.engine_skip_reason(run=_engine_runner())
+        self.assertIsNotNone(reason)
+        self.assertIn(tiers.CONFORMANCE_DOCKER_ENV, reason)
+
+    def test_failed_info_produces_a_reason(self):
+        with mock.patch.dict(
+            os.environ, {tiers.CONFORMANCE_DOCKER_ENV: "/usr/bin/docker"}
+        ):
+            reason = tiers.engine_skip_reason(
+                run=_engine_runner(
+                    returncode=1,
+                    stderr="Cannot connect to the Docker daemon",
+                )
+            )
+        self.assertIsNotNone(reason)
+        self.assertIn("exited 1", reason)
+        self.assertIn("Cannot connect", reason)
+
+    def test_unexecutable_client_produces_a_reason(self):
+        with mock.patch.dict(
+            os.environ, {tiers.CONFORMANCE_DOCKER_ENV: "/no/such/docker"}
+        ):
+            reason = tiers.engine_skip_reason(
+                run=_engine_runner(
+                    client="/no/such/docker", raises=FileNotFoundError
+                )
+            )
+        self.assertIsNotNone(reason)
+        self.assertIn("not available", reason)
+
+    def test_never_probes_the_apple_runtime(self):
+        """The probe is the client's ``info``; no ``container`` argv is issued."""
+        runner = RecordingRunner({("/usr/bin/docker", "info"): FakeProc(0)})
+        with mock.patch.dict(
+            os.environ, {tiers.CONFORMANCE_DOCKER_ENV: "/usr/bin/docker"}
+        ):
+            reason = tiers.engine_skip_reason(run=runner)
+        self.assertIsNone(reason)
+        self.assertEqual(runner.commands, [["/usr/bin/docker", "info"]])
+
+
 class TierDecoratorTests(unittest.TestCase):
     def test_live_disabled_is_skipped_with_a_reason(self):
         @tiers.live_tier()
@@ -185,7 +260,9 @@ class TierDecoratorTests(unittest.TestCase):
         self.assertIn("SHIM_CONFORMANCE_DOCKER", str(ctx.exception))
 
     def test_conformance_enabled_with_docker_client_runs_the_test(self):
-        run = _runner(stdout=_status_output(SUPPORTED_CONTAINER_VERSION))
+        # The fake runner only accepts the client's ``info`` probe: a gate
+        # that also probed the Apple runtime would fail the assertion.
+        run = _engine_runner()
 
         @tiers.conformance_tier(run)
         def target() -> str:
@@ -195,8 +272,10 @@ class TierDecoratorTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             self.assertEqual(target(), "ran")
 
-    def test_conformance_with_unusable_runtime_is_skipped(self):
-        run = _runner(returncode=1, stderr="apiserver not running")
+    def test_conformance_with_unreachable_engine_is_skipped(self):
+        run = _engine_runner(
+            returncode=1, stderr="Cannot connect to the Docker daemon"
+        )
 
         @tiers.conformance_tier(run)
         def target() -> str:
@@ -209,18 +288,31 @@ class TierDecoratorTests(unittest.TestCase):
         self.assertIn("conformance tier cannot run", str(ctx.exception))
         self.assertIn("exited 1", str(ctx.exception))
 
-    def test_conformance_with_other_runtime_version_is_skipped(self):
-        run = _runner(stdout=_status_output("0.0.1"))
+    def test_conformance_with_unexecutable_client_is_skipped(self):
+        run = _engine_runner(client="/no/such/docker", raises=FileNotFoundError)
 
         @tiers.conformance_tier(run)
         def target() -> str:
             return "ran"
 
-        env = {"SHIM_TIERS": "conformance", "SHIM_CONFORMANCE_DOCKER": "/usr/bin/docker"}
+        env = {"SHIM_TIERS": "conformance", "SHIM_CONFORMANCE_DOCKER": "/no/such/docker"}
         with mock.patch.dict(os.environ, env):
             with self.assertRaises(unittest.SkipTest) as ctx:
                 target()
-        self.assertIn("differs from the supported", str(ctx.exception))
+        self.assertIn("conformance tier cannot run", str(ctx.exception))
+        self.assertIn("not available", str(ctx.exception))
+
+    def test_conformance_gate_never_probes_the_apple_runtime(self):
+        runner = RecordingRunner({("/usr/bin/docker", "info"): FakeProc(0)})
+
+        @tiers.conformance_tier(runner)
+        def target() -> str:
+            return "ran"
+
+        env = {"SHIM_TIERS": "conformance", "SHIM_CONFORMANCE_DOCKER": "/usr/bin/docker"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(target(), "ran")
+        self.assertEqual(runner.commands, [["/usr/bin/docker", "info"]])
 
 
 class DisposableNameTests(unittest.TestCase):
