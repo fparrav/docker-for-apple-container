@@ -572,7 +572,13 @@ def main(argv=None) -> int:
     else:
         sys.stdout.write(output + "\n")
 
-    return compute_exit_status(records)
+    exit_status = compute_exit_status(records)
+    if exit_status:
+        print("failed tests:", file=sys.stderr)
+        for record in records:
+            if record["outcome"] == FAILED:
+                print(f"- {record['id']}: {record.get('reason', 'failed')}", file=sys.stderr)
+    return exit_status
 
 
 if __name__ == "__main__":
