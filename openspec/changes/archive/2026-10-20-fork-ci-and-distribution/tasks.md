@@ -82,6 +82,6 @@ Conventions for every task:
 - [x] 6.1 Run `python3 -m unittest discover -s tests -v`, `python3 scripts/render_compat_table.py --check README.md`, `python3 -m compileall -q src scripts tests` and `openspec validate fork-ci-and-distribution --strict`; record results
   - Priority: P0. Files: none. Depends: 2.3, 3.1, 3.2, 3.3, 4.3, 4.4, 5.1, 5.2, 5.3, 5.4.
   - Done: all four commands exit 0.
-- [ ] 6.2 Tag a prerelease on a branch of the fork, confirm the GitHub Release contents and notes, and the `uv`/`pipx` install from the tag; delete the prerelease and tag afterwards (ask the owner before pushing a tag)
-  - Priority: P1. Files: none. Depends: 6.1. @needs-human
-  - Done: the notes list the supported runtime and tier table; the install works; the prerelease is removed.
+- [x] 6.2 Defer the prerelease/tag installation trial by owner decision; the operational installation path is directly from the fork until release distribution is adopted
+  - Priority: P1. Files: none. Depends: 6.1. @owner-decision 2026-10-20
+  - Done: owner confirmed that installation from the fork is sufficient for current use and that release distribution is not being used through CI yet. No tag or prerelease was created. Validate the release workflow, protect the `v*` tag namespace, and test `uv`/`pipx` before the first versioned release.
