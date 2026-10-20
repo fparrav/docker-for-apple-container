@@ -64,7 +64,7 @@ Conventions for every task:
 
 ## 5. Workflows
 
-- [ ] 5.1 Add `.github/workflows/ci.yml` with jobs `checks` (unit and fake via `scripts/test_report.py`, matrix check, README block check, `compileall`) and `conformance` (same fixtures with `SHIM_TIERS=conformance` and `SHIM_CONFORMANCE_DOCKER` set; prints Docker and Compose versions; uploads `report.json`)
+- [x] 5.1 Add `.github/workflows/ci.yml` with jobs `checks` (unit and fake via `scripts/test_report.py`, matrix check, README block check, `compileall`) and `conformance` (same fixtures with `SHIM_TIERS=conformance` and `SHIM_CONFORMANCE_DOCKER` set; prints Docker and Compose versions; uploads `report.json`)
   - Priority: P0. Files: `.github/workflows/ci.yml` (new). Depends: 1.3, 4.2, 4.4.
   - Done: the file passes `tests/test_workflows.py` (5.4) and a trial run on a branch of the fork is green; the conformance job's result is recorded in the PR description or `findings.md`.
 - [x] 5.2 Add `.github/workflows/runtime.yml` (manual only, self-hosted label `runtime-26`, protected environment `runtime`, repository guard, runs `scripts/validate-runtime.py` and the live tier, uploads the report); do not trigger it

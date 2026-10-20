@@ -215,4 +215,6 @@ with `git ls-remote https://github.com/{owner}/{repo} 'refs/tags/<tag>'
 - `python3 scripts/render_compat_table.py --check README.md` — exit 0.
 - `python3 -m compileall -q src scripts tests` — exit 0.
 - `openspec validate fork-ci-and-distribution --strict` — exit 0; change is valid.
-- The CI workflow's branch trial was not run because it requires a remote push and Actions trigger. Task 5.1 remains unchecked until that external trial is authorized and completed.
+- Targeted post-fix tests passed: `test_test_report.py` (19 tests), `test_workflows.py` (9 tests), and `test_image.py` (11 tests).
+- CI branch trial: draft PR [#1](https://github.com/fparrav/docker-for-apple-container/pull/1), commit `06b089e`, Actions run [39411338351](https://github.com/fparrav/docker-for-apple-container/actions/runs/39411338351) — both `Hosted checks` and `Conformance (real Docker Engine)` passed. The conformance artifact reports 16 passed, 0 failed, 0 skipped. The first trial exposed a host-architecture-dependent image assertion; the test now derives the expected architecture from the runner.
+- Task 5.1 is complete. The runtime workflow was not dispatched, and no release tag was created.
