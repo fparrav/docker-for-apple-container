@@ -1,0 +1,52 @@
+name: Runtime
+
+# Manual-only validation of the supported Apple `container` release
+# (design D6; docs/testing.md, "CI limitation").
+#
+# Trust boundary: `workflow_dispatch` is the only trigger — no pull request,
+# push, or schedule path can start a run. The job additionally requires the
+# protected `runtime` environment, so every run needs maintainer approval,
+# and it is skipped outside `fparrav/docker-for-apple-container`, so a fork
+# of the fork cannot schedule it. It runs on the owner's self-hosted macOS 26
+# runner (label `runtime-26`), the only place with the virtualization Apple
+# `container` needs. No secrets, read-only permissions, and third-party
+# actions pinned to full commit SHAs (findings.md, spike 1.3).
+#
+# The run checks the installed candidate against the compatibility matrix
+# (read-only `--help` checks) and runs the live tier against it (disposable
+# `shimtest-` objects only, never a prune). The report is uploaded even when
+# the run fails, so a failed validation still leaves an artifact.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Runtime (supported container release)
+    if: github.repository == 'fparrav/docker-for-apple-container' && github.ref == 'refs/heads/main'
+    environment: runtime
+    runs-on: [self-hosted, macOS, runtime-26]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+      - name: Initialize report
+        run: printf '# Runtime validation\n\nValidation did not produce a complete report. Check the workflow log for the failure.\n' > runtime-report.md
+      - name: Validate the supported container release
+        # The runner's Apple `container` binary (Homebrew, Apple silicon).
+        # The read-only matrix check and the live tier both run against it;
+        # the step fails when the candidate is missing a matrix flag or a
+        # live test fails.
+        run: python3 scripts/validate-runtime.py --container /opt/homebrew/bin/container --output runtime-report.md
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-report
+          path: runtime-report.md

@@ -2397,10 +2397,10 @@
     "id": "docker version",
     "kind": "command",
     "status": "SUPPORTED",
-    "apple": null,
-    "evidence": "fake",
-    "test": null,
-    "note": "Renders a Docker-shaped client/server version from Apple CLI and apiserver status."
+    "apple": "container --version; container system status",
+    "evidence": "unit",
+    "test": "test_cli.VersionFormatTests.test_version_json_and_plain_output",
+    "note": "Plain output includes the Apple CLI/client-server shape and the shim version."
   },
   {
     "id": "docker volume create",

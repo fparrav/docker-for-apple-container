@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import json
 
-import test_cli
+try:
+    import test_cli
+except ModuleNotFoundError:
+    from tests import test_cli
 
 TIER = "fake"
 

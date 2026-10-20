@@ -88,7 +88,7 @@ def check_entry(entry: dict, container: str, cache: dict) -> str:
 
 
 def run_live(container: str) -> tuple:
-    """Run the live tier; return (ran, {test id: outcome}, raw output)."""
+    """Run the live tier; return (ran, {test id: outcome}, raw output, exit code)."""
     env = dict(os.environ, SHIM_TIERS="live", CONTAINER_DOCKER_SHIM_CONTAINER=container)
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests"), "-p", "test_live_*.py", "-v"],
@@ -111,7 +111,12 @@ def run_live(container: str) -> tuple:
         outcomes[test_id] = (
             "passed" if outcome == "ok" else ("not run" if outcome.startswith("skipped") else "FAILED")
         )
-    return bool(outcomes) and any(v != "not run" for v in outcomes.values()), outcomes, result.stdout + result.stderr
+    return (
+        bool(outcomes) and any(v != "not run" for v in outcomes.values()),
+        outcomes,
+        result.stdout + result.stderr,
+        result.returncode,
+    )
 
 
 def main(argv: list = None) -> int:
@@ -142,15 +147,20 @@ def main(argv: list = None) -> int:
     cache: dict = {}
     apple = {entry["id"]: check_entry(entry, args.container, cache) for entry in entries}
 
-    live_ran, outcomes = False, {}
+    live_ran, outcomes, live_output, live_returncode = False, {}, "", 0
     if args.skip_live:
         lines.append("live tier         : not run (--skip-live)")
     else:
-        live_ran, outcomes, _ = run_live(args.container)
-        lines.append("live tier         : " + ("ran" if live_ran else "not run (skipped or runtime unavailable)"))
+        live_ran, outcomes, live_output, live_returncode = run_live(args.container)
+        if live_returncode:
+            print("live test runner failed:", file=sys.stderr)
+            print(live_output, file=sys.stderr, end="" if live_output.endswith("\n") else "\n")
+            lines.append(f"live tier         : failed (runner exit {live_returncode})")
+        else:
+            lines.append("live tier         : " + ("ran" if live_ran else "not run (skipped or runtime unavailable)"))
 
     rows = ["", "| id | claimed | apple side | live test |", "| --- | --- | --- | --- |"]
-    problems = 0
+    problems = int(bool(live_returncode))
     for entry in entries:
         claimed = entry["evidence"]
         test = entry.get("test")

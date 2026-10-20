@@ -27,7 +27,10 @@ from __future__ import annotations
 import datetime
 import json
 
-import test_cli
+try:
+    import test_cli
+except ModuleNotFoundError:
+    from tests import test_cli
 
 TIER = "fake"
 
@@ -37,6 +40,7 @@ class HermesContractTests(test_cli.ShimCLITestCase):
         version = self.docker("version")
         self.assertEqual(version.returncode, 0, version.stderr)
         self.assertIn("container CLI version 1.5.0", version.stdout)
+        self.assertRegex(version.stdout, r"(?m)^Shim: .+$")
 
         image = self.docker(
             "image",

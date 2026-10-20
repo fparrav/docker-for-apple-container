@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
 import tiers  # noqa: E402
+import _outcomes  # noqa: E402
 
 TIER = "live"
 
@@ -234,7 +235,7 @@ class LiveFixtureTests(unittest.TestCase):
         try:
             images = _run([_container(), "image", "ls"])
         except (OSError, subprocess.SubprocessError) as exc:
-            self.skipTest(f"container image ls failed: {exc}")
+            self.skipTest(f"{_outcomes.LIVE_IMAGES_LS_FAILED_PREFIX} {exc}")
         listing = images.stdout + images.stderr
         missing = [
             reference
@@ -243,7 +244,10 @@ class LiveFixtureTests(unittest.TestCase):
             or not _image_available(listing, *reference.split(":", 1))
         ]
         if missing:
-            self.skipTest(f"images {', '.join(missing)} not available locally")
+            self.skipTest(
+                f"{_outcomes.LIVE_IMAGES_NOT_LOCAL_PREFIX}{', '.join(missing)}"
+                f"{_outcomes.LIVE_IMAGES_NOT_LOCAL_SUFFIX}"
+            )
 
     # -- helpers ---------------------------------------------------------
 

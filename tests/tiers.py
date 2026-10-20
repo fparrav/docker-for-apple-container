@@ -2,9 +2,9 @@
 
 The suite runs in four tiers (see ``docs/testing.md``): ``unit`` and ``fake``
 always run; ``live`` and ``conformance`` are opt-in through ``SHIM_TIERS``
-(comma-separated). A tier that is enabled but cannot run (no ``container``
-runtime, a release other than the supported one, no Engine client) is
-reported as skipped with the reason, never as passed.
+(comma-separated). A tier that is enabled but cannot run (live: no usable
+``container`` runtime; conformance: no reachable Docker Engine) is reported
+as skipped with the reason, never as passed.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION  # noqa: E402
+
+import _outcomes  # noqa: E402
 
 TIERS_ENV = "SHIM_TIERS"
 CONFORMANCE_DOCKER_ENV = "SHIM_CONFORMANCE_DOCKER"
@@ -56,6 +58,23 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
     container = os.environ.get(CONTAINER_BIN_ENV) or args[0]
     return subprocess.run(
         [container, *args[1:]],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=RUN_TIMEOUT_SECONDS,
+    )
+
+
+def _run_argv(args: list[str]) -> subprocess.CompletedProcess:
+    """Run ``args`` verbatim with captured output.
+
+    Unlike :func:`_run`, no binary override is applied: the conformance gate
+    must invoke the client named by ``SHIM_CONFORMANCE_DOCKER`` itself, never
+    the Apple ``container`` binary that ``CONTAINER_DOCKER_SHIM_CONTAINER``
+    points at.
+    """
+    return subprocess.run(
+        args,
         capture_output=True,
         text=True,
         check=False,
@@ -98,6 +117,30 @@ def runtime_skip_reason(run: Runner | None = None) -> str | None:
     return None
 
 
+def engine_skip_reason(run: Runner | None = None) -> str | None:
+    """Return ``None`` when the configured Docker Engine answers, else the reason.
+
+    The conformance tier's gate: it runs ``info`` with the client named by
+    ``SHIM_CONFORMANCE_DOCKER`` and requires a successful answer. The Apple
+    ``container`` runtime is never probed, so the tier can run on a
+    Docker-only host. The reason is a human-readable string for skip
+    messages: the client variable is unset, the client cannot be executed, or
+    ``info`` exits non-zero.
+    """
+    client = os.environ.get(CONFORMANCE_DOCKER_ENV)
+    if not client:
+        return f"{CONFORMANCE_DOCKER_ENV} is not set"
+    runner = run if run is not None else _run_argv
+    try:
+        proc = runner([client, "info"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"Docker Engine not available: {exc}"
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if proc.returncode != 0:
+        return f"Docker Engine info exited {proc.returncode}: {output}"
+    return None
+
+
 def live_tier(run: Runner | None = None):
     """Decorator that runs a test only when the live tier is enabled and usable.
 
@@ -109,12 +152,12 @@ def live_tier(run: Runner | None = None):
         @functools.wraps(func)
         def wrapper(*args: object, **kwargs: object) -> object:
             if "live" not in enabled_tiers():
-                raise unittest.SkipTest(
-                    f"live tier disabled: set {TIERS_ENV}=live to run live tests"
-                )
+                raise unittest.SkipTest(_outcomes.LIVE_TIER_DISABLED)
             reason = runtime_skip_reason(run)
             if reason is not None:
-                raise unittest.SkipTest(f"live tier cannot run: {reason}")
+                raise unittest.SkipTest(
+                    f"{_outcomes.LIVE_TIER_CANNOT_RUN_PREFIX} {reason}"
+                )
             return func(*args, **kwargs)
 
         return wrapper
@@ -127,27 +170,25 @@ def conformance_tier(run: Runner | None = None):
 
     Requires ``SHIM_TIERS`` to contain ``conformance``,
     ``SHIM_CONFORMANCE_DOCKER`` to point at a real Docker Engine client
-    (a bare ``docker`` on this machine would be the shim itself), and the
-    same usable runtime the live tier needs: the shim side of a comparison
-    still runs on the supported Apple ``container`` release.
+    (a bare ``docker`` on this machine would be the shim itself), and that
+    client to answer ``info`` (see :func:`engine_skip_reason`). The gate
+    never probes the Apple ``container`` runtime, so the tier runs on a
+    Docker-only host; the ``live`` tier is the one that needs the supported
+    Apple release.
     """
 
     def decorator(func: Callable[..., object]):
         @functools.wraps(func)
         def wrapper(*args: object, **kwargs: object) -> object:
             if "conformance" not in enabled_tiers():
-                raise unittest.SkipTest(
-                    f"conformance tier disabled: set {TIERS_ENV}=conformance "
-                    f"and {CONFORMANCE_DOCKER_ENV} to run conformance tests"
-                )
+                raise unittest.SkipTest(_outcomes.CONFORMANCE_TIER_DISABLED)
             if not os.environ.get(CONFORMANCE_DOCKER_ENV):
-                raise unittest.SkipTest(
-                    f"conformance tier cannot run: {CONFORMANCE_DOCKER_ENV} "
-                    "is not set"
-                )
-            reason = runtime_skip_reason(run)
+                raise unittest.SkipTest(_outcomes.CONFORMANCE_DOCKER_NOT_SET)
+            reason = engine_skip_reason(run)
             if reason is not None:
-                raise unittest.SkipTest(f"conformance tier cannot run: {reason}")
+                raise unittest.SkipTest(
+                    f"{_outcomes.CONFORMANCE_TIER_CANNOT_RUN_PREFIX} {reason}"
+                )
             return func(*args, **kwargs)
 
         return wrapper
