@@ -4,12 +4,16 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+import json
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 import test_cli
+from container_docker_shim.compose_ps import render_json
 
 TIER = "fake"
 
-ROOT = Path(__file__).resolve().parents[1]
 DOCKER = ROOT / "bin" / "docker"
 
 # The shared fake in test_cli always exits 0 from `run`/`exec` and only ever
@@ -101,6 +105,30 @@ class AgentContractTests(test_cli.ShimCLITestCase):
         super().setUp()
         self.fake.write_text(AGENT_FAKE_CONTAINER)
         self.fake.chmod(0o755)
+
+    def test_generic_compose_ps_json_contract(self) -> None:
+        record = json.loads(render_json([{
+            "id": "0123456789abcdef", "name": "svc-1", "image": "alpine",
+            "state": "running", "path": "sleep", "args": ["infinity"],
+            "labels": {"com.docker.compose.project": "p", "com.docker.compose.service": "svc"},
+        }]))
+        self.assertEqual(record["Service"], "svc")
+        self.assertEqual(record["State"], "running")
+        self.assertEqual(record["Project"], "p")
+        self.assertIsInstance(record["ExitCode"], int)
+        self.assertIsInstance(record["Publishers"], list)
+
+    def test_version_probe_formats_are_agent_safe(self) -> None:
+        json_result = self.docker("version", "--format", "json")
+        client = self.docker("version", "--format", "{{.Client.Version}}")
+        server = self.docker("version", "-f", "{{.Server.Version}}")
+        for result in (json_result, client, server):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(json_result.stdout)
+        self.assertIsInstance(payload["Client"]["Version"], str)
+        self.assertIsInstance(payload["Server"]["Version"], str)
+        self.assertEqual(client.stdout.strip(), payload["Client"]["Version"])
+        self.assertEqual(server.stdout.strip(), payload["Server"]["Version"])
 
     def _create_container(self, name: str) -> None:
         result = self.docker(

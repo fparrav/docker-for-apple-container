@@ -1031,6 +1031,50 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertIn("demo-web-1", ps.stdout)
         self.assertIn("web", ps.stdout)
 
+    def test_ps_json_and_quiet_have_stable_output(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        self.docker("compose", "up", "-d")
+        ps = self.docker("compose", "ps", "--format", "json")
+        self.assertEqual(ps.returncode, 0, ps.stderr)
+        record = json.loads(ps.stdout)
+        self.assertEqual(record["Service"], "web")
+        self.assertEqual(record["State"], "running")
+        self.assertIsInstance(record["ExitCode"], int)
+        quiet = self.docker("compose", "ps", "-q")
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(len(quiet.stdout.splitlines()), 1)
+        self.assertNotIn("NAME", quiet.stdout)
+
+    def test_ps_services_status_and_service_filters(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+              worker:
+                image: busybox:latest
+                command: ["sh", "-c", "sleep 600"]
+            """
+        )
+        self.docker("compose", "up", "-d")
+        services = self.docker("compose", "ps", "--services")
+        self.assertEqual(services.returncode, 0, services.stderr)
+        self.assertEqual(services.stdout.splitlines(), ["web", "worker"])
+        filtered = self.docker("compose", "ps", "worker", "--status", "running", "--format=json")
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        self.assertEqual(json.loads(filtered.stdout)["Service"], "worker")
+
+    def test_ps_refuses_templates_without_stdout(self) -> None:
+        ps = self.docker("compose", "ps", "--format", "{{.Name}}")
+        self.assertEqual(ps.returncode, 64)
+        self.assertEqual(ps.stdout, "")
+
     def test_down_removes_only_owned_resources(self) -> None:
         self.write_compose(
             """

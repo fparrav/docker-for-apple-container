@@ -513,6 +513,12 @@ if args and args[0] == "export":
     raise SystemExit(0)
 
 if args and args[0] in ("network", "volume"):
+    if (
+        args[:2] == ["volume", "inspect"]
+        and os.environ.get("FAKE_CONTAINER_MISSING_VOLUME") == (args[2] if len(args) > 2 else "")
+    ):
+        print("volume not found", file=sys.stderr)
+        raise SystemExit(1)
     print(args[0].upper() + " " + " ".join(args[1:]))
     raise SystemExit(0)
 
@@ -1129,14 +1135,21 @@ class CLIContractTests(ShimCLITestCase):
 
     def test_stop_forwards_signal(self) -> None:
         self.docker("run", "-d", "--name", "s1", "alpine", "sleep", "infinity")
-        self.clear_container_calls()
+        for given in ("TERM", "SIGTERM", "15"):
+            with self.subTest(signal=given):
+                self.clear_container_calls()
+                result = self.docker("stop", "--signal=" + given, "s1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.container_calls(),
+                    [["stop", "--signal", "SIGTERM", "s1"]],
+                )
 
-        result = self.docker("stop", "--signal=TERM", "s1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.container_calls(),
-            [["stop", "--signal", "TERM", "s1"]],
-        )
+    def test_stop_refuses_invalid_signal_before_runtime_call(self) -> None:
+        result = self.docker("stop", "-s", "NOT_A_SIGNAL", "s1")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("unsupported Docker signal", result.stderr)
+        self.assertEqual(self.container_calls(), [])
 
     def test_rmi_aliases_image_rm(self) -> None:
         result = self.docker("rmi", "alpine:latest")
@@ -1232,9 +1245,17 @@ class CLIContractTests(ShimCLITestCase):
         self.assertEqual(result.stdout.strip(), "apple-container")
 
     def test_kill_passes_through(self) -> None:
-        result = self.docker("kill", "-s", "TERM", "k1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "KILL -s TERM k1")
+        for given in ("TERM", "SIGTERM", "15"):
+            with self.subTest(signal=given):
+                result = self.docker("kill", "-s", given, "k1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "KILL -s SIGTERM k1")
+
+    def test_kill_refuses_invalid_signal_before_runtime_call(self) -> None:
+        result = self.docker("kill", "--signal", "NOT_A_SIGNAL", "k1")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("unsupported Docker signal", result.stderr)
+        self.assertEqual(self.container_calls(), [])
 
     def test_pull_forwards_to_image_pull(self) -> None:
         result = self.docker("pull", "alpine:latest")
@@ -1334,6 +1355,32 @@ class ContainerResolutionTests(ShimCLITestCase):
         self.assertIn("PATH", result.stderr)
 
 
+class VersionFormatTests(ShimCLITestCase):
+    def test_version_client_template(self) -> None:
+        result = self.docker("version", "--format", "{{.Client.Version}}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.5.0")
+
+    def test_version_server_template_short_alias(self) -> None:
+        result = self.docker("version", "-f", "{{.Server.Version}}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.5.0")
+
+    def test_version_json_and_plain_output(self) -> None:
+        plain = self.docker("version")
+        formatted = self.docker("version", "--format", "json")
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(formatted.returncode, 0, formatted.stderr)
+        self.assertIn("Client:\n Version:", plain.stdout)
+        payload = json.loads(formatted.stdout)
+        self.assertEqual(payload, {"Client": {"Version": "1.5.0"}, "Server": {"Version": "1.5.0"}})
+
+    def test_version_refuses_unbounded_template(self) -> None:
+        result = self.docker("version", "--format", "{{json .}}")
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, "")
+
+
 class RunSecurityRefusalTests(ShimCLITestCase):
     def _no_run_or_create_calls(self) -> None:
         called = [
@@ -1431,6 +1478,399 @@ class RunSecurityRefusalTests(ShimCLITestCase):
         self.assertNotIn("names no waivable option", result.stderr)
 
 
+class CPUSharesRefusalTests(ShimCLITestCase):
+    """Task 2.1: refuse Docker -c, --cpu-shares, and combined -cN forms.
+
+    Docker -c/--cpu-shares sets CPU weight shares (a relative fraction of CPU
+    time). Apple container --cpus specifies an integer count of CPUs. The
+    shim refuses both with exit 64 and a message naming both meanings.
+    """
+
+    def _no_run_or_create_calls(self) -> None:
+        called = [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] in (["run"], ["create"])
+        ]
+        self.assertEqual(called, [], f"shim must not call container: {called}")
+
+    def test_run_short_cpu_shares_is_refused(self) -> None:
+        result = self.docker("run", "-c", "2", "alpine", "sleep", "infinity")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-c", result.stderr)
+        self.assertIn("cpu-shares", result.stderr)
+        self.assertIn("--cpus", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_run_combined_short_cpu_shares_is_refused(self) -> None:
+        result = self.docker("run", "-c2", "alpine", "sleep", "infinity")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-c", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_run_long_cpu_shares_is_refused(self) -> None:
+        result = self.docker(
+            "run", "--cpu-shares", "512", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--cpu-shares", result.stderr)
+        self.assertIn("--cpus", result.stderr)
+        self.assertIn("CPU weight shares", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_create_short_cpu_shares_is_refused(self) -> None:
+        result = self.docker("create", "-c2", "alpine", "sleep", "infinity")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-c", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_build_short_cpu_shares_is_refused(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        result = self.docker("build", "-c", "512", ".")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-c", result.stderr)
+        self.assertIn("--cpus", result.stderr)
+
+    def test_build_long_cpu_shares_is_refused(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        result = self.docker("build", "--cpu-shares", "512", ".")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--cpu-shares", result.stderr)
+        self.assertIn("--cpus", result.stderr)
+
+    def test_build_cpu_shares_inline_value_is_refused(self) -> None:
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(self.root / "build-args.json")
+        result = self.docker("build", "--cpu-shares=512", ".")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--cpu-shares", result.stderr)
+
+    def test_run_long_cpus_still_works(self) -> None:
+        """--cpus must remain functional after -c refusal."""
+        result = self.docker(
+            "run", "-d", "--cpus", "2", "--name", "cpu-check", "alpine",
+            "sleep", "infinity",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class NetworkModeTests(ShimCLITestCase):
+    """Task 2.2: `--network` values follow Docker's network-mode semantics.
+
+    `none`, `host` and `container:NAME` are refused with exit 64 and no
+    container created; `bridge` and `default` map to Apple's default network
+    (the flag is omitted); any other value is forwarded verbatim as the name
+    of an existing network.
+    """
+
+    def _no_run_or_create_calls(self) -> None:
+        called = [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] in (["run"], ["create"])
+        ]
+        self.assertEqual(called, [], f"shim must not call container: {called}")
+
+    def _run_calls(self) -> list[list[str]]:
+        return [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] == ["run"]
+        ]
+
+    def _attached_networks(self, name: str) -> list[str]:
+        state = json.loads(Path(self.env["FAKE_CONTAINER_STATE"]).read_text())
+        item = state["containers"][name]
+        return [net["network"] for net in item["status"]["networks"]]
+
+    def test_none_is_refused_without_container(self) -> None:
+        result = self.docker(
+            "run", "-d", "--network=none", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("none", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_host_is_refused_without_container(self) -> None:
+        result = self.docker(
+            "run", "-d", "--network", "host", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("host", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_container_mode_is_refused_without_container(self) -> None:
+        result = self.docker(
+            "run",
+            "-d",
+            "--network",
+            "container:other",
+            "alpine",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("container:other", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_bridge_maps_to_apple_default_network(self) -> None:
+        result = self.docker(
+            "run",
+            "-d",
+            "--name",
+            "bridge-net",
+            "--network",
+            "bridge",
+            "alpine",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_calls = self._run_calls()
+        self.assertEqual(len(run_calls), 1)
+        # The flag is omitted so Apple attaches its own default network.
+        self.assertNotIn("--network", run_calls[0])
+        self.assertEqual(self._attached_networks("bridge-net"), ["default"])
+
+    def test_default_maps_to_apple_default_network(self) -> None:
+        result = self.docker(
+            "run",
+            "-d",
+            "--name",
+            "default-net",
+            "--network",
+            "default",
+            "alpine",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_calls = self._run_calls()
+        self.assertEqual(len(run_calls), 1)
+        self.assertNotIn("--network", run_calls[0])
+        self.assertEqual(self._attached_networks("default-net"), ["default"])
+
+    def test_named_network_is_forwarded_verbatim(self) -> None:
+        result = self.docker(
+            "run",
+            "-d",
+            "--name",
+            "named-net",
+            "--network",
+            "mynet",
+            "alpine",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_calls = self._run_calls()
+        self.assertEqual(len(run_calls), 1)
+        self.assertEqual(run_calls[0][run_calls[0].index("--network") + 1], "mynet")
+        self.assertEqual(self._attached_networks("named-net"), ["mynet"])
+
+
+class RuntimeRefusalTests(ShimCLITestCase):
+    """Task 2.2: refuse `--runtime` (Docker OCI runtime vs Apple handler).
+
+    Docker --runtime selects an OCI runtime (runc); Apple container
+    --runtime selects a container runtime handler. The meanings differ, so
+    the option is refused with exit 64 and no container is created.
+    """
+
+    def _no_run_or_create_calls(self) -> None:
+        called = [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] in (["run"], ["create"])
+        ]
+        self.assertEqual(called, [], f"shim must not call container: {called}")
+
+    def test_run_runtime_is_refused(self) -> None:
+        result = self.docker(
+            "run", "-d", "--runtime", "runc", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--runtime", result.stderr)
+        self.assertIn("OCI runtime", result.stderr)
+        self.assertIn("runtime handler", result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_run_runtime_inline_is_refused(self) -> None:
+        result = self.docker(
+            "run", "-d", "--runtime=runc", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self._no_run_or_create_calls()
+
+    def test_create_runtime_is_refused(self) -> None:
+        result = self.docker(
+            "create", "--runtime", "runc", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--runtime", result.stderr)
+        self._no_run_or_create_calls()
+
+
+class MemoryCpusValueTests(ShimCLITestCase):
+    """Task 2.3: memory and CPU values follow Docker's unit semantics.
+
+    Docker reads a bare --memory number as bytes; Apple container memory has
+    1 MiB granularity and reads a bare number as MiB. Bare values that are
+    exact multiples of 1 MiB are converted (536870912 -> 512M); sub-MiB and
+    non-multiple values are refused with exit 64. Apple container 1.5.0
+    accepts only whole CPU counts (spike C1), so fractional --cpus values are
+    refused and integral values are normalised (2.0 -> 2).
+    """
+
+    # (value, argv value forwarded to Apple, container memoryInBytes)
+    ACCEPTED_MEMORY = [
+        ("536870912", "512M", 536870912),
+        ("1048576", "1M", 1048576),
+        ("268435456", "256M", 268435456),
+        ("256m", "256M", 256 * 1024**2),
+        ("2g", "2G", 2 * 1024**3),
+        ("512k", "512K", 512 * 1024),
+    ]
+    # (value, marker the refusal message must name)
+    REFUSED_MEMORY = [
+        ("0", "granularity"),
+        ("512", "granularity"),
+        ("1023", "granularity"),
+        ("1048575", "granularity"),
+        ("1048577", "whole number"),
+        ("1048578", "whole number"),
+    ]
+    # (value, argv value forwarded to Apple, container cpus)
+    ACCEPTED_CPUS = [
+        ("2", "2", 2),
+        ("2.0", "2", 2),
+        ("1", "1", 1),
+        ("4", "4", 4),
+    ]
+    REFUSED_CPUS = ["0.5", "1.5", "2.5", "0.1"]
+
+    def _no_run_or_create_calls(self) -> None:
+        called = [
+            entry
+            for entry in self.container_calls()
+            if entry[:1] in (["run"], ["create"])
+        ]
+        self.assertEqual(called, [], f"shim must not call container: {called}")
+
+    def _run_entries(self) -> list[list[str]]:
+        return [entry for entry in self.container_calls() if entry[:1] == ["run"]]
+
+    def _forwarded_value(self, option: str) -> str:
+        runs = self._run_entries()
+        self.assertEqual(len(runs), 1, f"expected one run call, got {runs}")
+        return runs[0][runs[0].index(option) + 1]
+
+    def _resources(self, name: str) -> dict:
+        state = json.loads(Path(self.env["FAKE_CONTAINER_STATE"]).read_text())
+        return state["containers"][name]["configuration"]["resources"]
+
+    def test_memory_values_are_converted_or_refused(self) -> None:
+        for given, expected, bytes_ in self.ACCEPTED_MEMORY:
+            with self.subTest(value=given):
+                self.clear_container_calls()
+                result = self.docker(
+                    "run", "-d", "--name", "mem", "--memory", given,
+                    "alpine", "sleep", "infinity",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._forwarded_value("--memory"), expected)
+                self.assertEqual(self._resources("mem")["memoryInBytes"], bytes_)
+
+        for given, marker in self.REFUSED_MEMORY:
+            with self.subTest(value=given):
+                self.clear_container_calls()
+                result = self.docker(
+                    "run", "-d", "--name", "mem", "--memory", given,
+                    "alpine", "sleep", "infinity",
+                )
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("--memory", result.stderr)
+                self.assertIn(marker, result.stderr)
+                self._no_run_or_create_calls()
+
+    def test_memory_short_and_inline_forms(self) -> None:
+        result = self.docker(
+            "run", "-d", "--name", "mem", "-m", "2g", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._forwarded_value("--memory"), "2G")
+
+        self.clear_container_calls()
+        result = self.docker(
+            "run", "-d", "--name", "mem", "-m", "512", "alpine", "sleep", "infinity"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("-m", result.stderr)
+        self.assertIn("granularity", result.stderr)
+        self._no_run_or_create_calls()
+
+        result = self.docker(
+            "run",
+            "-d",
+            "--name",
+            "mem",
+            "--memory=536870912",
+            "alpine",
+            "sleep",
+            "infinity",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._forwarded_value("--memory"), "512M")
+
+    def test_cpus_values_are_applied_or_refused(self) -> None:
+        for given, expected, cpus in self.ACCEPTED_CPUS:
+            with self.subTest(value=given):
+                self.clear_container_calls()
+                result = self.docker(
+                    "run", "-d", "--name", "cpu", "--cpus", given,
+                    "alpine", "sleep", "infinity",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._forwarded_value("--cpus"), expected)
+                self.assertEqual(self._resources("cpu")["cpus"], cpus)
+
+        for given in self.REFUSED_CPUS:
+            with self.subTest(value=given):
+                self.clear_container_calls()
+                result = self.docker(
+                    "run", "-d", "--name", "cpu", "--cpus", given,
+                    "alpine", "sleep", "infinity",
+                )
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("--cpus", result.stderr)
+                self.assertIn("fractional", result.stderr)
+                self._no_run_or_create_calls()
+
+    def test_build_memory_and_cpus_follow_the_same_rules(self) -> None:
+        args_path = self.root / "build-args.json"
+        self.env["FAKE_CONTAINER_BUILD_ARGS"] = str(args_path)
+
+        result = self.docker(
+            "build", "--memory", "536870912", "--cpus", "2", "."
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(args_path.read_text())
+        self.assertEqual(args[args.index("--memory") + 1], "512M")
+        self.assertEqual(args[args.index("--cpus") + 1], "2")
+
+        args_path.unlink()
+        result = self.docker("build", "--memory", "512", ".")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--memory", result.stderr)
+        self.assertIn("granularity", result.stderr)
+        self.assertFalse(args_path.exists(), "no build must start")
+
+        result = self.docker("build", "--cpus", "0.5", ".")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--cpus", result.stderr)
+        self.assertIn("fractional", result.stderr)
+        self.assertFalse(args_path.exists(), "no build must start")
+
+
 class RunTmpfsForwardingTests(ShimCLITestCase):
     """`run --tmpfs` is forwarded verbatim (including options) to Apple `container run`.
 
@@ -1476,6 +1916,120 @@ class RunTmpfsForwardingTests(ShimCLITestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self._assert_forwarded_pair("--name", "probe")
         self._assert_forwarded_pair("--tmpfs", "/tmp")
+
+
+class RunMountTranslationTests(ShimCLITestCase):
+    def _run_entries(self) -> list[list[str]]:
+        return [entry for entry in self.container_calls() if entry[:1] == ["run"]]
+
+    def _create_entries(self) -> list[list[str]]:
+        return [entry for entry in self.container_calls() if entry[:1] == ["create"]]
+
+    def test_short_named_volume_is_emitted_as_volume_mount(self) -> None:
+        result = self.docker("run", "-v", "cache:/cache", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--mount", self._run_entries()[0])
+        args = self._run_entries()[0]
+        self.assertIn("type=volume,source=cache,target=/cache", args)
+
+    def test_long_mount_aliases_translate_to_apple_dialect(self) -> None:
+        result = self.docker(
+            "run", "--mount", "type=bind,src=./data,dst=/data,ro", "alpine", "true"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self._run_entries()[0]
+        spec = args[args.index("--mount") + 1]
+        self.assertIn("type=bind,source=", spec)
+        self.assertIn(",target=/data,readonly", spec)
+
+    def test_unknown_mount_key_is_refused_before_runtime_call(self) -> None:
+        result = self.docker(
+            "run", "--mount", "type=bind,source=/tmp,target=/data,bind-propagation=rshared",
+            "alpine", "true",
+        )
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("bind-propagation", result.stderr)
+        self.assertFalse(self._run_entries())
+
+    def test_selinux_volume_mode_is_refused_before_runtime_call(self) -> None:
+        for spec in ("cache:/cache:z", "cache:/cache:Z", "/host:/data:z", "./data:/data:Z"):
+            result = self.docker("run", "-v", spec, "alpine", "true")
+            self.assertEqual(result.returncode, 64, f"{spec}: {result.stderr}")
+            self.assertIn("SELinux", result.stderr, f"{spec}: {result.stderr}")
+            self.assertFalse(self._run_entries(), f"{spec}: {result.stderr}")
+
+    def test_named_volume_is_created_before_the_run(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "cache"
+        result = self.docker("run", "-v", "cache:/cache:ro", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.container_calls()
+        self.assertEqual(calls[:2], [["volume", "inspect", "cache"], ["volume", "create", "cache"]])
+        run = next(entry for entry in calls if entry[:1] == ["run"])
+        mount = run[run.index("--mount") + 1]
+        self.assertEqual(mount, "type=volume,source=cache,target=/cache,readonly")
+
+    def _assert_no_volume_calls(self) -> None:
+        self.assertFalse(
+            [entry for entry in self.container_calls() if entry[:1] == ["volume"]],
+            f"volume side effect must not run: {self.container_calls()}",
+        )
+
+    def test_invalid_later_option_does_not_touch_named_volume(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "cache"
+        result = self.docker(
+            "run", "-v", "cache:/cache", "--bogus-flag", "alpine", "true"
+        )
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("--bogus-flag", result.stderr)
+        self.assertFalse(self._run_entries())
+        self._assert_no_volume_calls()
+
+    def test_missing_image_does_not_touch_named_volume(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "cache"
+        result = self.docker("run", "-v", "cache:/cache")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("requires an image", result.stderr)
+        self.assertFalse(self._run_entries())
+        self._assert_no_volume_calls()
+
+    def test_valid_named_volume_run_inspects_creates_and_mounts(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "cache"
+        result = self.docker("run", "-v", "cache:/cache", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.container_calls()
+        self.assertEqual(
+            calls[:2],
+            [["volume", "inspect", "cache"], ["volume", "create", "cache"]],
+        )
+        run = next(entry for entry in calls if entry[:1] == ["run"])
+        self.assertGreater(run.index("--mount"), 0)
+        self.assertEqual(run[run.index("--mount") + 1], "type=volume,source=cache,target=/cache")
+        self.assertEqual(calls.index(run), 2)
+
+    def test_create_detach_with_named_volume_is_refused_without_side_effect(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "newname"
+        result = self.docker("create", "-d", "-v", "newname:/data", "alpine")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("detach", result.stderr)
+        self._assert_no_volume_calls()
+        self.assertFalse(self._create_entries())
+
+    def test_create_with_named_volume_inspects_creates_and_mounts(self) -> None:
+        self.env["FAKE_CONTAINER_MISSING_VOLUME"] = "cache"
+        result = self.docker("create", "-v", "cache:/cache", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.container_calls()
+        self.assertEqual(
+            calls[:2],
+            [["volume", "inspect", "cache"], ["volume", "create", "cache"]],
+        )
+        create = next(entry for entry in calls if entry[:1] == ["create"])
+        self.assertGreater(create.index("--mount"), 0)
+        self.assertEqual(
+            create[create.index("--mount") + 1],
+            "type=volume,source=cache,target=/cache",
+        )
+        self.assertEqual(calls.index(create), 2)
 
 
 class RunCapabilityPassthroughTests(ShimCLITestCase):

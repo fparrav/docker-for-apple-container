@@ -1,0 +1,4 @@
+NAME                                  IMAGE          COMMAND               SERVICE   CREATED                  STATUS                              PORTS
+shimtest-cli-semantics-ps-created-1   busybox:1.36   "sh -c 'sleep 600'"   created   Less than a second ago   Created                             
+shimtest-cli-semantics-ps-exited-1    busybox:1.36   "sh -c 'exit 3'"      exited    Less than a second ago   Exited (3) Less than a second ago   
+shimtest-cli-semantics-ps-running-1   busybox:1.36   "sh -c 'sleep 600'"   running   Less than a second ago   Up Less than a second               

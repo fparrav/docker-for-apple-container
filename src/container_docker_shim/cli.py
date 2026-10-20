@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from . import compose_capabilities
+from . import mounts
 from . import security
 
 
@@ -129,7 +130,7 @@ def _take_value(argv: list[str], index: int, opt: str) -> tuple[str, int]:
     arg = argv[index]
     if arg.startswith("--") and "=" in arg:
         return arg.split("=", 1)[1], index + 1
-    if len(arg) > 2 and arg[0] == "-" and not arg.startswith("--") and arg[:2] in ("-e", "-v", "-w", "-u", "-m", "-p", "-f", "-t", "-c", "-o"):
+    if len(arg) > 2 and arg[0] == "-" and not arg.startswith("--") and arg[:2] in ("-e", "-v", "-w", "-u", "-m", "-p", "-f", "-t", "-c", "-o", "-s"):
         return arg[2:], index + 1
     if index + 1 >= len(argv):
         raise ShimError(f"{opt} requires a value", 64)
@@ -143,37 +144,73 @@ def _split_long(arg: str) -> tuple[str, str | None]:
     return arg, None
 
 
-def _normalize_memory(value: str) -> str:
+_MIB = 1024 * 1024
+
+
+def _normalize_memory(value: str, option: str = "--memory") -> str:
+    """Translate a Docker memory value into Apple container units.
+
+    Docker reads a bare number as bytes; Apple container memory has 1 MiB
+    granularity and reads a bare number as MiB. A bare value is converted to
+    MiB only when it is an exact multiple of 1 MiB (536870912 -> 512M);
+    anything else is refused, since forwarding it would change the size.
+    """
     if value and value[-1:] in ("k", "m", "g", "t", "p"):
         return value[:-1] + value[-1].upper()
-    return value
+    try:
+        size = int(value)
+    except ValueError:
+        return value
+    if size < _MIB:
+        detail = f"{value} is below the runtime's 1 MiB granularity"
+    elif size % _MIB != 0:
+        detail = f"{value} is not a whole number of MiB"
+    else:
+        return f"{size // _MIB}M"
+
+    raise ShimError(
+        f"{option} {detail}: Docker reads a bare number as bytes, but "
+        "Apple container reads it as MiB. Use an explicit unit "
+        "(e.g. 512M) or a multiple of 1048576 bytes.",
+        64,
+    )
+    return f"{size // _MIB}M"
 
 
-def _normalize_cpus(value: str) -> str:
+def _normalize_cpus(value: str, option: str = "--cpus") -> str:
+    """Apply a Docker --cpus value or refuse what Apple cannot represent.
+
+    Apple container 1.5.0 accepts only whole CPU counts (spike C1: 0.5 and
+    1.5 rejected, 2 accepted), so fractional values are refused instead of
+    rounded or forwarded; integral values are normalised to their whole form
+    (2.0 -> 2).
+    """
     try:
         parsed = float(value)
     except ValueError:
         return value
-    if parsed.is_integer():
-        return str(int(parsed))
-    return value
+    if not parsed.is_integer():
+        raise ShimError(
+            f"{option} {value} is fractional; Apple container 1.5.0 accepts "
+            "only whole CPU counts. Use an integer count instead.",
+            64,
+        )
+    return str(int(parsed))
 
 
-def _translate_volume(value: str) -> list[str]:
-    parts = value.split(":")
-    if len(parts) < 2:
-        raise ShimError(f"unsupported volume syntax: {value}", 64)
-    source = parts[0]
-    target = parts[1]
-    mode = ":".join(parts[2:]) if len(parts) > 2 else ""
-    mount = f"type=bind,source={source},target={target}"
-    if "ro" in {item.strip() for item in mode.replace(",", ":").split(":") if item.strip()}:
-        mount += ",readonly"
-    return ["--mount", mount]
-
-
-def _tmpfs_path(value: str) -> str:
-    return value
+def _normalize_signal(value: str) -> str:
+    """Normalize Docker signal aliases to the canonical SIG* spelling."""
+    token = value.strip().upper()
+    try:
+        if token.isdecimal():
+            parsed = signal.Signals(int(token))
+        else:
+            if not token.startswith("SIG"):
+                token = "SIG" + token
+            parsed = signal.Signals[token]
+    except (ValueError, KeyError):
+        raise ShimError(f"unsupported Docker signal: {value!r}", 64) from None
+    return parsed.name
 
 
 def _parse_key_value(value: str) -> tuple[str, str]:
@@ -949,8 +986,22 @@ def _render_template(
 
 
 def cmd_version(argv: list[str]) -> int:
-    if argv:
-        return _unsupported("version " + " ".join(argv))
+    fmt: str | None = None
+    i = 0
+    while i < len(argv):
+        arg, inline = _split_long(argv[i])
+        if arg in ("--format", "-f"):
+            fmt = inline
+            if fmt is None:
+                fmt, i = _take_value(argv, i, arg)
+                continue
+        else:
+            return _unsupported("version " + " ".join(argv))
+        i += 1
+    if fmt is not None and fmt not in {
+        "json", "{{.Client.Version}}", "{{.Server.Version}}"
+    }:
+        return _die(f"unsupported docker version format: {fmt}", 64)
     cli = _run_container_capture(["--version"])
     if cli.returncode != 0:
         _print_completed(cli)
@@ -962,6 +1013,13 @@ def cmd_version(argv: list[str]) -> int:
             sys.stderr.write("Apple container service is unavailable. Run: container system start\n")
         return status.returncode
     version = (cli.stdout or "").strip()
+    if fmt == "json":
+        print(json.dumps({"Client": {"Version": SUPPORTED_CONTAINER_VERSION},
+                          "Server": {"Version": SUPPORTED_CONTAINER_VERSION}}))
+        return 0
+    if fmt in ("{{.Client.Version}}", "{{.Server.Version}}"):
+        print(SUPPORTED_CONTAINER_VERSION)
+        return 0
     print("Client:")
     print(f" Version: {version}")
     print("Server:")
@@ -1377,7 +1435,6 @@ RUN_VALUE_OPTIONS = frozenset(
         "--env-file",
         "--platform",
         "--publish",
-        "--runtime",
         "--shm-size",
         "--ulimit",
     }
@@ -1385,7 +1442,14 @@ RUN_VALUE_OPTIONS = frozenset(
 RUN_BOOL_OPTIONS = frozenset({"--init", "--read-only", "--rm", "--no-dns"})
 # Common Docker run flags Apple `container run` has no equivalent for. Refuse
 # them with a clear message instead of forwarding a flag the CLI rejects opaquely.
-RUN_REFUSED_OPTIONS = frozenset({"--add-host", "--hostname"})
+RUN_REFUSED_OPTIONS = frozenset(
+    {
+        "-c",
+        "--add-host",
+        "--cpu-shares",
+        "--hostname",
+    }
+)
 # Flags matched by literal in the _parse_run_options if/elif chain.
 RUN_EXPLICIT_OPTIONS = frozenset(
     {
@@ -1415,24 +1479,46 @@ RUN_EXPLICIT_OPTIONS = frozenset(
         "--user",
         "-u",
         "--network",
+        "--runtime",
         "--security-opt",
         "--pids-limit",
         "--privileged",
         "--storage-opt",
         "-p",
-        "-c",
     }
 )
 
 
+def _ensure_named_volume(name: str) -> None:
+    """Create a Docker named volume on demand using Apple runtime state only."""
+    existing = _run_container_capture(["volume", "inspect", name])
+    if existing.returncode == 0:
+        return
+    created = _run_container_capture(["volume", "create", name])
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout).strip()
+        raise ShimError(
+            f"failed to create named volume {name!r}: {detail}",
+            created.returncode,
+        )
+
+
 def _parse_run_options(
     argv: list[str],
-) -> tuple[list[str], str | None, list[str], bool, str | None]:
+    ensure_volumes: bool = True,
+) -> tuple[list[str], str | None, list[str], bool, str | None, list[str]]:
     """Translate Docker `run`/`create` flags into Apple container flags.
 
-    Returns (opts, image, command, detach, name). `opts` never contains `-d`;
-    the caller decides whether to detach. Raises ShimError on unsupported input
-    so main() renders the standard clear error.
+    Returns (opts, image, command, detach, name, named_volumes). `opts` never
+    contains `-d`; the caller decides whether to detach. Raises ShimError on
+    unsupported input so main() renders the standard clear error.
+
+    The named-volume inspect/create side effect is deferred until the complete
+    argv has been parsed and the required image is present: an invalid later
+    option or a missing image must fail with exit 64 without touching runtime
+    volume state. When `ensure_volumes` is False the side effect is skipped and
+    the collected `named_volumes` are returned so the caller can perform the
+    inspect/create only after its own command-specific validation has passed.
     """
     value_options = RUN_VALUE_OPTIONS
     bool_options = RUN_BOOL_OPTIONS
@@ -1443,6 +1529,7 @@ def _parse_run_options(
     opts: list[str] = []
     image = None
     command: list[str] = []
+    named_volumes: list[str] = []
 
     i = 0
     while i < len(argv):
@@ -1487,23 +1574,35 @@ def _parse_run_options(
             continue
         elif arg in ("--volume", "-v"):
             value, i = _take_value(argv, i, arg)
-            opts.extend(_translate_volume(value))
+            try:
+                mount = mounts.parse_volume_spec(value)
+            except mounts.MountSpecError as error:
+                raise ShimError(str(error), 64) from error
+            if mount.kind == "volume":
+                named_volumes.append(mount.source)
+            opts.extend(mounts.emit(mount))
             continue
         elif arg == "--mount":
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--mount", value])
+            try:
+                mount = mounts.parse_mount_spec(value)
+            except mounts.MountSpecError as error:
+                raise ShimError(str(error), 64) from error
+            if mount.kind == "volume":
+                named_volumes.append(mount.source)
+            opts.extend(mounts.emit(mount))
             continue
         elif arg == "--tmpfs":
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--tmpfs", _tmpfs_path(value)])
+            opts.extend(mounts.emit_tmpfs(*value.split(":", 1)))
             continue
         elif arg in ("--memory", "-m"):
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--memory", _normalize_memory(value)])
+            opts.extend(["--memory", _normalize_memory(value, arg)])
             continue
         elif arg == "--cpus":
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--cpus", _normalize_cpus(value)])
+            opts.extend(["--cpus", _normalize_cpus(value, arg)])
             continue
         elif arg in ("--user", "-u"):
             value, i = _take_value(argv, i, arg)
@@ -1519,8 +1618,38 @@ def _parse_run_options(
                     ),
                     64,
                 )
+            if value == "host":
+                raise ShimError(
+                    compose_capabilities.refused(
+                        "Docker --network=host shares the host network "
+                        "namespace; Apple container 1.5.0 has no host network; "
+                        "refusing unsafe translation"
+                    ),
+                    64,
+                )
+            if value.startswith("container:"):
+                raise ShimError(
+                    compose_capabilities.refused(
+                        f"Docker --network={value} shares another container's "
+                        "network namespace; Apple container 1.5.0 has no "
+                        "container network mode; refusing unsafe translation"
+                    ),
+                    64,
+                )
+            if value in ("bridge", "default"):
+                # Docker's bridge/default is its default network; Apple's
+                # default network is used when --network is omitted.
+                continue
             opts.extend(["--network", value])
             continue
+        elif arg == "--runtime":
+            value, i = _take_value(argv, i, arg)
+            raise ShimError(
+                "Docker --runtime selects an OCI runtime (runc); Apple "
+                "container --runtime selects a container runtime handler. "
+                "The meanings differ, so the option is refused.",
+                64,
+            )
         elif arg in ("--security-opt", "--pids-limit", "--privileged", "--storage-opt"):
             if arg == "--privileged":
                 i += 1
@@ -1532,13 +1661,27 @@ def _parse_run_options(
             if decision.action == "skip":
                 print(compose_capabilities.not_applied(decision.message), file=sys.stderr)
             continue
+        elif arg == "-c":
+            value, i = _take_value(argv, i, arg)
+            raise ShimError(
+                "Docker -c / --cpu-shares sets CPU weight shares (a relative "
+                "fraction of CPU time); Apple container -c is a combined "
+                "form of --cpus specifying an integer count of CPUs. Use "
+                "--cpus <count> for Apple container CPU allocation.",
+                64,
+            )
+        elif arg == "--cpu-shares":
+            value, i = _take_value(argv, i, arg)
+            raise ShimError(
+                "Docker --cpu-shares sets CPU weight shares (a relative "
+                "fraction of CPU time); Apple container --cpus specifies an "
+                "integer count of CPUs. Use --cpus instead.",
+                64,
+            )
         elif arg in unsupported_apple_options:
             raise ShimError(f"unsupported docker run option for Apple container: {current}", 64)
-        elif arg in value_options or arg in ("-p", "-c"):
+        elif arg in value_options or arg == "-p":
             value, i = _take_value(argv, i, arg)
-            if arg == "-c":
-                opts.extend(["--cpus", _normalize_cpus(value)])
-                continue
             opts.extend([arg, value])
             continue
         elif arg in bool_options:
@@ -1549,7 +1692,10 @@ def _parse_run_options(
 
     if image is None:
         raise ShimError("run requires an image", 64)
-    return opts, image, command, detach, name
+    if ensure_volumes:
+        for volume_name in named_volumes:
+            _ensure_named_volume(volume_name)
+    return opts, image, command, detach, name, named_volumes
 
 
 def _print_new_container_id(result: subprocess.CompletedProcess[str], fallback: str | None) -> int:
@@ -1566,7 +1712,7 @@ def _print_new_container_id(result: subprocess.CompletedProcess[str], fallback: 
 
 
 def cmd_run(argv: list[str]) -> int:
-    opts, image, command, detach, name = _parse_run_options(argv)
+    opts, image, command, detach, name, _ = _parse_run_options(argv)
     if not detach:
         return _run_container_passthrough(["run", *opts, image, *command])
     if name is None:
@@ -1599,10 +1745,12 @@ BUILD_NOOP_OPTIONS = frozenset({"--rm", "--force-rm"})
 # a clear message instead of forwarding a flag the CLI rejects opaquely.
 BUILD_REFUSED_OPTIONS = frozenset(
     {
+        "-c",
         "--add-host",
         "--build-context",
         "--cache-from",
         "--cache-to",
+        "--cpu-shares",
         "--iidfile",
         "--load",
         "--network",
@@ -1622,7 +1770,6 @@ BUILD_EXPLICIT_OPTIONS = frozenset(
         "--memory",
         "-m",
         "--cpus",
-        "-c",
         "-o",
         "-q",
         "--ssh",
@@ -1676,12 +1823,19 @@ def translate_build_argv(argv: list[str]) -> tuple[list[str], str] | None:
             continue
         if arg in ("--memory", "-m"):
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--memory", _normalize_memory(value)])
+            opts.extend(["--memory", _normalize_memory(value, arg)])
             continue
-        if arg in ("--cpus", "-c"):
+        if arg == "--cpus":
             value, i = _take_value(argv, i, arg)
-            opts.extend(["--cpus", _normalize_cpus(value)])
+            opts.extend(["--cpus", _normalize_cpus(value, arg)])
             continue
+        if arg in ("-c", "--cpu-shares"):
+            raise ShimError(
+                f"Docker {arg} sets CPU weight shares (a relative fraction of "
+                f"CPU time); Apple container --cpus specifies an integer count "
+                f"of CPUs. Use --cpus instead.",
+                64,
+            )
         if arg in ("--output", "-o"):
             value, i = _take_value(argv, i, arg)
             opts.extend(["--output", value])
@@ -1786,9 +1940,37 @@ def cmd_start(argv: list[str]) -> int:
     return rc
 
 
+def cmd_kill(argv: list[str]) -> int:
+    signal_value: str | None = None
+    ids: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg, value = _split_long(argv[i])
+        if arg in ("-s", "--signal"):
+            if value is None:
+                value, i = _take_value(argv, i, arg)
+            else:
+                i += 1
+            signal_value = _normalize_signal(value)
+            continue
+        if argv[i].startswith("-"):
+            return _die(f"unsupported kill option: {argv[i]}", 64)
+        ids.append(argv[i])
+        i += 1
+    if not ids:
+        return _die("kill requires at least one container", 64)
+    args = ["kill"]
+    if signal_value is not None:
+        args.extend(["-s", signal_value])
+    args.extend(ids)
+    result = _run_container_capture(args)
+    _print_completed(result)
+    return result.returncode
+
+
 def cmd_stop(argv: list[str]) -> int:
     timeout = None
-    signal = None
+    signal_value = None
     ids: list[str] = []
     i = 0
     while i < len(argv):
@@ -1805,7 +1987,7 @@ def cmd_stop(argv: list[str]) -> int:
                 value, i = _take_value(argv, i, arg)
             else:
                 i += 1
-            signal = value
+            signal_value = _normalize_signal(value)
             continue
         elif argv[i].startswith("-"):
             return _die(f"unsupported stop option: {argv[i]}", 64)
@@ -1820,8 +2002,8 @@ def cmd_stop(argv: list[str]) -> int:
         args = ["stop"]
         if timeout is not None:
             args.extend(["--time", timeout])
-        if signal is not None:
-            args.extend(["--signal", signal])
+        if signal_value is not None:
+            args.extend(["--signal", signal_value])
         args.append(ident)
         result = _run_container_capture(args)
         if result.returncode != 0:
@@ -1940,9 +2122,13 @@ def cmd_create(argv: list[str]) -> int:
     # Some callers probe storage-opt support. Docker returns 125 when the driver lacks it.
     if "--storage-opt" in argv or any(arg.startswith("--storage-opt=") for arg in argv):
         return _die("Docker --storage-opt probe is unsupported by Apple container", 125)
-    opts, image, command, detach, name = _parse_run_options(argv)
+    opts, image, command, detach, name, named_volumes = _parse_run_options(
+        argv, ensure_volumes=False
+    )
     if detach:
         return _die("create does not take -d/--detach", 64)
+    for volume_name in named_volumes:
+        _ensure_named_volume(volume_name)
     result = _run_container_capture(["create", *opts, image, *command])
     return _print_new_container_id(result, name)
 
@@ -2319,7 +2505,7 @@ def main(argv: list[str] | None = None) -> int:
         if command == "system":
             return cmd_system(rest)
         if command == "kill":
-            return cmd_proxy([command, *rest])
+            return cmd_kill(rest)
         if command == "compose":
             from . import compose
 

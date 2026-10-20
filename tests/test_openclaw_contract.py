@@ -19,12 +19,29 @@ that pins it:
 
 from __future__ import annotations
 
+import json
+
 import test_cli
 
 TIER = "fake"
 
 
 class OpenClawContractTests(test_cli.ShimCLITestCase):
+    def test_compose_ps_json_contract(self) -> None:
+        run = self.docker(
+            "run", "-d", "--name", "openclaw-compose-web",
+            "--label", "com.docker.compose.project=openclaw",
+            "--label", "com.docker.compose.service=web", "alpine", "sleep", "infinity",
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = self.docker("compose", "-p", "openclaw", "ps", "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["Name"], "openclaw-compose-web")
+        self.assertEqual(record["Service"], "web")
+        self.assertEqual(record["State"], "running")
+        self.assertIsInstance(record["Publishers"], list)
+
     def test_sandbox_running_probe(self) -> None:
         run = self.docker(
             "run", "-d", "--name", "openclaw-sandbox", "alpine", "sleep", "infinity"

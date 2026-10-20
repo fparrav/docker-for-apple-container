@@ -424,7 +424,12 @@ caller observes follows Docker's conventions:
   orphan behind.
 - `docker version`, `docker info`, `docker ps --format`, `docker inspect
   --format`, `docker images --format`, `docker logs` and
-  `docker compose ps --format json` keep the documented output shapes. The
+  `docker compose ps --format json|table` keep the documented output shapes;
+  `docker compose ps` refuses Go templates and formats other than `json` or
+  `table` with exit 64, and `docker compose ps --format json` refuses with
+  exit 64 a listing that includes an exited container, because the Apple
+  runtime exposes no numeric exit code (the default table, `-q` and
+  `--services` keep working). The
   contracts of the named consumers (Hermes and OpenClaw) are pinned by tests.
 - An unsupported command or option exits 64 with a message on standard error
   that names it and the reason (`docker commit c img` names `commit`), and
@@ -531,7 +536,7 @@ API). Known differences are called out in the `note` column.
 | docker import | UNSUPPORTED | - | fake | No Apple equivalent; refused with exit 64. |
 | docker info | SUPPORTED | container system status | fake | Only the {{.Driver}} --format template is translated; other formats are refused. |
 | docker inspect | SUPPORTED | container inspect | fake | Bounded template subset: field paths, literal text, and json rendering. |
-| docker kill | PARTIAL | container kill | fake | Forwards to Apple container kill, including -s SIG. |
+| docker kill | PARTIAL | container kill | fake | Forwards to Apple container kill, including -s SIG. D1 option semantics: kill -s; see tests/option_semantics.py. |
 | docker load | PARTIAL | container image load | fake | Basic form only; Docker-only flags are not translated. |
 | docker login | PARTIAL | container registry login | fake | Apple stores the credential; -p/--password is refused in favor of --password-stdin. |
 | docker logout | PARTIAL | container registry logout | fake | Delegates to Apple registry logout; flags are refused. |
@@ -553,7 +558,7 @@ API). Known differences are called out in the `note` column.
 | docker save | PARTIAL | container image save | fake | Basic form only; Docker-only flags are not translated. |
 | docker start | SUPPORTED | container start | fake | Non-attached starts refresh Compose /etc/hosts mappings; attach/interactive stay passthroughs. |
 | docker stats | PARTIAL | container stats | fake | Go-template --format is refused; Apple accepts json\|table\|yaml\|toml. |
-| docker stop | SUPPORTED | container stop | fake | Maps -s SIGNAL and -t N to Apple container stop. |
+| docker stop | SUPPORTED | container stop | fake | Maps -s SIGNAL and -t N to Apple container stop. D1 option semantics: stop -s; see tests/option_semantics.py. |
 | docker system df | PARTIAL | container system df | fake | Maps directly; Go templates and Docker's verbose mode are refused. |
 | docker system events | UNSUPPORTED | - | fake | Stateful watcher with no Apple equivalent; refused with exit 64. |
 | docker system info | PARTIAL | container system status | fake | Maps to docker info; only the {{.Driver}} --format template is translated. |
@@ -728,20 +733,27 @@ API). Known differences are called out in the `note` column.
 | compose volumes_from | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose working_dir | SUPPORTED | -w | fake | Forwards to Apple -w. |
 | compose x-shim-boot-hosts | SUPPORTED | - | fake | Shim extension: false skips the boot-time /etc/hosts entrypoint wrapper for the service. |
+| docker compose ps --format json | SUPPORTED | container list --all --format json | unit | JSON-lines fields and value types follow the captured Compose 5.6.0 reference fixture; a listing that includes an exited container is refused (exit 64) because the runtime exposes no numeric exit code. |
+| docker compose ps --format table | SUPPORTED | container list --all --format json | fake | Default Compose table columns are NAME, IMAGE, COMMAND, SERVICE, CREATED, STATUS, PORTS. |
+| docker compose ps --format template | UNSUPPORTED | - | fake | Go-template output is refused with exit 64. |
+| docker compose ps --format yaml\|toml | UNSUPPORTED | - | fake | Only json and table are supported formats; other values are refused with exit 64. |
+| docker version --format json | SUPPORTED | container --version; container system status | fake | Bounded JSON object with Client.Version and Server.Version strings. |
+| docker version --format version templates | SUPPORTED | container --version; container system status | fake | Accepts only {{.Client.Version}} and {{.Server.Version}}; other templates are refused with exit 64. |
 | build --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
 | build --arch | SUPPORTED | --arch | fake | Forwarded verbatim to Apple --arch. |
 | build --build-arg | SUPPORTED | --build-arg | live | Forwarded verbatim to Apple --build-arg. |
 | build --build-context | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build-context flag. |
 | build --cache-from | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no cache-from flag. |
 | build --cache-to | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no cache-to flag. |
-| build --cpus | SUPPORTED | --cpus | fake | Normalized and forwarded to Apple --cpus as a fractional CPU count. |
+| build --cpu-shares | UNSUPPORTED | - | fake | Docker --cpu-shares sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build --cpu-shares; see tests/option_semantics.py. |
+| build --cpus | SUPPORTED | --cpus | fake | Apple-only build extension (Docker build has no --cpus option); forwarded to Apple container 1.5.0 --cpus. D1 option semantics: build --cpus; see tests/option_semantics.py. |
 | build --file | SUPPORTED | --file | fake | Forwarded verbatim to Apple --file. |
-| build --force-rm | PARTIAL | - | fake | Accepted and ignored; Apple container 1.5.0 build documents no force-remove flag. |
+| build --force-rm | PARTIAL | - | fake | Docker uses --force-rm to request removal of intermediate build containers on build failure. Apple container 1.5.0 documents no corresponding flag, so the shim accepts it as a no-op instead of forwarding an unsupported option. D1 option semantics: build --force-rm; see tests/option_semantics.py. |
 | build --help | SUPPORTED | --help | fake | Forwards to Apple container build --help. |
 | build --iidfile | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no iidfile flag. |
 | build --label | SUPPORTED | --label | live | Forwarded verbatim to Apple --label. |
 | build --load | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no load flag. |
-| build --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; sets the builder container memory. |
+| build --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; sets the builder container memory. D1 option semantics: build --memory; see tests/option_semantics.py. |
 | build --network | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build network flag. |
 | build --no-cache | SUPPORTED | --no-cache | fake | Forwarded verbatim to Apple --no-cache. |
 | build --output | SUPPORTED | --output | fake | Forwarded verbatim to Apple --output. |
@@ -750,55 +762,65 @@ API). Known differences are called out in the `note` column.
 | build --pull | SUPPORTED | --pull | fake | Forwarded verbatim to Apple --pull. |
 | build --push | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build push flag. |
 | build --quiet | SUPPORTED | --quiet | fake | Forwarded verbatim to Apple --quiet. |
-| build --rm | PARTIAL | - | fake | Accepted and ignored; Apple container 1.5.0 build documents no remove flag. |
+| build --rm | PARTIAL | - | fake | Docker uses --rm to request removal of intermediate build containers. Apple container 1.5.0 documents no corresponding flag, so the shim accepts it as a no-op instead of forwarding an unsupported option. D1 option semantics: build --rm; see tests/option_semantics.py. |
 | build --secret | SUPPORTED | --secret | fake | Forwarded verbatim to Apple --secret (`id=<id>,src=<path>` or `id=<id>,env=<VAR>`, verified live in findings 1.5). |
 | build --ssh | PARTIAL | --ssh default | fake | Only `--ssh default` is forwarded (the host agent, as Apple container 1.5.0 build supports); any other form is refused with exit 64. |
 | build --tag | SUPPORTED | --tag | fake | Forwarded verbatim to Apple --tag. |
 | build --target | SUPPORTED | --target | fake | Forwarded verbatim to Apple --target. |
 | build --ulimit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag. |
+| build -c | UNSUPPORTED | - | fake | Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build -c; see tests/option_semantics.py. |
 | compose up --no-deps | SUPPORTED | - | fake | Creates only the named services and prints a notice listing the skipped dependencies. |
 | run --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
-| run --arch | SUPPORTED | --arch | fake | Forwarded verbatim to Apple --arch. |
-| run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. |
-| run --cap-drop | SUPPORTED | --cap-drop | live | Forwarded verbatim; the runtime normalizes names to CAP_*. |
+| run --arch | SUPPORTED | --arch | fake | Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --arch. D1 option semantics: run --arch; see tests/option_semantics.py. |
+| run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-add; see tests/option_semantics.py. |
+| run --cap-drop | SUPPORTED | --cap-drop | live | Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-drop; see tests/option_semantics.py. |
 | run --cidfile | SUPPORTED | --cidfile | fake | Forwarded verbatim to Apple --cidfile. |
-| run --cpus | SUPPORTED | --cpus | fake | Normalized and forwarded to Apple --cpus as a fractional CPU count. |
+| run --cpu-shares | UNSUPPORTED | - | fake | Docker --cpu-shares sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: run --cpu-shares; see tests/option_semantics.py. |
+| run --cpus | SUPPORTED | --cpus | fake | Only whole (integer) CPU counts are supported; fractional values are refused with exit 64. Integral values are normalized to their whole form (2.0 -> 2) before forwarding to Apple --cpus. D1 option semantics: run --cpus; see tests/option_semantics.py. |
 | run --cwd | SUPPORTED | -w | fake | Alias of --workdir; translated to Apple -w. |
 | run --detach | SUPPORTED | -d | fake | Detached run re-adds -d and generates a --name when none is given; create refuses -d with exit 64. |
-| run --device | UNSUPPORTED | - | fake | Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough. |
+| run --device | UNSUPPORTED | - | fake | Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough. D1 option semantics: run --device; see tests/option_semantics.py. |
 | run --dns | SUPPORTED | --dns | fake | Forwarded verbatim to Apple --dns. |
 | run --dns-option | SUPPORTED | --dns-option | fake | Forwarded verbatim to Apple --dns-option. |
 | run --dns-search | SUPPORTED | --dns-search | fake | Forwarded verbatim to Apple --dns-search. |
 | run --entrypoint | SUPPORTED | --entrypoint | fake | Forwarded verbatim to Apple --entrypoint. |
 | run --env | SUPPORTED | -e | fake | Forwarded verbatim to Apple -e. |
-| run --env-file | SUPPORTED | --env-file | fake | Forwarded verbatim to Apple --env-file. |
+| run --env-file | SUPPORTED | --env-file | fake | Forwarded verbatim to Apple --env-file. D1 option semantics: run --env-file; see tests/option_semantics.py. |
+| run --group-add | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no group-add namespace/group option. D1 option semantics: run --group-add; see tests/option_semantics.py. |
 | run --hostname | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no hostname flag. |
 | run --init | SUPPORTED | --init | fake | Forwarded verbatim to Apple --init. |
 | run --interactive | SUPPORTED | -i | fake | Forwarded verbatim to Apple -i. |
+| run --ipc | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no ipc namespace/group option. D1 option semantics: run --ipc; see tests/option_semantics.py. |
 | run --label | SUPPORTED | --label | fake | Forwarded verbatim to Apple --label. |
-| run --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity. |
-| run --mount | SUPPORTED | --mount | fake | Forwarded verbatim to Apple --mount without content validation. |
+| run --memory | SUPPORTED | --memory | fake | Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity. D1 option semantics: run --memory; see tests/option_semantics.py. |
+| run --mount | SUPPORTED | --mount | fake | Parsed and validated, then translated to the Apple --mount dialect (type/source/target/readonly); unsupported or duplicate keys are refused with exit 64 rather than forwarded verbatim. D1 option semantics: run --mount; see tests/option_semantics.py. |
 | run --name | SUPPORTED | --name | fake | Forwarded verbatim to Apple --name. |
-| run --network | SUPPORTED | --network | fake | Verified networks forward verbatim; --network=none is refused (see run --network none). |
+| run --network | SUPPORTED | --network | fake | bridge and default map to Apple's default network (flag omitted); named networks forward verbatim; none, host and container:* are refused (see the per-mode entries). D1 option semantics: run --network; see tests/option_semantics.py. |
+| run --network bridge | SUPPORTED | - | fake | Docker's bridge is its default network; the flag is omitted so Apple attaches its own default network. |
+| run --network container: | UNSUPPORTED | - | fake | Docker --network=container:NAME shares another container's network namespace; Apple container 1.5.0 has no container network mode. Refused with exit 64 as an unsafe translation. |
+| run --network default | SUPPORTED | - | fake | Docker's default is its default network; the flag is omitted so Apple attaches its own default network. |
+| run --network host | UNSUPPORTED | - | fake | Docker --network=host shares the host network namespace; Apple container 1.5.0 has no host network. Refused with exit 64 as an unsafe translation. |
 | run --network none | UNSUPPORTED | - | fake | No verified Apple container equivalent; refused with exit 64 as an unsafe translation. |
-| run --no-dns | SUPPORTED | --no-dns | fake | Forwarded verbatim to Apple --no-dns. |
-| run --pids-limit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no process-count limit. |
+| run --no-dns | SUPPORTED | --no-dns | fake | Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --no-dns. D1 option semantics: run --no-dns; see tests/option_semantics.py. |
+| run --pid | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 has no pid namespace/group option. D1 option semantics: run --pid; see tests/option_semantics.py. |
+| run --pids-limit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no process-count limit. D1 option semantics: run --pids-limit; see tests/option_semantics.py. |
 | run --platform | SUPPORTED | --platform | live | Forwarded verbatim to Apple --platform. |
-| run --privileged | UNSUPPORTED | - | live | Refused with exit 64; Apple container 1.5.0 has no privileged mode. |
+| run --privileged | UNSUPPORTED | - | live | Refused with exit 64; Apple container 1.5.0 has no privileged mode. D1 option semantics: run --privileged; see tests/option_semantics.py. |
 | run --publish | SUPPORTED | --publish | fake | Forwarded verbatim to Apple --publish. |
 | run --read-only | SUPPORTED | --read-only | live | Forwarded verbatim; guest writes fail on the read-only root filesystem. |
 | run --rm | SUPPORTED | --rm | fake | Forwarded verbatim to Apple --rm. |
-| run --runtime | SUPPORTED | --runtime | fake | Forwarded verbatim to Apple --runtime. |
-| run --security-opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob. |
+| run --runtime | UNSUPPORTED | - | fake | Docker --runtime selects an OCI runtime (runc); Apple container --runtime selects a container runtime handler. Refused with exit 64 and a message naming both meanings. D1 option semantics: run --runtime; see tests/option_semantics.py. |
+| run --security-opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob. D1 option semantics: run --security-opt; see tests/option_semantics.py. |
 | run --shm-size | SUPPORTED | --shm-size | fake | Forwarded verbatim to Apple --shm-size. |
 | run --storage-opt | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no storage driver options, and the create probe exits 125. |
 | run --sysctl | UNSUPPORTED | - | fake | Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no sysctl passthrough. |
 | run --tmpfs | SUPPORTED | --tmpfs | live | Forwarded verbatim including options, which the runtime applies to the mount. |
 | run --tty | SUPPORTED | -t | fake | Forwarded verbatim to Apple -t. |
 | run --ulimit | SUPPORTED | --ulimit | fake | Forwarded verbatim to Apple --ulimit. |
-| run --user | SUPPORTED | --user | live | Forwarded verbatim; a numeric user maps to that UID in the guest. |
-| run --volume | PARTIAL | --mount | fake | Bind mounts translate to Apple --mount with ro becoming readonly; other mode flags are dropped. |
+| run --user | SUPPORTED | --user | live | Forwarded verbatim; a numeric user maps to that UID in the guest. D1 option semantics: run --user; see tests/option_semantics.py. |
+| run --volume | PARTIAL | --mount | fake | Bind mounts translate to Apple --mount with ro becoming readonly; Docker SELinux relabel modes z/Z are refused with exit 64 because the supported Apple macOS runtime cannot represent them, and other unknown mode flags are refused too. D1 option semantics: run --volume; see tests/option_semantics.py. |
 | run --workdir | SUPPORTED | -w | fake | Translated to Apple -w, accepting the --cwd and -w aliases. |
+| run -c | UNSUPPORTED | - | fake | Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container -c is a combined form of --cpus specifying an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: run -c; see tests/option_semantics.py. |
 <!-- compat-matrix:end -->
 
 ### Building and publishing for AWS

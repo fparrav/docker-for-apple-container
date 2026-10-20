@@ -19,6 +19,8 @@ TIER = "fake"
 
 ROOT = Path(__file__).resolve().parents[1]
 SHIM = ROOT / "bin" / "docker"
+sys.path.insert(0, str(ROOT / "src"))
+from container_docker_shim.cli import ShimError, _normalize_signal  # noqa: E402
 
 FAKE_CONTAINER = """#!/bin/sh
 echo $$ > "$FAKE_PIDFILE"
@@ -101,6 +103,18 @@ class SignalPropagationTests(unittest.TestCase):
             _wait_for(lambda: not _alive(child), 10),
             "the container process survived SIGINT sent to the shim",
         )
+
+
+class DockerSignalNormalizationTests(unittest.TestCase):
+    def test_term_spellings_normalize_to_apple_signal_name(self) -> None:
+        for value in ("TERM", "SIGTERM", "15"):
+            with self.subTest(value=value):
+                self.assertEqual(_normalize_signal(value), "SIGTERM")
+
+    def test_invalid_signal_is_refused(self) -> None:
+        with self.assertRaisesRegex(ShimError, "unsupported Docker signal") as caught:
+            _normalize_signal("NOT_A_SIGNAL")
+        self.assertEqual(caught.exception.code, 64)
 
 
 if __name__ == "__main__":

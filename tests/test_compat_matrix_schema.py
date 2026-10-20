@@ -25,6 +25,9 @@ class ValidateTests(unittest.TestCase):
     def test_valid_entry_has_no_errors(self):
         self.assertEqual(compat_matrix.validate([entry()]), [])
 
+    def test_format_is_a_valid_kind(self):
+        self.assertEqual(compat_matrix.validate([entry(kind="format")]), [])
+
     def test_empty_matrix_is_valid(self):
         self.assertEqual(compat_matrix.validate([]), [])
 
@@ -63,7 +66,7 @@ class ValidateTests(unittest.TestCase):
             compat_matrix.validate([entry(kind="docker")]),
             [
                 "entries[0] (run): kind 'docker' is not one of "
-                "command, option, compose-key"
+                "command, option, compose-key, format"
             ],
         )
 

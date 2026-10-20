@@ -138,8 +138,10 @@ def _describe_row_diff(readme_block: str, rendered: str) -> str:
 # Short forms are covered through the long option they alias. A short option
 # that appears in an option set but not here fails the test, so a new short
 # option cannot slip in without a matrix entry.
+# Note: -c is now refused (Docker CPU-shares vs Apple --cpus count) and does
+# not map to --cpus anymore; mapped to None so the alias checker skips it.
 RUN_SHORT_ALIASES = {
-    "-c": "--cpus",
+    "-c": None,
     "-d": "--detach",
     "-e": "--env",
     "-i": "--interactive",
@@ -154,7 +156,7 @@ RUN_SHORT_ALIASES = {
     "-w": "--workdir",
 }
 BUILD_SHORT_ALIASES = {
-    "-c": "--cpus",
+    "-c": None,
     "-f": "--file",
     "-h": None,  # --help is not a matrix entry
     "-m": "--memory",

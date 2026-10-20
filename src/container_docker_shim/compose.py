@@ -73,7 +73,6 @@ from .cli import (
     _normalize_memory,
     _run_container_capture,
     _run_container_passthrough,
-    _translate_volume,
     cmd_exec as docker_exec,
     cmd_image as docker_image,
     cmd_rm as docker_rm,
@@ -81,6 +80,7 @@ from .cli import (
     cmd_stop as docker_stop,
     translate_build_argv,
 )
+from .mounts import parse_volume as _translate_volume
 from . import security
 from . import compose_health
 from . import compose_normalizer
@@ -88,6 +88,11 @@ from . import compose_plan
 from . import compose_reconcile
 from . import compose_resources
 from . import compose_subset
+from .compose_ps import (
+    exited_rows_without_exit_code as _exited_without_exit_code,
+    render_json as _render_ps_json,
+    render_table as _render_ps_table,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -2468,18 +2473,54 @@ def cmd_down(
     return rc
 
 
-def cmd_ps(project_name: str, *, quiet: bool, show_all: bool) -> int:
+def cmd_ps(
+    project_name: str,
+    *,
+    quiet: bool = False,
+    show_all: bool = False,
+    output_format: str = "table",
+    statuses: list[str] | None = None,
+    services_only: bool = False,
+    only: list[str] | None = None,
+) -> int:
     rows = _project_containers(project_name)
     if not show_all:
         rows = [r for r in rows if r.get("state") == "running"]
-    if quiet:
-        for row in rows:
-            print(row.get("id", ""))
+    if statuses:
+        wanted_statuses = {status.lower() for status in statuses}
+        rows = [r for r in rows if str(r.get("state") or "").lower() in wanted_statuses]
+    if only:
+        wanted_services = set(only)
+        rows = [r for r in rows if (r.get("labels") or {}).get(LABEL_SERVICE) in wanted_services]
+    if services_only:
+        output = "".join(
+            f"{service}\n"
+            for service in sorted({(row.get("labels") or {}).get(LABEL_SERVICE, "") for row in rows})
+            if service
+        )
+        sys.stdout.write(output)
         return 0
-    print("NAME\tIMAGE\tSTATE\tSERVICE")
-    for row in rows:
-        service = (row.get("labels") or {}).get(LABEL_SERVICE, "")
-        print(f"{row.get('name', '')}\t{row.get('image', '')}\t{row.get('state', '')}\t{service}")
+    if quiet:
+        sys.stdout.write("".join(f"{row.get('id', '')}\n" for row in rows))
+        return 0
+    if output_format == "json":
+        missing = _exited_without_exit_code(rows)
+        if missing:
+            # Apple container 1.5.0's list/inspect JSON exposes no numeric
+            # exit code, so an exited row cannot fill Compose's integer
+            # ExitCode. Refuse the JSON listing instead of printing 0; the
+            # default table, -q and --services remain available.
+            raise ShimError(
+                "compose ps --format json: " + ", ".join(missing)
+                + " has exited, but Apple container 1.5.0 exposes no numeric exit code, "
+                "so Compose's ExitCode cannot be reported honestly; refusing to print a "
+                "fabricated value. Use the default table, -q, or --services instead.",
+                64,
+            )
+        output = _render_ps_json(rows)
+    else:
+        output = _render_ps_table(rows)
+    sys.stdout.write(output)
     return 0
 
 
@@ -3151,11 +3192,54 @@ def _dispatch(
             project=model,
         )
     if sub == "ps":
-        opts = _parse_flags(sub_args, bools={"-q", "--quiet", "-a", "--all"})
+        ps_flags: set[str] = set()
+        ps_positionals: list[str] = []
+        ps_statuses: list[str] = []
+        output_format = "table"
+        i = 0
+        while i < len(sub_args):
+            arg = sub_args[i]
+            if arg in {"-q", "--quiet", "-a", "--all", "--services"}:
+                ps_flags.add(arg)
+                i += 1
+                continue
+            if arg in {"--format", "-f", "--status"}:
+                value, i = _take(sub_args, i, arg)
+                if arg == "--status":
+                    ps_statuses.append(value)
+                else:
+                    output_format = value
+                continue
+            if arg.startswith("--format="):
+                output_format = arg.split("=", 1)[1]
+                i += 1
+                continue
+            if arg.startswith("--status="):
+                ps_statuses.append(arg.split("=", 1)[1])
+                i += 1
+                continue
+            if arg.startswith("-"):
+                raise ShimError(f"compose: unsupported option: {arg}", 64)
+            ps_positionals.append(arg)
+            i += 1
+        if not output_format:
+            raise ShimError("compose: --format requires a value", 64)
+        if "{{" in output_format or "}}" in output_format:
+            raise ShimError("compose: Go-template formats are unsupported", 64)
+        if output_format not in {"json", "table"}:
+            raise ShimError(f"compose: unsupported --format: {output_format}", 64)
+        valid_statuses = {"created", "running", "exited", "paused", "restarting", "removing", "dead"}
+        invalid_statuses = [status for status in ps_statuses if status.lower() not in valid_statuses]
+        if invalid_statuses:
+            raise ShimError(f"compose: invalid --status: {invalid_statuses[0]}", 64)
         return cmd_ps(
             resolved_name(),
-            quiet=opts.flag("-q") or opts.flag("--quiet"),
-            show_all=opts.flag("-a") or opts.flag("--all"),
+            quiet="-q" in ps_flags or "--quiet" in ps_flags,
+            show_all="-a" in ps_flags or "--all" in ps_flags,
+            output_format=output_format,
+            statuses=ps_statuses,
+            services_only="--services" in ps_flags,
+            only=ps_positionals,
         )
     if sub == "logs":
         opts = _parse_flags(sub_args, bools={"-f", "--follow"})

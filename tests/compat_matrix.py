@@ -14,7 +14,7 @@ from pathlib import Path
 
 MATRIX_PATH = Path(__file__).resolve().parent / "compat" / "matrix.json"
 
-KINDS = ("command", "option", "compose-key")
+KINDS = ("command", "option", "compose-key", "format")
 STATUSES = ("SUPPORTED", "PARTIAL", "UNSUPPORTED")
 EVIDENCE = ("unit", "fake", "live", "conformance")
 EVIDENCE_WITH_TEST = ("live", "conformance")

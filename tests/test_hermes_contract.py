@@ -305,13 +305,14 @@ class HermesContractTests(test_cli.ShimCLITestCase):
         )
         self.assertEqual(run.returncode, 0, run.stderr)
 
-        result = self.docker("compose", "-p", "hermes-gateway", "ps")
+        result = self.docker("compose", "-p", "hermes-gateway", "ps", "--format", "json")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            result.stdout,
-            "NAME\tIMAGE\tSTATE\tSERVICE\n"
-            "hermes-gateway-web\talpine\trunning\tweb\n",
-        )
+        record = json.loads(result.stdout)
+        self.assertEqual(record["Name"], "hermes-gateway-web")
+        self.assertEqual(record["Project"], "hermes-gateway")
+        self.assertEqual(record["Service"], "web")
+        self.assertEqual(record["State"], "running")
+        self.assertIsInstance(record["ExitCode"], int)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,77 @@
 [
   {
+    "id": "docker compose ps --format json",
+    "kind": "format",
+    "status": "SUPPORTED",
+    "apple": "container list --all --format json",
+    "evidence": "unit",
+    "test": "test_compose_ps.ComposePsRendererTests.test_json_has_reference_keys_and_types",
+    "note": "JSON-lines fields and value types follow the captured Compose 5.6.0 reference fixture; a listing that includes an exited container is refused (exit 64) because the runtime exposes no numeric exit code."
+  },
+  {
+    "id": "docker compose ps --format table",
+    "kind": "format",
+    "status": "SUPPORTED",
+    "apple": "container list --all --format json",
+    "evidence": "fake",
+    "test": "test_compose_ps.ComposePsRendererTests.test_table_header_and_empty_project_match_reference",
+    "note": "Default Compose table columns are NAME, IMAGE, COMMAND, SERVICE, CREATED, STATUS, PORTS."
+  },
+  {
+    "id": "docker compose ps --format template",
+    "kind": "format",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_compose.ComposeE2ETests.test_ps_refuses_templates_without_stdout",
+    "note": "Go-template output is refused with exit 64."
+  },
+  {
+    "id": "docker compose ps --format yaml|toml",
+    "kind": "format",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_compose.ComposeE2ETests.test_ps_refuses_templates_without_stdout",
+    "note": "Only json and table are supported formats; other values are refused with exit 64."
+  },
+  {
+    "id": "docker version --format json",
+    "kind": "format",
+    "status": "SUPPORTED",
+    "apple": "container --version; container system status",
+    "evidence": "fake",
+    "test": "test_agent_contract.AgentContractTests.test_version_probe_formats_are_agent_safe",
+    "note": "Bounded JSON object with Client.Version and Server.Version strings."
+  },
+  {
+    "id": "docker version --format version templates",
+    "kind": "format",
+    "status": "SUPPORTED",
+    "apple": "container --version; container system status",
+    "evidence": "fake",
+    "test": "test_cli.VersionFormatTests",
+    "note": "Accepts only {{.Client.Version}} and {{.Server.Version}}; other templates are refused with exit 64."
+  },
+  {
+    "id": "build -c",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.CPUSharesRefusalTests.test_build_short_cpu_shares_is_refused",
+    "note": "Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build -c; see tests/option_semantics.py."
+  },
+  {
+    "id": "build --cpu-shares",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.CPUSharesRefusalTests.test_build_long_cpu_shares_is_refused",
+    "note": "Docker --cpu-shares sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build --cpu-shares; see tests/option_semantics.py."
+  },
+  {
     "id": "build --add-host",
     "kind": "option",
     "status": "UNSUPPORTED",
@@ -60,7 +132,7 @@
     "apple": "--cpus",
     "evidence": "fake",
     "test": null,
-    "note": "Normalized and forwarded to Apple --cpus as a fractional CPU count."
+    "note": "Apple-only build extension (Docker build has no --cpus option); forwarded to Apple container 1.5.0 --cpus. D1 option semantics: build --cpus; see tests/option_semantics.py."
   },
   {
     "id": "build --file",
@@ -78,7 +150,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Accepted and ignored; Apple container 1.5.0 build documents no force-remove flag."
+    "note": "Docker uses --force-rm to request removal of intermediate build containers on build failure. Apple container 1.5.0 documents no corresponding flag, so the shim accepts it as a no-op instead of forwarding an unsupported option. D1 option semantics: build --force-rm; see tests/option_semantics.py."
   },
   {
     "id": "build --help",
@@ -123,7 +195,7 @@
     "apple": "--memory",
     "evidence": "fake",
     "test": null,
-    "note": "Unit letter upper-cased before forwarding; sets the builder container memory."
+    "note": "Unit letter upper-cased before forwarding; sets the builder container memory. D1 option semantics: build --memory; see tests/option_semantics.py."
   },
   {
     "id": "build --network",
@@ -204,7 +276,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Accepted and ignored; Apple container 1.5.0 build documents no remove flag."
+    "note": "Docker uses --rm to request removal of intermediate build containers. Apple container 1.5.0 documents no corresponding flag, so the shim accepts it as a no-op instead of forwarding an unsupported option. D1 option semantics: build --rm; see tests/option_semantics.py."
   },
   {
     "id": "build --secret",
@@ -2076,7 +2148,7 @@
     "apple": "container kill",
     "evidence": "fake",
     "test": null,
-    "note": "Forwards to Apple container kill, including -s SIG."
+    "note": "Forwards to Apple container kill, including -s SIG. D1 option semantics: kill -s; see tests/option_semantics.py."
   },
   {
     "id": "docker load",
@@ -2274,7 +2346,7 @@
     "apple": "container stop",
     "evidence": "fake",
     "test": null,
-    "note": "Maps -s SIGNAL and -t N to Apple container stop."
+    "note": "Maps -s SIGNAL and -t N to Apple container stop. D1 option semantics: stop -s; see tests/option_semantics.py."
   },
   {
     "id": "docker system df",
@@ -2376,6 +2448,24 @@
     "note": "create/ls/rm/inspect/prune forward; subcommands Apple lacks fail loudly."
   },
   {
+    "id": "run -c",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.CPUSharesRefusalTests.test_run_short_cpu_shares_is_refused",
+    "note": "Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container -c is a combined form of --cpus specifying an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: run -c; see tests/option_semantics.py."
+  },
+  {
+    "id": "run --cpu-shares",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.CPUSharesRefusalTests.test_run_long_cpu_shares_is_refused",
+    "note": "Docker --cpu-shares sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: run --cpu-shares; see tests/option_semantics.py."
+  },
+  {
     "id": "run --add-host",
     "kind": "option",
     "status": "UNSUPPORTED",
@@ -2391,7 +2481,7 @@
     "apple": "--arch",
     "evidence": "fake",
     "test": null,
-    "note": "Forwarded verbatim to Apple --arch."
+    "note": "Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --arch. D1 option semantics: run --arch; see tests/option_semantics.py."
   },
   {
     "id": "run --cap-add",
@@ -2400,7 +2490,7 @@
     "apple": "--cap-add",
     "evidence": "fake",
     "test": null,
-    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*."
+    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-add; see tests/option_semantics.py."
   },
   {
     "id": "run --cap-drop",
@@ -2409,7 +2499,7 @@
     "apple": "--cap-drop",
     "evidence": "live",
     "test": "test_live_security.LiveSecurityTests.test_cap_drop_all_leaves_no_effective_capabilities",
-    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*."
+    "note": "Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-drop; see tests/option_semantics.py."
   },
   {
     "id": "run --cidfile",
@@ -2427,7 +2517,7 @@
     "apple": "--cpus",
     "evidence": "fake",
     "test": null,
-    "note": "Normalized and forwarded to Apple --cpus as a fractional CPU count."
+    "note": "Only whole (integer) CPU counts are supported; fractional values are refused with exit 64. Integral values are normalized to their whole form (2.0 -> 2) before forwarding to Apple --cpus. D1 option semantics: run --cpus; see tests/option_semantics.py."
   },
   {
     "id": "run --cwd",
@@ -2454,7 +2544,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough."
+    "note": "Refused with exit 64 as an unsupported run option; Apple container 1.5.0 documents no host device passthrough. D1 option semantics: run --device; see tests/option_semantics.py."
   },
   {
     "id": "run --dns",
@@ -2508,7 +2598,7 @@
     "apple": "--env-file",
     "evidence": "fake",
     "test": null,
-    "note": "Forwarded verbatim to Apple --env-file."
+    "note": "Forwarded verbatim to Apple --env-file. D1 option semantics: run --env-file; see tests/option_semantics.py."
   },
   {
     "id": "run --hostname",
@@ -2553,7 +2643,7 @@
     "apple": "--memory",
     "evidence": "fake",
     "test": null,
-    "note": "Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity."
+    "note": "Unit letter upper-cased before forwarding; the runtime applies 1 MiB granularity. D1 option semantics: run --memory; see tests/option_semantics.py."
   },
   {
     "id": "run --mount",
@@ -2562,7 +2652,7 @@
     "apple": "--mount",
     "evidence": "fake",
     "test": null,
-    "note": "Forwarded verbatim to Apple --mount without content validation."
+    "note": "Parsed and validated, then translated to the Apple --mount dialect (type/source/target/readonly); unsupported or duplicate keys are refused with exit 64 rather than forwarded verbatim. D1 option semantics: run --mount; see tests/option_semantics.py."
   },
   {
     "id": "run --name",
@@ -2579,8 +2669,8 @@
     "status": "SUPPORTED",
     "apple": "--network",
     "evidence": "fake",
-    "test": null,
-    "note": "Verified networks forward verbatim; --network=none is refused (see run --network none)."
+    "test": "test_cli.NetworkModeTests.test_named_network_is_forwarded_verbatim",
+    "note": "bridge and default map to Apple's default network (flag omitted); named networks forward verbatim; none, host and container:* are refused (see the per-mode entries). D1 option semantics: run --network; see tests/option_semantics.py."
   },
   {
     "id": "run --network none",
@@ -2588,8 +2678,44 @@
     "status": "UNSUPPORTED",
     "apple": null,
     "evidence": "fake",
-    "test": null,
+    "test": "test_cli.NetworkModeTests.test_none_is_refused_without_container",
     "note": "No verified Apple container equivalent; refused with exit 64 as an unsafe translation."
+  },
+  {
+    "id": "run --network host",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.NetworkModeTests.test_host_is_refused_without_container",
+    "note": "Docker --network=host shares the host network namespace; Apple container 1.5.0 has no host network. Refused with exit 64 as an unsafe translation."
+  },
+  {
+    "id": "run --network container:",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.NetworkModeTests.test_container_mode_is_refused_without_container",
+    "note": "Docker --network=container:NAME shares another container's network namespace; Apple container 1.5.0 has no container network mode. Refused with exit 64 as an unsafe translation."
+  },
+  {
+    "id": "run --network bridge",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.NetworkModeTests.test_bridge_maps_to_apple_default_network",
+    "note": "Docker's bridge is its default network; the flag is omitted so Apple attaches its own default network."
+  },
+  {
+    "id": "run --network default",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": "test_cli.NetworkModeTests.test_default_maps_to_apple_default_network",
+    "note": "Docker's default is its default network; the flag is omitted so Apple attaches its own default network."
   },
   {
     "id": "run --no-dns",
@@ -2598,7 +2724,7 @@
     "apple": "--no-dns",
     "evidence": "fake",
     "test": null,
-    "note": "Forwarded verbatim to Apple --no-dns."
+    "note": "Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --no-dns. D1 option semantics: run --no-dns; see tests/option_semantics.py."
   },
   {
     "id": "run --pids-limit",
@@ -2607,7 +2733,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Refused with exit 64; Apple container 1.5.0 documents no process-count limit."
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no process-count limit. D1 option semantics: run --pids-limit; see tests/option_semantics.py."
   },
   {
     "id": "run --platform",
@@ -2625,7 +2751,7 @@
     "apple": null,
     "evidence": "live",
     "test": "test_live_security.LiveSecurityTests.test_privileged_is_refused_before_any_container_is_created",
-    "note": "Refused with exit 64; Apple container 1.5.0 has no privileged mode."
+    "note": "Refused with exit 64; Apple container 1.5.0 has no privileged mode. D1 option semantics: run --privileged; see tests/option_semantics.py."
   },
   {
     "id": "run --publish",
@@ -2657,11 +2783,11 @@
   {
     "id": "run --runtime",
     "kind": "option",
-    "status": "SUPPORTED",
-    "apple": "--runtime",
+    "status": "UNSUPPORTED",
+    "apple": null,
     "evidence": "fake",
-    "test": null,
-    "note": "Forwarded verbatim to Apple --runtime."
+    "test": "test_cli.RuntimeRefusalTests.test_run_runtime_is_refused",
+    "note": "Docker --runtime selects an OCI runtime (runc); Apple container --runtime selects a container runtime handler. Refused with exit 64 and a message naming both meanings. D1 option semantics: run --runtime; see tests/option_semantics.py."
   },
   {
     "id": "run --security-opt",
@@ -2670,7 +2796,7 @@
     "apple": null,
     "evidence": "fake",
     "test": null,
-    "note": "Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob."
+    "note": "Refused with exit 64; Apple container 1.5.0 documents no seccomp, AppArmor, or no-new-privileges knob. D1 option semantics: run --security-opt; see tests/option_semantics.py."
   },
   {
     "id": "run --shm-size",
@@ -2733,7 +2859,7 @@
     "apple": "--user",
     "evidence": "live",
     "test": "test_live_security.LiveSecurityTests.test_user_maps_to_uid_1000",
-    "note": "Forwarded verbatim; a numeric user maps to that UID in the guest."
+    "note": "Forwarded verbatim; a numeric user maps to that UID in the guest. D1 option semantics: run --user; see tests/option_semantics.py."
   },
   {
     "id": "run --volume",
@@ -2742,7 +2868,7 @@
     "apple": "--mount",
     "evidence": "fake",
     "test": null,
-    "note": "Bind mounts translate to Apple --mount with ro becoming readonly; other mode flags are dropped."
+    "note": "Bind mounts translate to Apple --mount with ro becoming readonly; Docker SELinux relabel modes z/Z are refused with exit 64 because the supported Apple macOS runtime cannot represent them, and other unknown mode flags are refused too. D1 option semantics: run --volume; see tests/option_semantics.py."
   },
   {
     "id": "run --workdir",
@@ -2752,5 +2878,32 @@
     "evidence": "fake",
     "test": null,
     "note": "Translated to Apple -w, accepting the --cwd and -w aliases."
+  },
+  {
+    "id": "run --ipc",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 has no ipc namespace/group option. D1 option semantics: run --ipc; see tests/option_semantics.py."
+  },
+  {
+    "id": "run --pid",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 has no pid namespace/group option. D1 option semantics: run --pid; see tests/option_semantics.py."
+  },
+  {
+    "id": "run --group-add",
+    "kind": "option",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "fake",
+    "test": null,
+    "note": "Refused with exit 64; Apple container 1.5.0 has no group-add namespace/group option. D1 option semantics: run --group-add; see tests/option_semantics.py."
   }
 ]

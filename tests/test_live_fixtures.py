@@ -282,24 +282,37 @@ class LiveFixtureTests(unittest.TestCase):
         want: str,
         wait_seconds: float = STATE_WAIT_SECONDS,
     ) -> str:
-        """Poll ``compose ps -a`` until the service's row shows ``want`` in its state.
+        """Poll the Apple runtime's list until the service reaches the requested state.
 
-        The Apple runtime updates a container's state when the process ends;
-        a one-shot ``ps`` right after ``up`` can still show the old state.
+        The runtime updates a container's state when the process ends; a
+        one-shot ``ps`` right after ``up`` can still show the old state. The
+        poll reads ``container list --all --format json`` directly (matching
+        ``configuration.labels.com.docker.compose.service`` and
+        ``status.state``) because the shim's ``ps --format json`` refuses
+        once any listed container has exited, and the table layout is not a
+        stable parsing target.
         """
         deadline = time.monotonic() + wait_seconds
         last = ""
         while time.monotonic() < deadline:
-            result = harness.compose("ps", "-a")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            for row in result.stdout.splitlines():
-                columns = row.split("\t")
-                if len(columns) >= 4 and columns[3] == service and want in columns[2]:
-                    return row
-            last = result.stdout
+            result = _run([_container(), "list", "--all", "--format", "json"])
+            last = result.stdout + result.stderr
+            try:
+                items = json.loads(result.stdout or "[]")
+            except ValueError:
+                items = []
+            for item in items:
+                labels = (item.get("configuration") or {}).get("labels") or {}
+                if labels.get("com.docker.compose.service") != service:
+                    continue
+                state = str((item.get("status") or {}).get("state") or "").lower()
+                if state in ("stopped", "exited", "terminated"):
+                    state = "exited"
+                if state == want:
+                    return json.dumps(item)
             time.sleep(1)
         self.fail(
-            f"compose ps -a never showed state {want!r} for service {service!r} "
+            f"the Apple runtime never showed state {want!r} for service {service!r} "
             f"within {wait_seconds:.0f}s:\n{last}"
         )
 
@@ -331,6 +344,79 @@ class LiveFixtureTests(unittest.TestCase):
         )
 
     # -- tests -----------------------------------------------------------
+
+    @tiers.live_tier()
+    def test_docker_run_creates_named_volume_without_host_path(self) -> None:
+        self.require_images("alpine:3.20")
+        volume = tiers.disposable_name("run-volume")
+        writer = tiers.disposable_name("run-volume-writer")
+        reader = tiers.disposable_name("run-volume-reader")
+        temp = tempfile.TemporaryDirectory(prefix="shimtest-run-volume-")
+        self.addCleanup(temp.cleanup)
+        cwd = Path(temp.name)
+        host_path = cwd / volume
+
+        def _remove_container(name: str) -> None:
+            _run([str(SHIM), "rm", "-f", name], cwd=cwd)
+
+        def _remove_volume() -> None:
+            _run([_container(), "volume", "rm", volume])
+
+        # unittest cleanups run in reverse registration order, leaving cwd alive
+        # until both exact container names and the exact volume are removed.
+        self.addCleanup(_remove_volume)
+        self.addCleanup(_remove_container, reader)
+        self.addCleanup(_remove_container, writer)
+
+        written = _run(
+            [str(SHIM), "run", "--name", writer, "-v", f"{volume}:/data",
+             "alpine:3.20", "sh", "-c", "printf persisted > /data/probe"],
+            cwd=cwd,
+        )
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        self.assertFalse(host_path.exists(), "a named volume must not become a host bind directory")
+
+        read = _run(
+            [str(SHIM), "run", "--name", reader, "-v", f"{volume}:/data",
+             "alpine:3.20", "cat", "/data/probe"],
+            cwd=cwd,
+        )
+        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+        self.assertEqual(read.stdout, "persisted")
+        self.assertFalse(host_path.exists(), "the named volume created no path in the working directory")
+
+    @tiers.live_tier()
+    def test_docker_kill_normalizes_signal_and_delivers_sigterm(self) -> None:
+        self.require_images("alpine:3.20")
+        name = tiers.disposable_name("signal")
+        self.addCleanup(lambda: _run([str(SHIM), "rm", "-f", name]))
+        result = _run(
+            [str(SHIM), "run", "-d", "--name", name, "alpine:3.20", "sh", "-c",
+             "trap 'echo GOT_TERM; exit 0' TERM; echo READY; while :; do sleep 1; done"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        deadline = time.monotonic() + 15
+        logs = ""
+        while time.monotonic() < deadline:
+            captured = _run([str(SHIM), "logs", name])
+            logs = captured.stdout + captured.stderr
+            if "READY" in logs:
+                break
+            time.sleep(0.25)
+        self.assertIn("READY", logs, "the signal handler did not become ready")
+
+        result = _run([str(SHIM), "kill", "-s", "TERM", name])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            captured = _run([str(SHIM), "logs", name])
+            logs = captured.stdout + captured.stderr
+            if "GOT_TERM" in logs:
+                break
+            time.sleep(0.25)
+        self.assertIn("GOT_TERM", logs, "the container did not handle SIGTERM")
 
     @tiers.live_tier()
     def test_fixture_a_published_port_answers_http_and_down_removes_everything(self) -> None:
@@ -720,10 +806,16 @@ class LiveFixtureTests(unittest.TestCase):
             self.assertIn("brief", result.stderr, result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        # 2. `compose ps -a` reports the service as exited; the Apple runtime
-        #    exposes no numeric exit-code field, so the state is the report.
+        # 2. `compose ps -a` (default table) reports the service as exited;
+        #    the Apple runtime exposes no numeric exit-code field, so the
+        #    table omits the code Docker would print in parentheses. The JSON
+        #    form refuses instead of fabricating an ExitCode.
         row = self._wait_for_state(harness, "brief", "exited")
-        self.assertTrue("exited" in row or "3" in row, row)
+        self.assertIn('"state": "stopped"', row, row)
+        ps = harness.compose("ps", "--format", "json", "-a")
+        self.assertEqual(ps.returncode, 64, ps.stdout + ps.stderr)
+        self.assertEqual(ps.stdout, "")
+        self.assertIn("exit code", ps.stderr)
 
         # 3. Docker's `inspect --format '{{.State.ExitCode}}'` names no field
         #    Apple container 1.5.0 exposes, so the shim refuses it (exit 64,
@@ -771,6 +863,19 @@ class LiveFixtureTests(unittest.TestCase):
             "the second up recreated the healthy web container",
         )
         self._wait_for_state(harness, "flaky", "exited")
+
+    @tiers.live_tier()
+    def test_compose_ps_json_reports_fixture_l_states(self) -> None:
+        self.require_images("alpine:3.20", "nginx:1.27-alpine")
+        harness = FixtureHarness(self, FIXTURE_L)
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._wait_for_state(harness, "web", "running")
+        self._wait_for_state(harness, "flaky", "exited")
+        ps = harness.compose("ps", "--format", "json", "-a")
+        self.assertEqual(ps.returncode, 64, ps.stdout + ps.stderr)
+        self.assertEqual(ps.stdout, "")
+        self.assertIn("exit code", ps.stderr)
 
     @tiers.live_tier()
     def test_fixture_h_dotenv_value_reaches_container(self) -> None:

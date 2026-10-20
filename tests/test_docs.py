@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -47,6 +48,53 @@ class DocumentationConsistencyTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.readme)
         self.assertNotIn("Anchors, multi-document streams, and `|`/`>` block scalars are\n  out of scope", self.readme)
+
+    def test_compose_ps_format_claims_match_matrix(self) -> None:
+        entries = json.loads((ROOT / "tests/compat/matrix.json").read_text())
+        formats = {
+            entry["id"]: entry["status"] for entry in entries
+            if entry["kind"] == "format" and entry["id"].startswith("docker compose ps")
+        }
+        supported = [key for key, status in formats.items() if status == "SUPPORTED"]
+        refused = [key for key, status in formats.items() if status == "UNSUPPORTED"]
+        self.assertEqual(set(supported), {
+            "docker compose ps --format json", "docker compose ps --format table"
+        })
+        self.assertEqual(len(refused), 2)
+        paragraph = self.readme.split("### Behavior for scripts and agents", 1)[1].split(
+            "### Security options", 1
+        )[0]
+        self.assertIn("docker compose ps --format json|table", paragraph)
+        self.assertIn("refuses Go templates", paragraph)
+        self.assertIn("formats other than `json` or", paragraph)
+
+    def test_run_cpus_mount_volume_notes_state_the_verified_semantics(self) -> None:
+        entries = json.loads((ROOT / "tests/compat/matrix.json").read_text())
+        by_id = {entry["id"]: entry for entry in entries}
+
+        cpus = by_id["run --cpus"]["note"].lower()
+        self.assertIn("integer", cpus)
+        self.assertIn("fractional", cpus)
+        self.assertIn("refus", cpus)
+
+        mount = by_id["run --mount"]["note"].lower()
+        self.assertIn("translated", mount)
+        self.assertNotIn("without content validation", mount)
+
+        volume = by_id["run --volume"]["note"]
+        self.assertIn("z/Z", volume)
+        self.assertIn("refus", volume.lower())
+        self.assertIn("readonly", volume)
+
+    def test_readme_compat_block_carries_the_run_mount_semantics(self) -> None:
+        entries = json.loads((ROOT / "tests/compat/matrix.json").read_text())
+        by_id = {entry["id"]: entry for entry in entries}
+        block = self.readme.split("<!-- compat-matrix:start -->", 1)[1].split(
+            "<!-- compat-matrix:end -->", 1
+        )[0]
+        for entry_id in ("run --cpus", "run --mount", "run --volume"):
+            with self.subTest(entry=entry_id):
+                self.assertIn(by_id[entry_id]["note"], block)
 
     def test_cli_help_uses_the_same_image_classification(self) -> None:
         output = io.StringIO()

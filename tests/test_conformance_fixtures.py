@@ -618,6 +618,27 @@ class ConformanceFixtureTests(unittest.TestCase):
         code = self._wait_for_exited(f"{project}-brief-1")
         self.assertEqual(code, "3", f"brief exited {code!r}, expected 3")
 
+        ps = harness.compose("ps", "--format", "json", "-a")
+        self.assertEqual(ps.returncode, 0, ps.stdout + ps.stderr)
+        record = json.loads(ps.stdout)
+        self.assertEqual(record["State"], "exited")
+        self.assertEqual(record["ExitCode"], 3)
+
+    @tiers.conformance_tier()
+    def test_compose_ps_json_matches_fixture_l_service_states(self) -> None:
+        harness = FixtureHarness(self, "l-partial-failure", docker=_client(), prefix="conf")
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        code = self._wait_for_exited(f"{harness.project}-flaky-1")
+        self.assertEqual(code, "1", f"flaky exited {code!r}, expected 1")
+        ps = harness.compose("ps", "--format", "json", "-a")
+        self.assertEqual(ps.returncode, 0, ps.stdout + ps.stderr)
+        records = [json.loads(line) for line in ps.stdout.splitlines()]
+        by_service = {record["Service"]: record for record in records}
+        self.assertEqual(by_service["web"]["State"], "running")
+        self.assertEqual(by_service["flaky"]["State"], "exited")
+        self.assertEqual(by_service["flaky"]["ExitCode"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
