@@ -526,9 +526,9 @@
     "kind": "compose-key",
     "status": "SUPPORTED",
     "apple": null,
-    "evidence": "unit",
-    "test": null,
-    "note": "Forwarded to the build."
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_q_build_secrets_reach_the_build_and_never_the_output",
+    "note": "Forwarded to the build as --secret id=<target or name>,src=<abs path>|env=<VAR>; file and environment secrets (environment must be exported) are pre-checked before any side effect; uid/gid/mode are NOT APPLIED."
   },
   {
     "id": "compose build.shm_size",
@@ -1604,11 +1604,11 @@
   {
     "id": "compose volumes.Z",
     "kind": "compose-key",
-    "status": "SUPPORTED",
+    "status": "UNSUPPORTED",
     "apple": null,
     "evidence": "unit",
     "test": null,
-    "note": "Accepted in short and long volume syntax."
+    "note": "Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option."
   },
   {
     "id": "compose volumes.bind",
@@ -1636,6 +1636,15 @@
     "evidence": "unit",
     "test": null,
     "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.create_host_path",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_missing_bind_source_is_neither_created_nor_started",
+    "note": "Accepted in long volume syntax without effect: Apple container 1.5.0 never creates a missing bind source and refuses to start the container (findings F5)."
   },
   {
     "id": "compose volumes.delegated",
@@ -1678,8 +1687,8 @@
     "kind": "compose-key",
     "status": "SUPPORTED",
     "apple": null,
-    "evidence": "unit",
-    "test": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_m_read_only_volume_and_bind_reject_writes",
     "note": "Accepted in short and long volume syntax."
   },
   {
@@ -1687,8 +1696,8 @@
     "kind": "compose-key",
     "status": "SUPPORTED",
     "apple": null,
-    "evidence": "unit",
-    "test": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_m_read_only_volume_and_bind_reject_writes",
     "note": "Accepted in short and long volume syntax."
   },
   {
@@ -1699,6 +1708,15 @@
     "evidence": "unit",
     "test": null,
     "note": "Accepted in short and long volume syntax."
+  },
+  {
+    "id": "compose volumes.selinux",
+    "kind": "compose-key",
+    "status": "UNSUPPORTED",
+    "apple": null,
+    "evidence": "unit",
+    "test": null,
+    "note": "Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option."
   },
   {
     "id": "compose volumes.source",
@@ -1757,11 +1775,11 @@
   {
     "id": "compose volumes.z",
     "kind": "compose-key",
-    "status": "SUPPORTED",
+    "status": "UNSUPPORTED",
     "apple": null,
     "evidence": "unit",
     "test": null,
-    "note": "Accepted in short and long volume syntax."
+    "note": "Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option."
   },
   {
     "id": "compose volumes_from",
