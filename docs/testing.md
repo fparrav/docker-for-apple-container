@@ -169,6 +169,20 @@ the process environment (`Q_ENV_SECRET`), the image name arrives through a
 tier also asserts that `up` exits 64 naming the variable, and creates nothing,
 when `Q_ENV_SECRET` is not exported.
 
+`s-anonymous-volume` has one service with a short-form anonymous volume over a
+path the image already has (`/etc/apk`) and a long-form one over a path it does
+not. Both tiers assert that the first starts with the image's content, that the
+second is empty, and that a file written to the first survives recreating the
+container (`REV` changes the environment to force it). The live tier also asserts
+that `down -v` leaves no `_app_anon-` volume and tolerates the runtime's
+`lost+found`. The conformance tier does not assert survival across `down` + `up`,
+because Docker drops anonymous volumes on `down` and the shim keeps them.
+`t-local-bind-volume` declares two top-level volumes with the local bind idiom
+(`driver_opts: {type: none, o: bind, device: ${DATA_DIR}}`, one with `o: bind,ro`)
+on a temporary host directory: a write from the read-write service appears on
+the host, the read-only service cannot write, no Apple volume exists for them
+(live), and the host directory survives `down -v`.
+
 ## Conformance tier in CI
 
 The conformance tier needs a Docker Engine, so it is meant for CI or on-demand
@@ -212,6 +226,18 @@ a newer release is a deliberate change, never an automatic one:
 4. Only when the validator reports no problems, change
    `SUPPORTED_CONTAINER_VERSION`, the test fixtures and the README together,
    then refresh the published website as described in `AGENTS.md`.
+
+The validator's exit status names the case, and the summary always ends with a
+`result:` line stating it:
+
+| Exit | Case |
+| --- | --- |
+| `0` | every requested check ran and held (or `--skip-live` with no problem) |
+| `1` | a check failed: a missing Apple flag, a failed live test, or a runner error |
+| `2` | usage error or invalid matrix |
+| `3` | incomplete: the live tier was requested but no test ran, or a `live` entry's test did not run |
+
+When both 1 and 3 apply, 1 wins.
 
 ## CI limitation
 

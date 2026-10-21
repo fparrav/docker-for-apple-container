@@ -90,8 +90,8 @@ Because nothing is published to a package index, a release is installed from
 the tag, not from an index:
 
 ```bash
-uv tool install --from docker-for-apple-container-fork \
-    git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
+uv tool install --from git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z \
+    docker-for-apple-container-fork
 ```
 
 or
@@ -100,9 +100,9 @@ or
 pipx install git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
 ```
 
-`--from` names the distribution explicitly because the repository is named
-like the upstream project; both commands install
-`docker-for-apple-container-fork`, and the executable lands in the tool bin
+`uv` takes the source with `--from` and the distribution as the positional
+argument, because the repository is named like the upstream project; both
+commands install `docker-for-apple-container-fork`, and the executable lands in the tool bin
 directory (`~/.local/bin` by default). Users of the upstream package must
 uninstall it first (`uv tool uninstall docker-for-apple-container`,
 `pipx uninstall docker-for-apple-container`, or `brew uninstall

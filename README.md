@@ -36,8 +36,8 @@ Releases are GitHub Releases of this repository. Install a release tag
 (replace `vX.Y.Z` with the tag you want) with `uv`:
 
 ```bash
-uv tool install --from docker-for-apple-container-fork \
-    git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
+uv tool install --from git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z \
+    docker-for-apple-container-fork
 ```
 
 or with `pipx`:
@@ -46,9 +46,9 @@ or with `pipx`:
 pipx install git+https://github.com/fparrav/docker-for-apple-container@vX.Y.Z
 ```
 
-`--from` names the distribution explicitly because the repository is named
-like the upstream project; both commands install
-`docker-for-apple-container-fork`. The executable lands in the tool bin
+`uv` takes the source with `--from` and the distribution as the positional
+argument, because the repository is named like the upstream project; both
+commands install `docker-for-apple-container-fork`. The executable lands in the tool bin
 directory (`~/.local/bin` by default for both `uv` and `pipx`).
 
 ### From source
@@ -438,8 +438,47 @@ created (see [Security options](#security-options)). `secrets` and `configs` are
 refused the same way and cannot be waived: they are Compose features, not
 Swarm-only ones, and Apple `container` 1.5.0 cannot mount a single file, so the
 shim has no safe way to deliver them. The shim never opens the files they name.
-`compose run`, scaling, network aliases, continuous healthchecks and
-anonymous-volume removal remain intentionally out of scope.
+`compose run`, scaling, network aliases and continuous healthchecks remain
+intentionally out of scope.
+
+**Anonymous volumes.** A volume entry without a source (`- /app/node_modules`,
+or `{type: volume, target: ...}`) becomes a project-labelled Apple volume named
+`<project>_<service>_anon-<10 hex>`, where the hex is derived from the target
+path. Apple `container` volumes start empty, so on first creation the shim runs
+a short helper container from the service image that copies the image's content
+at the target into the new volume, as Docker does. This needs `/bin/sh` and
+`cp` in the image; if the copy fails, the volume is removed and `up` exits 1
+naming the service, image and target, instead of starting the service with an
+empty directory. An existing volume is never filled again, so data survives
+recreating the container, and `down -v` removes the project's anonymous volumes
+(a plain `down` keeps them, unlike Docker, which drops them). Apple volumes carry
+a `lost+found` directory at their root, also in a volume that was filled from the
+image. Named volumes get no copy-up (existing behavior).
+
+**Local-driver bind volumes.** A top-level volume with `driver: local` (or none)
+and `driver_opts` `type: none`, `o: bind` (optionally `rbind`, `ro`, `rw`) and an
+absolute `device` is mounted as a bind mount of that path; no Apple volume is
+created, and `down -v` never touches the host directory. Any other `driver_opts`
+(for example `type: nfs`, a relative `device`, or an extra `o` token) is refused
+naming the option.
+
+**Network options.** `com.docker.network.bridge.name` only names a Linux bridge,
+so it prints `NOT APPLIED:`; every other network `driver_opts` key is refused.
+
+**`network_mode`.** Every value is refused, with a message for the value: Apple
+`container` has no host network, cannot disable a service's networking and
+cannot join another service's or container's network. Instead of `host`,
+publish the ports with `ports` and reach the host through
+`host.docker.internal`; instead of `service:` or `container:`, use the project
+network, where service names resolve.
+
+**Checking a project without side effects.** `docker compose --dry-run up
+[SERVICE...]` loads the project and runs the capability gate, the mount and
+build-secret checks and the read-only resource checks, prints the networks,
+volumes and containers `up` would create in dependency order, and creates,
+builds, pulls and starts nothing. It reports the same `REFUSED:` lines and exit
+codes as `up`. It does not check that images exist, that builds succeed or that
+services start. `--dry-run` with any other command exits 64.
 
 #### Compose normalizer
 
@@ -757,7 +796,7 @@ API). Known differences are called out in the `note` column.
 | compose memswap_limit | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose models | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose name | SUPPORTED | - | unit | No runtime effect; accepted and ignored as Compose does. |
-| compose network_mode | UNSUPPORTED | - | fake | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 cannot share, disable or replace the project network; the service would otherwise gain connectivity it did not request. |
+| compose network_mode | UNSUPPORTED | - | live | Refused with exit 64 (REFUSED line) for every value, not waivable: Apple container 1.5.0 has no host network and cannot share, disable or replace the project network. The message names the value and the alternative (published `ports` and host.docker.internal for host; the project network for service:/container:). |
 | compose networks | PARTIAL | --network | live | Each declared network joins via Apple --network; per-network aliases are reported with a NOT APPLIED line. |
 | compose oom_kill_disable | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose oom_score_adj | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
@@ -788,7 +827,7 @@ API). Known differences are called out in the `note` column.
 | compose top-level networks | PARTIAL | network create | live | Declared networks are created at up time honoring --internal; external networks are warned and not created. |
 | compose top-level networks.attachable | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
 | compose top-level networks.driver | SUPPORTED | - | unit | Honoured when creating the resource. |
-| compose top-level networks.driver_opts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
+| compose top-level networks.driver_opts | PARTIAL | - | unit | Only com.docker.network.bridge.name is accepted and printed as NOT APPLIED (it names a Linux bridge); every other key is refused with exit 64 naming it, not waivable. |
 | compose top-level networks.enable_ipv4 | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
 | compose top-level networks.enable_ipv6 | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent. |
 | compose top-level networks.external | SUPPORTED | - | fake | Attached by its own name (`name:` or the key); never created or removed. `up` exits 1 when it does not exist, before creating anything. |
@@ -799,7 +838,7 @@ API). Known differences are called out in the `note` column.
 | compose top-level services | SUPPORTED | - | fake | Each entry becomes a service, started in topological (dependency) order. |
 | compose top-level volumes | PARTIAL | - | live | Parsed and shown by `config`; named volumes are created on demand from service references. |
 | compose top-level volumes.driver | SUPPORTED | - | unit | Honoured when creating the resource. |
-| compose top-level volumes.driver_opts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: changes where the data lives and has no Apple equivalent. |
+| compose top-level volumes.driver_opts | PARTIAL | - | live | Only the local bind idiom (driver local or unset; type none; o of bind, rbind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable. |
 | compose top-level volumes.external | SUPPORTED | - | live | Mounted by its own name (`name:` or the key); never created, relabelled or removed. `up` exits 1 naming the volume and service when it does not exist; a leftover `<project>_<key>` copy from earlier versions only gets a notice. |
 | compose top-level volumes.labels | SUPPORTED | - | unit | Honoured when creating the resource. |
 | compose top-level volumes.name | SUPPORTED | - | fake | Used verbatim as the runtime volume name, without the project prefix. |
@@ -811,6 +850,7 @@ API). Known differences are called out in the `note` column.
 | compose uts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
 | compose volumes.Z | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
+| compose volumes.anonymous | SUPPORTED | - | live | A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled once from the image's content at the target (copy-up) by a helper container, reused on recreation and removed by down -v; if the copy fails the volume is removed and up exits 1. |
 | compose volumes.bind | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.cached | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.consistency | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
