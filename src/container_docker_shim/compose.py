@@ -88,6 +88,7 @@ from . import compose_health
 from . import compose_normalizer
 from . import compose_plan
 from . import compose_reconcile
+from . import compose_resource_compat
 from . import compose_resources
 from . import compose_subset
 from .compose_ps import (
@@ -884,6 +885,33 @@ def _volume_resource(project: Project, key: str) -> compose_resources.Resource:
     return found or compose_resources.Resource(key, f"{project.name}_{key}", False)
 
 
+def _local_bind(
+    project: Project, key: str
+) -> Optional[compose_resource_compat.LocalBind]:
+    """The bind a top-level volume stands for (the ``local`` driver idiom), if any.
+
+    Raises ``MountSpecError`` for a ``driver_opts`` form the shared verdict
+    refuses (the gate has already reported it; this keeps the translator from
+    guessing). An external volume is never a bind: it names an existing one.
+    """
+    if not key or _volume_resource(project, key).external:
+        return None
+    verdict = compose_resource_compat.local_bind(_resource_spec(project.volumes, key))
+    if isinstance(verdict, compose_resource_compat.Problem):
+        raise MountSpecError(f"volume {key!r}: {verdict.message}")
+    if isinstance(verdict, compose_resource_compat.LocalBind):
+        return verdict
+    return None
+
+
+def _is_local_bind(project: Project, key: str) -> bool:
+    """Whether ``key`` is a local-driver bind; a refused form is not (the gate reports it)."""
+    try:
+        return _local_bind(project, key) is not None
+    except MountSpecError:
+        return False
+
+
 def _compose_port_to_publish(port: Any) -> str:
     """Translate a compose port entry into Apple `-p [ip:]host:container[/proto]`.
 
@@ -922,25 +950,42 @@ class _PlannedMount:
 
     mount: Mount
     volume_key: Optional[str] = None
+    anonymous: Optional[compose_resources.Resource] = None
 
 
-def _entry_mount(entry: Any, project: Project) -> _PlannedMount:
+def _entry_mount(entry: Any, project: Project, service: str = "") -> _PlannedMount:
     """Pure translation of one volume entry (short or long syntax) into a mount.
 
     Mode and attribute policy lives in :mod:`.mounts`; a named volume's source is
-    replaced by the runtime name the project resolved for it. Raises
+    replaced by the runtime name the project resolved for it, and an entry
+    without a source is the service's anonymous volume at its target. Raises
     ``MountSpecError`` for anything the policy or the translator refuses.
     """
     if isinstance(entry, dict):
         mount = mount_from_entry(entry, project.directory)
     else:
         text = _as_str(entry)
-        if len(text.split(":")) < 2:
+        if text.startswith("/") and ":" not in text:
+            mount = mount_from_entry({"type": "volume", "target": text}, project.directory)
+        elif len(text.split(":")) < 2:
             raise MountSpecError(f"invalid volume entry: {text!r}")
-        mount = parse_volume_spec(text, cwd=project.directory)
+        else:
+            mount = parse_volume_spec(text, cwd=project.directory)
     if mount.kind != "volume":
         return _PlannedMount(mount)
     key = mount.source
+    if not key:
+        if not service:
+            raise MountSpecError(f"anonymous volume at {mount.target!r} needs its service")
+        volume = compose_resources.anonymous_volume(project.name, service, mount.target)
+        return _PlannedMount(dataclasses.replace(mount, source=volume.name), None, volume)
+    bind = _local_bind(project, key)
+    if bind is not None:
+        # `driver_opts: {type: none, o: bind, device: /path}` is Docker's spelling
+        # of a bind mount: no runtime volume is created or owned.
+        return _PlannedMount(
+            Mount("bind", bind.device, mount.target, mount.readonly or bind.read_only)
+        )
     return _PlannedMount(
         dataclasses.replace(mount, source=_volume_resource(project, key).name), key
     )
@@ -948,7 +993,10 @@ def _entry_mount(entry: Any, project: Project) -> _PlannedMount:
 
 def _service_mounts(service: Service, project: Project) -> list[_PlannedMount]:
     """Every mount of a service, validated without touching the runtime."""
-    return [_entry_mount(entry, project) for entry in _as_list(service.spec.get("volumes"))]
+    return [
+        _entry_mount(entry, project, service.name)
+        for entry in _as_list(service.spec.get("volumes"))
+    ]
 
 
 def _mount_error(service: Service, exc: MountSpecError) -> ShimError:
@@ -956,7 +1004,11 @@ def _mount_error(service: Service, exc: MountSpecError) -> ShimError:
 
 
 def _classify_and_translate_volume(
-    entry: Any, project: Project, ensured_volumes: set[str]
+    entry: Any,
+    project: Project,
+    ensured_volumes: set[str],
+    service: str = "",
+    image: str = "",
 ) -> list[str]:
     """Translate one compose volume entry into `container run` args.
 
@@ -965,16 +1017,31 @@ def _classify_and_translate_volume(
     with the native ``--mount type=volume`` form.
     """
     try:
-        planned = _entry_mount(entry, project)
+        planned = _entry_mount(entry, project, service)
     except MountSpecError as exc:
         raise ShimError(f"compose: {exc}", 64)
-    return _emit_planned(planned, project, ensured_volumes)
+    return _emit_planned(planned, project, ensured_volumes, service=service, image=image)
 
 
 def _emit_planned(
-    planned: _PlannedMount, project: Project, ensured_volumes: set[str]
+    planned: _PlannedMount,
+    project: Project,
+    ensured_volumes: set[str],
+    *,
+    service: str = "",
+    image: str = "",
 ) -> list[str]:
-    """The only effect of mount translation: create the named volume on demand."""
+    """The only effect of mount translation: create the volume on demand.
+
+    A named volume is created empty; an anonymous one is created and filled
+    with the image's content at its target (Docker's copy-up).
+    """
+    if planned.anonymous is not None:
+        volume = planned.anonymous
+        if volume.name not in ensured_volumes:
+            _ensure_anonymous_volume(volume, planned.mount.target, service, image)
+            ensured_volumes.add(volume.name)
+        return emit_mount(planned.mount)
     key, resource = planned.volume_key, planned.mount.source
     if key is not None and resource not in ensured_volumes:
         volume = _volume_resource(project, key)
@@ -999,8 +1066,12 @@ def _service_networks(service: Service, project: Project) -> list[str]:
     return [_network_resource(project, key).name for key in _service_network_keys(service)]
 
 
-def _service_volume_keys(service: Service) -> list[str]:
-    """Keys of the named volumes a service mounts (host paths and tmpfs excluded)."""
+def _service_volume_keys(service: Service, project: Optional[Project] = None) -> list[str]:
+    """Keys of the named volumes a service mounts (host paths and tmpfs excluded).
+
+    With ``project``, a volume that is only a bind (the local-driver idiom) is
+    not a runtime volume and is left out.
+    """
     keys: list[str] = []
     for entry in _as_list(service.spec.get("volumes")):
         if isinstance(entry, dict):
@@ -1010,6 +1081,8 @@ def _service_volume_keys(service: Service) -> list[str]:
         else:
             source = _as_str(entry).split(":")[0]
         if source and not is_host_path(source):
+            if project is not None and _is_local_bind(project, source):
+                continue
             keys.append(source)
     return keys
 
@@ -1112,7 +1185,9 @@ def _build_run_args(
     except MountSpecError as exc:
         raise _mount_error(service, exc)
     for planned in planned_mounts:
-        args.extend(_emit_planned(planned, project, ensured_volumes))
+        args.extend(
+            _emit_planned(planned, project, ensured_volumes, service=service.name, image=image)
+        )
 
     # Compose entrypoint follows the same string-splitting rules as command.
     entrypoint = _command_list(spec["entrypoint"]) if spec.get("entrypoint") is not None else None
@@ -1212,7 +1287,7 @@ def _mount_problems(
     for service in services:
         for entry in _as_list(service.spec.get("volumes")):
             try:
-                _entry_mount(entry, project)
+                _entry_mount(entry, project, service.name)
             except MountSpecError as exc:
                 if any(str(exc) in line for line in reported):
                     continue
@@ -1784,9 +1859,14 @@ def _check_resources(project: Project, services: list[Service]) -> list[str]:
     for service in services:
         for key in _service_network_keys(service):
             uses["network"].setdefault(key, (_network_resource(project, key), service.name))
-        for key in _service_volume_keys(service):
+        for key in _service_volume_keys(service, project):
             uses["volume"].setdefault(key, (_volume_resource(project, key), service.name))
     uses["network"].setdefault("default", (_network_resource(project, "default"), ""))
+    planned_services = {service.name for service in services}
+    for volume in project.resources.anonymous:
+        owner = volume.labels.get(compose_resources.LABEL_SERVICE, "")
+        if owner in planned_services:
+            uses["volume"].setdefault(volume.name, (volume, owner))
 
     notices: list[str] = []
     for family, used in uses.items():
@@ -1864,6 +1944,51 @@ def _ensure_network(project: Project, network: str) -> None:
             f"compose: failed to create network {resource}: "
             f"{(result.stderr or result.stdout).strip()}",
             result.returncode,
+        )
+
+
+# Copy-up: anonymous volumes start with what the image has at the target. The
+# target is a positional parameter so it needs no quoting; a path that is not
+# in the image leaves the volume empty, which is what Docker does too.
+_SEED_DEST = "/shim-dest"
+_SEED_SCRIPT = 'if [ -d "$1" ]; then cp -a "$1"/. ' + _SEED_DEST + '/; fi'
+
+
+def _ensure_anonymous_volume(
+    volume: compose_resources.Resource, target: str, service: str, image: str
+) -> None:
+    """Create the anonymous volume once and fill it from ``image`` (design D5).
+
+    An existing volume is reused as it is: its data is never overwritten. When
+    the image's content cannot be copied the new volume is removed and the
+    command fails before the service starts.
+    """
+    if _run_container_capture(["volume", "inspect", volume.name]).returncode == 0:
+        return
+    label_args: list[str] = []
+    for name, value in volume.labels.items():
+        label_args.extend(["--label", f"{name}={value}"])
+    created = _run_container_capture(["volume", "create", *label_args, volume.name])
+    if created.returncode != 0:
+        raise ShimError(
+            f"compose: failed to create volume {volume.name}: "
+            f"{(created.stderr or created.stdout).strip()}",
+            created.returncode,
+        )
+    seeded = _run_container_capture([
+        "run", "--rm", "--name", f"{volume.name}-seed",
+        "--entrypoint", "/bin/sh",
+        "--mount", f"type=volume,source={volume.name},target={_SEED_DEST}",
+        image, "-c", _SEED_SCRIPT, "sh", target,
+    ])
+    if seeded.returncode != 0:
+        _run_container_capture(["volume", "rm", volume.name])
+        detail = (seeded.stderr or seeded.stdout).strip()
+        raise ShimError(
+            f"compose: service {service!r}: could not copy the content of {image} at "
+            f"{target} into the new anonymous volume ({detail}); the volume was removed. "
+            "The image needs /bin/sh and cp, or use a named volume",
+            1,
         )
 
 
@@ -2309,6 +2434,37 @@ def _create_service(
     return result.returncode
 
 
+def _print_dry_run(project: Project, services: list[Service]) -> None:
+    """Print what ``up`` would create, from the same ordered list ``up`` uses."""
+    networks: dict[str, compose_resources.Resource] = {}
+    volumes: dict[str, compose_resources.Resource] = {}
+    for key in ["default", *(k for svc in services for k in _service_network_keys(svc))]:
+        networks.setdefault(key, _network_resource(project, key))
+    planned = {service.name for service in services}
+    for service in services:
+        for key in _service_volume_keys(service, project):
+            volumes.setdefault(key, _volume_resource(project, key))
+    for volume in project.resources.anonymous:
+        if volume.labels.get(compose_resources.LABEL_SERVICE, "") in planned:
+            volumes.setdefault(volume.name, volume)
+
+    def lines(kind: str, items: dict[str, compose_resources.Resource]) -> None:
+        for resource in items.values():
+            note = " (external, must exist)" if resource.external else ""
+            print(f"{kind} {resource.name}{note}")
+
+    print(f"Dry run of project {project.name}: nothing was created.")
+    lines("Network", networks)
+    lines("Volume", volumes)
+    for service in services:
+        name = service.container_name or f"{project.name}-{service.name}-1"
+        print(f"Container {name} (service {service.name})")
+    print(
+        "Dry run: only the configuration was checked; image availability, "
+        "build results and start-up health are not evaluated."
+    )
+
+
 def cmd_up(
     project: Project,
     *,
@@ -2322,6 +2478,7 @@ def cmd_up(
     no_recreate: bool = False,
     remove_orphans: bool = False,
     no_deps: bool = False,
+    dry_run: bool = False,
 ) -> int:
     # The plan is the single source of truth for what this `up` acts on: the
     # set that is validated and checked is the set that is created.
@@ -2338,6 +2495,9 @@ def cmd_up(
     # before the first network, volume or container is created.
     for notice in _check_resources(project, services):
         _warn(notice)
+    if dry_run:
+        _print_dry_run(project, services)
+        return 0
 
     # Provision declared networks (record specs for ensure-on-attach), defaulting
     # to the implicit project network every service joins.
@@ -2496,6 +2656,20 @@ def _removable_names(
     return [r.name for r in compose_resources.removable(declared.values(), labelled, project_name)]
 
 
+def _runtime_volumes(project: Project) -> dict[str, compose_resources.Resource]:
+    """The volumes the project can own at runtime: declared ones and anonymous ones.
+
+    Local-driver binds are only paths, so they are left out.
+    """
+    volumes = {
+        key: volume
+        for key, volume in project.resources.volumes.items()
+        if not _is_local_bind(project, key)
+    }
+    volumes.update({volume.name: volume for volume in project.resources.anonymous})
+    return volumes
+
+
 def cmd_down(
     project_name: str,
     *,
@@ -2532,7 +2706,7 @@ def cmd_down(
         else:
             networks = _load_labeled_resources("network", project_name)
         volumes = (
-            _removable_names("volume", project_name, project.resources.volumes)
+            _removable_names("volume", project_name, _runtime_volumes(project))
             if remove_volumes and project is not None
             else []
         )
@@ -3153,6 +3327,7 @@ def main(argv: list[str]) -> int:
     project_name: str | None = None
     project_dir: str | None = None
     env_files: list[str] = []
+    dry_run = False
 
     i = 0
     while i < len(argv):
@@ -3160,6 +3335,10 @@ def main(argv: list[str]) -> int:
         if arg in ("-h", "--help"):
             print(_USAGE)
             return 0
+        if arg == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
         try:
             parsed = _global_option(argv, i)
         except ShimError as exc:
@@ -3194,6 +3373,7 @@ def main(argv: list[str]) -> int:
             project_name=project_name,
             project_dir=project_dir,
             env_files=tuple(env_files),
+            dry_run=dry_run,
         )
     except ShimError as exc:
         return _die(str(exc), exc.code)
@@ -3210,7 +3390,11 @@ def _dispatch(
     project_name: str | None,
     project_dir: str | None,
     env_files: tuple[str, ...],
+    dry_run: bool = False,
 ) -> int:
+    if dry_run and sub != "up":
+        raise ShimError(f"compose: --dry-run is only supported with 'up', not '{sub}'", 64)
+
     def project() -> Project:
         return _load_project(
             files=files,
@@ -3266,6 +3450,7 @@ def _dispatch(
             no_build=opts.flag("--no-build"),
             only=opts.positionals,
             wait_timeout=wait_timeout,
+            dry_run=dry_run,
         )
     if sub == "down":
         opts = _parse_flags(sub_args, bools={"-v", "--volumes"})

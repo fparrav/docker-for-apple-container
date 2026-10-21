@@ -1,0 +1,18 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# Two anonymous volumes, one per syntax: the short form `- /etc/apk` sits on a
+# path the image already has (alpine keeps its apk repository list there), and
+# the long form `{type: volume, target: /var/cache/shim-anon}` sits on a path
+# the image does not have. The first must start with the image's content
+# (copy-up) and keep data written to it across a container recreation; the
+# second must start empty with no error.
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    environment:
+      REV: ${REV:-1}
+    volumes:
+      - /etc/apk
+      - type: volume
+        target: /var/cache/shim-anon

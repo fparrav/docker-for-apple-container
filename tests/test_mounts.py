@@ -178,6 +178,40 @@ class LongSyntaxPolicyTests(unittest.TestCase):
         self.assertIn(target, message)
         return message
 
+    def test_source_less_volume_is_an_anonymous_mount(self):
+        for entry in (
+            {"type": "volume", "target": "/app/node_modules"},
+            {"type": "volume", "target": "/app/node_modules", "volume": {}},
+            {"target": "/app/node_modules"},
+        ):
+            with self.subTest(entry=entry):
+                mount = mounts.mount_from_entry(entry, "/project")
+                self.assertEqual(
+                    (mount.kind, mount.source, mount.target, mount.readonly),
+                    ("volume", "", "/app/node_modules", False),
+                )
+        read_only = mounts.mount_from_entry(
+            {"type": "volume", "target": "/x", "read_only": True}, "/project"
+        )
+        self.assertTrue(read_only.readonly)
+
+    def test_source_less_volume_keeps_refusing_unsupported_attributes(self):
+        self._refused(
+            {"type": "volume", "target": "/x", "volume": {"subpath": "a"}}, "volume.subpath", "/x"
+        )
+        self._refused(
+            {"type": "volume", "target": "/x", "volume": {"nocopy": True}}, "volume.nocopy", "/x"
+        )
+
+    def test_source_less_bind_and_docker_run_stay_refused(self):
+        with self.assertRaises(mounts.MountSpecError) as caught:
+            mounts.mount_from_entry({"type": "bind", "target": "/x"}, "/project")
+        self.assertIn("mount source is required", str(caught.exception))
+        # `docker run -v /path` keeps its current verdict.
+        with self.assertRaises(mounts.MountSpecError) as caught:
+            mounts.parse_volume_spec("/x")
+        self.assertIn("unsupported volume syntax", str(caught.exception))
+
     def test_read_only_attribute(self):
         self.assertTrue(mounts.mount_from_entry(self._bind(read_only=True), "/project").readonly)
         self.assertTrue(mounts.mount_from_entry(self._named(read_only=True), "/project").readonly)

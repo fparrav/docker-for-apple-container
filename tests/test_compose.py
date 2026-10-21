@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from container_docker_shim import compose  # noqa: E402
 from container_docker_shim import compose_capabilities  # noqa: E402
 from container_docker_shim import compose_normalizer  # noqa: E402
+from container_docker_shim import compose_resources  # noqa: E402
 
 TIER = "fake"
 
@@ -151,6 +152,8 @@ if a[:1] == ["run"]:
         # Foreground run: the container runs to completion; its exit code is
         # the scripted one (exit_codes: {container: code}), default 0.
         d["containers"][name]["status"] = {"state": "stopped", "networks": []}
+        if "--rm" in a:
+            d["containers"].pop(name)  # `--rm` removes the container once it exits
         save(d); raise SystemExit(d.get("exit_codes", {}).get(name, 0))
     save(d); print(name); raise SystemExit(0)
 
@@ -489,6 +492,28 @@ class RunArgsSecurityTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # End-to-end tests against the fake container binary
 # --------------------------------------------------------------------------- #
+
+
+# Runtime verbs a dry run may use: reads only (design D7).
+READ_ONLY_CALLS = (
+    ["--version"],
+    ["system", "status"],
+    ["inspect"],
+    ["list"],
+    ["image", "inspect"],
+    ["volume", "inspect"],
+    ["network", "inspect"],
+    ["volume", "list"],
+    ["network", "list"],
+)
+
+
+def mutating_calls(calls: list) -> list:
+    """The runtime calls that are not on the read-only allow-list."""
+    return [
+        call for call in calls
+        if not any(call[: len(allowed)] == allowed for allowed in READ_ONLY_CALLS)
+    ]
 
 
 class ComposeE2ETests(unittest.TestCase):
@@ -1841,7 +1866,8 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertEqual(result.returncode, 64, result.stderr)
         self.assertIn("REFUSED:", result.stderr)
         self.assertIn("worker", result.stderr)
-        self.assertIn("network_mode", result.stderr)
+        self.assertIn("network_mode: none is not supported", result.stderr)
+        self.assertNotIn("network_mode: network_mode", result.stderr)
         state = self.load_state()
         self.assertEqual(state["containers"], {})
         self.assertEqual(state["networks"], {})
@@ -1958,6 +1984,214 @@ class ComposeE2ETests(unittest.TestCase):
         after = self.load_state()
         self.assertEqual(after["action_log"], [])
         self.assertEqual(after["containers"], before["containers"])
+
+    def write_local_bind_compose(self, options: str, services: tuple = ("db",)) -> Path:
+        """A project whose `data` volume is the local-driver bind idiom."""
+        device = self.root / "host-data"
+        device.mkdir(exist_ok=True)
+        body = "services:\n"
+        for name in services:
+            body += (
+                f"  {name}:\n    image: alpine:3.20\n    volumes:\n      - data:/data\n"
+            )
+        body += (
+            "volumes:\n  data:\n    driver: local\n    driver_opts:\n"
+            f"      type: none\n      o: {options}\n      device: {device}\n"
+        )
+        (self.project / "docker-compose.yml").write_text(body)
+        return device
+
+    def run_mounts(self) -> list:
+        """The `--mount` values of every `container run` the fake received."""
+        mounts = []
+        for call in self.runtime_calls():
+            if call[:1] == ["run"] and "--mount" in call:
+                mounts.extend(
+                    call[i + 1] for i, arg in enumerate(call) if arg == "--mount"
+                )
+        return mounts
+
+    def test_local_bind_volume_is_a_bind_mount_and_creates_no_volume(self) -> None:
+        device = self.write_local_bind_compose("bind")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"type=bind,source={device},target=/data", self.run_mounts())
+        self.assertEqual(self.load_state()["volumes"], {})
+        volume_calls = [c for c in self.runtime_calls() if c[:1] == ["volume"]]
+        self.assertEqual([c for c in volume_calls if c[1] in ("create", "inspect")], [])
+
+    def test_local_bind_volume_with_ro_is_read_only(self) -> None:
+        device = self.write_local_bind_compose("bind,ro")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"type=bind,source={device},target=/data,readonly", self.run_mounts())
+
+    def test_two_services_share_the_local_bind_volume(self) -> None:
+        device = self.write_local_bind_compose("rbind", services=("a", "b"))
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_mounts().count(f"type=bind,source={device},target=/data"), 2)
+
+    def test_down_v_never_removes_a_local_bind_volume(self) -> None:
+        device = self.write_local_bind_compose("bind")
+        (device / "keep.txt").write_text("data")
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        result = self.docker("compose", "down", "-v")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in self.runtime_calls() if c[:2] == ["volume", "rm"]], [])
+        self.assertTrue((device / "keep.txt").exists())
+
+    def test_refused_local_bind_variants_exit_64_and_create_nothing(self) -> None:
+        self._seed_state()
+        self.write_local_bind_compose("bind,uid=1")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("uid=1", result.stderr)
+        self.assert_nothing_was_created()
+
+    ANON_COMPOSE = """
+        services:
+          web:
+            image: node:20
+            volumes:
+              - ./src:/app
+              - /app/node_modules
+        """
+
+    def anonymous_name(self, target: str = "/app/node_modules", service: str = "web") -> str:
+        return compose_resources.anonymous_volume("demo", service, target).name
+
+    def seed_runs(self) -> list:
+        """The copy-up helper runs the fake received."""
+        return [
+            c for c in self.runtime_calls()
+            if c[:1] == ["run"] and "--entrypoint" in c and c[c.index("--entrypoint") + 1] == "/bin/sh"
+        ]
+
+    def test_anonymous_volume_is_a_labelled_volume_filled_from_the_image(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        name = self.anonymous_name()
+        labels = self.load_state()["volumes"][name]["configuration"]["labels"]
+        self.assertEqual(labels["com.docker.compose.project"], "demo")
+        self.assertEqual(labels["com.docker.compose.service"], "web")
+        self.assertEqual(labels["com.docker.compose.anonymous"], "/app/node_modules")
+        self.assertIn(f"type=volume,source={name},target=/app/node_modules", self.run_mounts())
+        (seed,) = self.seed_runs()
+        self.assertIn("--rm", seed)
+        self.assertIn("node:20", seed)
+        self.assertEqual(seed[-3:], [compose._SEED_SCRIPT, "sh", "/app/node_modules"])
+        # The helper is gone and no `-v /path` reached the service container.
+        self.assertEqual(sorted(self.load_state()["containers"]), ["demo-web-1"])
+        service_run = [c for c in self.runtime_calls() if c[:1] == ["run"] and "--name" in c
+                       and c[c.index("--name") + 1] == "demo-web-1"][0]
+        self.assertNotIn("-v", service_run)
+
+    def test_anonymous_volume_is_reused_and_not_filled_again_on_recreate(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        creates = [c for c in self.runtime_calls() if c[:2] == ["volume", "create"]]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(self.seed_runs()), 1)
+        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+
+    def test_two_anonymous_targets_get_two_volumes(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: node:20
+                volumes:
+                  - /app/node_modules
+                  - /var/cache
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        volumes = self.load_state()["volumes"]
+        self.assertEqual(
+            sorted(volumes),
+            sorted([self.anonymous_name("/app/node_modules"), self.anonymous_name("/var/cache")]),
+        )
+        self.assertEqual(len(self.seed_runs()), 2)
+
+    def test_failed_copy_up_removes_the_volume_and_does_not_start_the_service(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        self.script_run_failure(f"{self.anonymous_name()}-seed")
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        for text in ("web", "node:20", "/app/node_modules"):
+            self.assertIn(text, result.stderr)
+        state = self.load_state()
+        self.assertNotIn(self.anonymous_name(), state["volumes"])
+        self.assertNotIn(["run", "demo-web-1"], state["action_log"])
+
+    def test_down_v_removes_only_the_projects_anonymous_volumes(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        state = self.load_state()
+        state["volumes"]["other_anon"] = {
+            "configuration": {"name": "other_anon", "labels": {"com.docker.compose.project": "other"}},
+            "id": "other_anon",
+        }
+        state["volumes"]["unlabelled"] = {"configuration": {"name": "unlabelled", "labels": {}}, "id": "unlabelled"}
+        self.state.write_text(json.dumps(state))
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+        self.assertEqual(self.docker("compose", "down", "-v").returncode, 0)
+        volumes = self.load_state()["volumes"]
+        self.assertNotIn(self.anonymous_name(), volumes)
+        self.assertIn("other_anon", volumes)
+        self.assertIn("unlabelled", volumes)
+
+    def test_anonymous_volume_name_owned_by_another_project_is_refused(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        self._seed_state()
+        state = self.load_state()
+        name = self.anonymous_name()
+        state["volumes"][name] = {
+            "configuration": {"name": name, "labels": {"com.docker.compose.project": "other"}},
+            "id": name,
+        }
+        self.state.write_text(json.dumps(state))
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("belongs to project", result.stderr)
+        self.assertEqual(self.seed_runs(), [])
+
+    def test_anonymous_volume_with_subpath_is_refused_before_anything_is_created(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: node:20
+                volumes:
+                  - type: volume
+                    target: /app/node_modules
+                    volume:
+                      subpath: sub
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("subpath", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_long_syntax_anonymous_volume_equals_the_short_one(self) -> None:
+        proj = compose.Project("p", {"services": {"web": {"image": "x"}}}, "/tmp/p")
+        short = compose._entry_mount("/cache", proj, "web")
+        long = compose._entry_mount({"type": "volume", "target": "/cache"}, proj, "web")
+        self.assertEqual(short, long)
+        self.assertEqual(short.anonymous.labels["com.docker.compose.service"], "web")
+        self.assertEqual(short.mount.source, short.anonymous.name)
 
     def test_volume_driver_opts_exit_64_without_creating_a_volume(self) -> None:
         self._seed_state()
@@ -3917,6 +4151,123 @@ class ComposeE2ETests(unittest.TestCase):
         official = self.runtime_trace()
         self.assertEqual(official[0], builtin[0])
         self.assertEqual(official[1], builtin[1])
+
+
+    DRY_COMPOSE = """
+        services:
+          db:
+            image: postgres:16
+            volumes:
+              - data:/var/lib/postgresql/data
+          web:
+            image: nginx:latest
+            depends_on: [db]
+            volumes:
+              - /cache
+          other:
+            image: alpine:3.20
+        volumes:
+          data: {}
+        """
+
+    def dry_up(self, *args: str, flag_first: bool = True) -> subprocess.CompletedProcess[str]:
+        if flag_first:
+            return self.docker("compose", "--dry-run", "up", *args)
+        return self.docker("compose", "up", "--dry-run", *args)
+
+    def test_dry_run_up_prints_the_plan_and_calls_only_read_only_verbs(self) -> None:
+        self.write_compose(self.DRY_COMPOSE)
+        result = self.dry_up("-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertIn("Network demo_default", lines)
+        self.assertIn("Volume demo_data", lines)
+        self.assertIn(f"Volume {self.anonymous_name('/cache')}", lines)
+        containers = [line for line in lines if line.startswith("Container ")]
+        self.assertEqual(
+            [line.split()[1] for line in containers],
+            ["demo-db-1", "demo-web-1", "demo-other-1"],
+        )
+        self.assertLess(lines.index("Container demo-db-1 (service db)"),
+                        lines.index("Container demo-web-1 (service web)"))
+        self.assertIn("only the configuration was checked", lines[-1])
+        self.assertEqual(mutating_calls(self.runtime_calls()), [])
+
+    def test_the_read_only_check_fails_for_a_real_up(self) -> None:
+        self.write_compose(self.DRY_COMPOSE)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(mutating_calls(self.runtime_calls()))
+
+    def test_the_read_only_check_catches_a_mutating_stub(self) -> None:
+        stub = [["list", "--all"], ["volume", "create", "demo_data"], ["run", "-d", "nginx"]]
+        self.assertEqual(
+            mutating_calls(stub), [["volume", "create", "demo_data"], ["run", "-d", "nginx"]]
+        )
+
+    def test_dry_run_flag_after_up_is_not_a_global_flag(self) -> None:
+        self.write_compose(self.DRY_COMPOSE)
+        result = self.dry_up(flag_first=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.runtime_calls() and mutating_calls(self.runtime_calls()), [])
+
+    def test_dry_run_up_with_a_service_honours_the_selection(self) -> None:
+        self.write_compose(self.DRY_COMPOSE)
+        result = self.dry_up("web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        containers = [l for l in result.stdout.splitlines() if l.startswith("Container ")]
+        self.assertEqual(
+            containers,
+            ["Container demo-db-1 (service db)", "Container demo-web-1 (service web)"],
+        )
+        self.assertNotIn("demo-other-1", result.stdout)
+        alone = self.dry_up("other")
+        self.assertEqual(alone.returncode, 0, alone.stderr)
+        self.assertNotIn("demo_data", alone.stdout)
+        self.assertNotIn("demo-web-1", alone.stdout)
+
+    def test_dry_run_reports_a_refused_key_like_up(self) -> None:
+        self.write_compose(
+            """
+            services:
+              worker:
+                image: alpine:3.20
+                network_mode: none
+            """
+        )
+        dry = self.dry_up()
+        real = self.docker("compose", "up", "-d")
+        self.assertEqual(dry.returncode, 64, dry.stderr)
+        self.assertEqual(real.returncode, 64, real.stderr)
+        refused = [l for l in dry.stderr.splitlines() if l.startswith("REFUSED:")]
+        self.assertTrue(refused)
+        self.assertEqual(refused, [l for l in real.stderr.splitlines() if l.startswith("REFUSED:")])
+        self.assertEqual(mutating_calls(self.runtime_calls()[:1]), [])
+
+    def test_dry_run_reports_a_managed_name_conflict_like_up(self) -> None:
+        self._seed_resource("volumes", "demo_data", {"com.docker.compose.project": "other"})
+        self.write_compose(self.DRY_COMPOSE)
+        dry = self.dry_up()
+        self.assertEqual(dry.returncode, 1, dry.stderr)
+        self.assertIn("belongs to project", dry.stderr)
+        self.assertEqual(mutating_calls(self.runtime_calls()), [])
+
+    def test_dry_run_reports_a_missing_build_secret_file(self) -> None:
+        self.write_secret_project("tok", "tok:\n            file: ./missing-token.txt")
+        result = self.dry_up()
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertIn("missing-token.txt", result.stderr)
+        self.assertEqual(mutating_calls(self.runtime_calls()), [])
+
+    def test_dry_run_with_other_commands_exits_64_and_calls_nothing(self) -> None:
+        self.write_compose(self.DRY_COMPOSE)
+        for command in ("down", "stop", "rm", "build", "pull", "ps"):
+            with self.subTest(command=command):
+                result = self.docker("compose", "--dry-run", command)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("only supported with 'up'", result.stderr)
+        self.assertEqual(self.runtime_calls(), [])
 
 
 class DependsConditionTests(unittest.TestCase):

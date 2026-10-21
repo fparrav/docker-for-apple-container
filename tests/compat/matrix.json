@@ -1129,9 +1129,9 @@
     "kind": "compose-key",
     "status": "UNSUPPORTED",
     "apple": null,
-    "evidence": "fake",
-    "test": null,
-    "note": "Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 cannot share, disable or replace the project network; the service would otherwise gain connectivity it did not request."
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_network_mode_host_is_refused_with_the_host_message_and_creates_nothing",
+    "note": "Refused with exit 64 (REFUSED line) for every value, not waivable: Apple container 1.5.0 has no host network and cannot share, disable or replace the project network. The message names the value and the alternative (published `ports` and host.docker.internal for host; the project network for service:/container:)."
   },
   {
     "id": "compose networks",
@@ -1406,11 +1406,11 @@
   {
     "id": "compose top-level networks.driver_opts",
     "kind": "compose-key",
-    "status": "UNSUPPORTED",
+    "status": "PARTIAL",
     "apple": null,
     "evidence": "unit",
     "test": null,
-    "note": "Refused with exit 64 (REFUSED line), not waivable: changes how the network behaves and has no Apple equivalent."
+    "note": "Only com.docker.network.bridge.name is accepted and printed as NOT APPLIED (it names a Linux bridge); every other key is refused with exit 64 naming it, not waivable."
   },
   {
     "id": "compose top-level networks.enable_ipv4",
@@ -1505,11 +1505,11 @@
   {
     "id": "compose top-level volumes.driver_opts",
     "kind": "compose-key",
-    "status": "UNSUPPORTED",
+    "status": "PARTIAL",
     "apple": null,
-    "evidence": "unit",
-    "test": null,
-    "note": "Refused with exit 64 (REFUSED line), not waivable: changes where the data lives and has no Apple equivalent."
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them",
+    "note": "Only the local bind idiom (driver local or unset; type none; o of bind, rbind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable."
   },
   {
     "id": "compose top-level volumes.external",
@@ -1609,6 +1609,15 @@
     "evidence": "unit",
     "test": null,
     "note": "Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option."
+  },
+  {
+    "id": "compose volumes.anonymous",
+    "kind": "compose-key",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_and_down_v_removes",
+    "note": "A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled once from the image's content at the target (copy-up) by a helper container, reused on recreation and removed by down -v; if the copy fails the volume is removed and up exits 1."
   },
   {
     "id": "compose volumes.bind",

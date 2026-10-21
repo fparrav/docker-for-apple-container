@@ -1,0 +1,32 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# Two top-level volumes on the local bind idiom (driver_opts type: none,
+# o: bind, device: ${DATA_DIR}) over one host directory: `shared` is
+# read-write (no driver key) and `shared_ro` is read-only (driver: local,
+# o: bind,ro). A write from the read-write service must appear in the host
+# directory, the read-only service must be able to read it but not write,
+# no runtime volume may exist for the keys, and the host directory must
+# survive `down -v`.
+services:
+  writer:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    volumes:
+      - shared:/data
+  reader:
+    image: alpine:3.20
+    command: ["sleep", "3600"]
+    volumes:
+      - shared_ro:/data
+volumes:
+  shared:
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR}
+  shared_ro:
+    driver: local
+    driver_opts:
+      type: none
+      o: "bind,ro"
+      device: ${DATA_DIR}

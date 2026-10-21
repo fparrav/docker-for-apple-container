@@ -17,6 +17,16 @@ supported-version constant: advancing it stays a deliberate, separate change.
 
 Usage:
     scripts/validate-runtime.py [--container PATH] [--skip-live] [--output FILE]
+
+Exit status:
+    0  every requested check ran and held (or --skip-live with no problem)
+    1  a check failed (a missing Apple flag, a failed live test, a runner error)
+    2  usage error or invalid matrix
+    3  incomplete: the live tier was requested but no test ran, or a live
+       entry's test did not run
+
+When 1 and 3 both apply, 1 wins. The summary always ends with a ``result:``
+line stating which case applies.
 """
 from __future__ import annotations
 
@@ -41,20 +51,39 @@ LIVE_TIMEOUT = 3600
 OPTION_COMMANDS = {"run": ["run"], "build": ["build"]}
 
 
-def _help(container: str, words: list, cache: dict) -> tuple:
-    key = tuple(words)
-    if key not in cache:
-        try:
-            result = subprocess.run(
-                [container, *words, "--help"],
-                capture_output=True,
-                text=True,
-                timeout=HELP_TIMEOUT,
-            )
-            cache[key] = (result.returncode, result.stdout + result.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            cache[key] = (127, str(exc))
-    return cache[key]
+class Runtime:
+    """The candidate ``container`` binary, probed read-only.
+
+    Only ``--version`` and ``--help`` are issued; nothing is run or created.
+    ``main`` accepts a substitute with the same two methods, which is how the
+    unit tests exercise the script without a runtime.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._cache: dict = {}
+
+    def version(self) -> str:
+        result = subprocess.run(
+            [self.path, "--version"], capture_output=True, text=True, timeout=HELP_TIMEOUT
+        )
+        return result.stdout.strip()
+
+    def help(self, words: list) -> tuple:
+        """(exit code, combined output) of ``<words> --help``, cached per command."""
+        key = tuple(words)
+        if key not in self._cache:
+            try:
+                result = subprocess.run(
+                    [self.path, *words, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=HELP_TIMEOUT,
+                )
+                self._cache[key] = (result.returncode, result.stdout + result.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self._cache[key] = (127, str(exc))
+        return self._cache[key]
 
 
 def _flag_command(entry: dict) -> list:
@@ -65,29 +94,44 @@ def _flag_command(entry: dict) -> list:
     return OPTION_COMMANDS.get(prefix) or []
 
 
-def check_entry(entry: dict, container: str, cache: dict) -> str:
+def _lists_flag(help_text: str, flag: str) -> bool:
+    return bool(re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_text))
+
+
+def check_entry(entry: dict, runtime: "Runtime") -> str:
     """Return ``held``, ``missing`` or ``not checked`` for the Apple side of an entry."""
     apple = entry.get("apple")
     if not apple:
         return "not checked"
     if not apple.startswith("-"):
-        # A command (or sub-command) name: its own --help must exit 0.
-        words = apple.split()
-        if words and words[0] == "container":
-            words = words[1:]
-        code, _ = _help(container, words, cache)
-        return "held" if code == 0 else "missing"
+        # One or more commands joined by ";" (for example `container --version;
+        # container system status`): each part must hold.
+        for part in apple.split(";"):
+            words = part.split()
+            if words and words[0] == "container":
+                words = words[1:]
+            if len(words) == 1 and words[0].startswith("-"):
+                # A global option: `container --help` must list it.
+                code, text = runtime.help([])
+                if code != 0 or not _lists_flag(text, words[0]):
+                    return "missing"
+                continue
+            # A command (or sub-command) name: its own --help must exit 0.
+            code, _ = runtime.help(words)
+            if code != 0:
+                return "missing"
+        return "held"
     command = _flag_command(entry)
     if not command:
         return "not checked"
-    code, text = _help(container, command, cache)
+    code, text = runtime.help(command)
     if code != 0:
         return "missing"
     flag = apple.split()[0]  # `--ssh default` documents the flag `--ssh`
-    return "held" if re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", text) else "missing"
+    return "held" if _lists_flag(text, flag) else "missing"
 
 
-def run_live(container: str) -> tuple:
+def _run_live(container: str) -> tuple:
     """Run the live tier; return (ran, {test id: outcome}, raw output, exit code)."""
     env = dict(os.environ, SHIM_TIERS="live", CONTAINER_DOCKER_SHIM_CONTAINER=container)
     result = subprocess.run(
@@ -119,17 +163,37 @@ def run_live(container: str) -> tuple:
     )
 
 
-def main(argv: list = None) -> int:
+def _verdict(skip_live: bool, live_ran: bool, not_run: list, problems: int) -> tuple:
+    """(exit status, summary footer) for the run; a failure (1) wins over an
+    incomplete live tier (3)."""
+    live_incomplete = (not skip_live) and (not live_ran or bool(not_run))
+    if problems:
+        return 1, f"result: failed ({problems} problem{'s' if problems != 1 else ''})"
+    if live_incomplete:
+        if not live_ran:
+            return 3, "result: incomplete (live tier: not run)"
+        return 3, (
+            f"result: incomplete ({len(not_run)} live entry"
+            f"{'s' if len(not_run) != 1 else ''} without an executed test)"
+        )
+    detail = "live tier: not run (--skip-live)" if skip_live else "live tier: ran"
+    return 0, f"result: success ({detail})"
+
+
+def main(argv: list = None, *, runtime: "Runtime" = None, run_live=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--container", default=os.environ.get("CONTAINER_DOCKER_SHIM_CONTAINER") or "container")
     parser.add_argument("--skip-live", action="store_true", help="only run the read-only matrix check")
     parser.add_argument("--output", help="also write the summary to this file")
     args = parser.parse_args(argv)
 
+    if runtime is None:
+        runtime = Runtime(args.container)
+    if run_live is None:
+        run_live = _run_live
+
     try:
-        version = subprocess.run(
-            [args.container, "--version"], capture_output=True, text=True, timeout=HELP_TIMEOUT
-        ).stdout.strip()
+        version = runtime.version()
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"cannot run {args.container}: {exc}", file=sys.stderr)
         return 2
@@ -142,10 +206,10 @@ def main(argv: list = None) -> int:
     errors = compat_matrix.validate(entries)
     if errors:
         print("\n".join(["matrix is invalid:"] + errors), file=sys.stderr)
+        print("result: usage (invalid matrix)", file=sys.stderr)
         return 2
 
-    cache: dict = {}
-    apple = {entry["id"]: check_entry(entry, args.container, cache) for entry in entries}
+    apple = {entry["id"]: check_entry(entry, runtime) for entry in entries}
 
     live_ran, outcomes, live_output, live_returncode = False, {}, "", 0
     if args.skip_live:
@@ -161,6 +225,7 @@ def main(argv: list = None) -> int:
 
     rows = ["", "| id | claimed | apple side | live test |", "| --- | --- | --- | --- |"]
     problems = int(bool(live_returncode))
+    not_run = []
     for entry in entries:
         claimed = entry["evidence"]
         test = entry.get("test")
@@ -169,17 +234,21 @@ def main(argv: list = None) -> int:
             live = outcomes.get(test, "not run") if live_ran else "not run"
             if live == "FAILED":
                 problems += 1
+            elif live == "not run":
+                not_run.append(entry["id"])
         if apple[entry["id"]] == "missing":
             problems += 1
         rows.append(f"| {entry['id']} | {claimed} | {apple[entry['id']]} | {live} |")
 
     lines += rows
     lines += ["", f"entries: {len(entries)}; problems: {problems}"]
+    status, footer = _verdict(args.skip_live, live_ran, not_run, problems)
+    lines.append(footer)
     text = "\n".join(lines)
     print(text)
     if args.output:
         Path(args.output).write_text(text + "\n", encoding="utf-8")
-    return 1 if problems else 0
+    return status
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import unittest
 from pathlib import Path
@@ -14,12 +15,13 @@ TIER = "unit"
 
 
 class FakeProject:
-    """Duck-typed stand-in for the parsed model: name + networks + volumes."""
+    """Duck-typed stand-in for the parsed model: name + networks + volumes + services."""
 
-    def __init__(self, name, networks=None, volumes=None):
+    def __init__(self, name, networks=None, volumes=None, services=None):
         self.name = name
         self.networks = networks
         self.volumes = volumes
+        self.services = services
 
 
 class ConstantsTests(unittest.TestCase):
@@ -27,6 +29,8 @@ class ConstantsTests(unittest.TestCase):
         self.assertEqual(compose_resources.LABEL_PROJECT, "com.docker.compose.project")
         self.assertEqual(compose_resources.LABEL_NETWORK, "com.docker.compose.network")
         self.assertEqual(compose_resources.LABEL_VOLUME, "com.docker.compose.volume")
+        self.assertEqual(compose_resources.LABEL_SERVICE, "com.docker.compose.service")
+        self.assertEqual(compose_resources.LABEL_ANONYMOUS, "com.docker.compose.anonymous")
 
 
 class NameResolutionTests(unittest.TestCase):
@@ -133,6 +137,114 @@ class LabelsTests(unittest.TestCase):
         self.assertEqual(result.volumes["b"].labels, {})
 
 
+ANONYMOUS_SERVICES = {
+    "api": {
+        "volumes": [
+            "/app/node_modules",  # short syntax
+            {"type": "volume", "target": "/cache"},  # long syntax
+            {"type": "volume", "target": "/cache"},  # duplicate entry
+            "./src:/app",  # bind (short)
+            {"type": "bind", "source": "./src", "target": "/app"},  # bind (long)
+            {"type": "tmpfs", "target": "/tmp"},
+            {"type": "volume", "source": "data", "target": "/data"},  # named
+            {"type": "image", "source": "img", "target": "/x"},
+        ]
+    },
+    "worker": {
+        "volumes": [
+            "/app/node_modules",  # same target as api's, different service
+            {"target": "/scratch"},  # type absent
+        ]
+    },
+}
+
+
+def _anon_name(project, service, target):
+    return f"{project}_{service}_anon-{hashlib.sha256(target.encode()).hexdigest()[:10]}"
+
+
+class AnonymousVolumeTests(unittest.TestCase):
+    def test_same_inputs_give_the_same_name(self):
+        first = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        second = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertEqual(first, second)
+
+    def test_different_target_service_or_project_give_different_names(self):
+        base = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertNotEqual(
+            base.name, compose_resources.anonymous_volume("demo", "api", "/app/site-packages").name
+        )
+        self.assertNotEqual(
+            base.name, compose_resources.anonymous_volume("demo", "worker", "/app/node_modules").name
+        )
+        self.assertNotEqual(
+            base.name, compose_resources.anonymous_volume("prod", "api", "/app/node_modules").name
+        )
+
+    def test_name_is_the_hashed_target(self):
+        resource = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertEqual(resource.name, _anon_name("demo", "api", "/app/node_modules"))
+
+    def test_name_is_a_valid_runtime_name_for_dotted_and_dashed_services(self):
+        resource = compose_resources.anonymous_volume("demo", "api.v1-2", "/cache")
+        self.assertRegex(resource.name, r"^[A-Za-z0-9_.-]+$")
+
+    def test_labels_carry_project_service_and_target(self):
+        resource = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertEqual(
+            resource.labels,
+            {
+                "com.docker.compose.project": "demo",
+                "com.docker.compose.service": "api",
+                "com.docker.compose.anonymous": "/app/node_modules",
+            },
+        )
+        self.assertEqual(resource.key, "/app/node_modules")
+        self.assertFalse(resource.external)
+        self.assertTrue(resource.managed)
+
+
+class ResolveAnonymousTests(unittest.TestCase):
+    def test_resolve_lists_anonymous_volumes_in_service_then_entry_order(self):
+        result = compose_resources.resolve(FakeProject("demo", services=ANONYMOUS_SERVICES))
+        self.assertEqual(
+            [r.name for r in result.anonymous],
+            [
+                _anon_name("demo", "api", "/app/node_modules"),
+                _anon_name("demo", "api", "/cache"),
+                _anon_name("demo", "worker", "/app/node_modules"),
+                _anon_name("demo", "worker", "/scratch"),
+            ],
+        )
+        self.assertEqual(
+            [r.key for r in result.anonymous],
+            ["/app/node_modules", "/cache", "/app/node_modules", "/scratch"],
+        )
+
+    def test_project_without_services_attribute_resolves_as_before(self):
+        project = FakeProject("demo", networks={"back": {}}, volumes={"data": {}})
+        del project.services
+        result = compose_resources.resolve(project)
+        self.assertEqual(result.anonymous, ())
+        self.assertEqual(result.networks["back"].name, "demo_back")
+        self.assertEqual(result.volumes["data"].name, "demo_data")
+        self.assertEqual(result.networks["default"].name, "demo_default")
+
+    def test_missing_or_empty_services_yield_no_anonymous(self):
+        for services in (None, {}):
+            with self.subTest(services=services):
+                result = compose_resources.resolve(
+                    FakeProject("demo", volumes={"data": {}}, services=services)
+                )
+                self.assertEqual(result.anonymous, ())
+                self.assertEqual(result.volumes["data"].name, "demo_data")
+
+    def test_duplicate_entries_collapse_to_one(self):
+        services = {"api": {"volumes": ["/cache", "/cache", "/cache"]}}
+        result = compose_resources.resolve(FakeProject("demo", services=services))
+        self.assertEqual([r.name for r in result.anonymous], [_anon_name("demo", "api", "/cache")])
+
+
 class RemovableTests(unittest.TestCase):
     def test_only_owned_managed_resources_survive_in_order(self):
         result = compose_resources.resolve(FakeProject(
@@ -183,6 +295,18 @@ class RemovableTests(unittest.TestCase):
         result = compose_resources.resolve(FakeProject("demo", volumes={"data": {}}))
         kept = compose_resources.removable(result.volumes.values(), {}, "demo")
         self.assertEqual(kept, [])
+
+    def test_removable_keeps_only_own_labelled_anonymous_volumes(self):
+        result = compose_resources.resolve(FakeProject("demo", services=ANONYMOUS_SERVICES))
+        api_modules = _anon_name("demo", "api", "/app/node_modules")
+        api_cache = _anon_name("demo", "api", "/cache")
+        labelled = {
+            api_modules: "demo",   # managed, ours          -> kept
+            api_cache: "other",    # managed, other project -> excluded
+            # the worker volumes are unlabelled            -> excluded
+        }
+        kept = compose_resources.removable(result.anonymous, labelled, "demo")
+        self.assertEqual([r.name for r in kept], [api_modules])
 
 
 if __name__ == "__main__":

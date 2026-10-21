@@ -232,7 +232,11 @@ def mount_from_entry(
                 "cannot represent it"
             )
         raise MountSpecError(f"unknown volume type {kind!r} on {target!r}")
-    _validate_source(source, target)
+    # A volume entry without a source is Compose's anonymous volume; the
+    # caller names it. `docker run -v /path` goes through parse_volume_spec
+    # and is unchanged.
+    if source or kind == "bind":
+        _validate_source(source, target)
 
     readonly = False
     for key, value in entry.items():

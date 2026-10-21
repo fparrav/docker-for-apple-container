@@ -3,8 +3,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +19,34 @@ sys.path.insert(0, str(ROOT / "src"))
 from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION, print_help  # noqa: E402
 
 TIER = "unit"
+
+
+PACKAGE = "docker-for-apple-container-fork"
+GIT_URL = "git+https://github.com/fparrav/docker-for-apple-container"
+
+# `uv tool install` takes the source with --from and the distribution as the
+# positional argument, or one PEP 508 direct reference. `--from <package>`
+# followed by a URL is rejected by uv ("conflicts with install request").
+UV_FROM_FORM = re.compile(
+    r"^uv tool install --from " + re.escape(GIT_URL) + r"@\S+ " + re.escape(PACKAGE) + r"$"
+)
+UV_REFERENCE_FORM = re.compile(
+    r'^uv tool install "' + re.escape(PACKAGE) + " @ " + re.escape(GIT_URL) + r'@[^"\s]+"$'
+)
+
+
+def uv_release_commands(text: str) -> list:
+    """The `uv tool install` commands that install a tagged release from git."""
+    joined = re.sub(r"\\\n\s*", " ", text)
+    return [
+        " ".join(line.split())
+        for line in joined.splitlines()
+        if line.strip().startswith("uv tool install") and "git+" in line
+    ]
+
+
+def is_valid_uv_release_command(command: str) -> bool:
+    return bool(UV_FROM_FORM.match(command) or UV_REFERENCE_FORM.match(command))
 
 
 # D7: a release literal is a dotted x.y.z version preceded by "container",
@@ -139,6 +171,51 @@ class DocumentationConsistencyTests(unittest.TestCase):
             2,
         )
         self.assertIn("uv tool install .", install)
+
+    def test_uv_release_command_is_valid_and_the_same_in_every_document(self) -> None:
+        commands = {}
+        for name in ("README.md", "docs/releasing.md"):
+            found = uv_release_commands((ROOT / name).read_text())
+            self.assertEqual(len(found), 1, f"{name} must document exactly one uv release command")
+            self.assertTrue(
+                is_valid_uv_release_command(found[0]),
+                f"{name} documents a uv command uv rejects: {found[0]}",
+            )
+            commands[name] = found[0]
+        self.assertEqual(commands["README.md"], commands["docs/releasing.md"])
+
+    def test_uv_command_validator_rejects_the_inverted_form(self) -> None:
+        inverted = f"uv tool install --from {PACKAGE} {GIT_URL}@v1.2.3"
+        valid_from = f"uv tool install --from {GIT_URL}@v1.2.3 {PACKAGE}"
+        valid_reference = f'uv tool install "{PACKAGE} @ {GIT_URL}@v1.2.3"'
+        self.assertFalse(is_valid_uv_release_command(inverted))
+        self.assertTrue(is_valid_uv_release_command(valid_from))
+        self.assertTrue(is_valid_uv_release_command(valid_reference))
+        text = f"```bash\nuv tool install --from {PACKAGE} \\\n    {GIT_URL}@v1.2.3\n```\n"
+        self.assertEqual(uv_release_commands(text), [inverted])
+
+    def test_uv_pipx_command_is_unchanged(self) -> None:
+        for name in ("README.md", "docs/releasing.md"):
+            self.assertIn(f"pipx install {GIT_URL}@vX.Y.Z", (ROOT / name).read_text())
+
+    @unittest.skipUnless(
+        os.environ.get("SHIM_TEST_UV") == "1" and shutil.which("uv"),
+        "set SHIM_TEST_UV=1 with uv on PATH to run the install check",
+    )
+    def test_uv_from_form_installs_the_docker_executable(self) -> None:
+        # Same shape as the documented command, with the source tree as the
+        # source; both tool directories are disposable.
+        with tempfile.TemporaryDirectory(prefix="shimtest-uv-") as tmp:
+            env = dict(os.environ, UV_TOOL_DIR=f"{tmp}/tools", UV_TOOL_BIN_DIR=f"{tmp}/bin")
+            result = subprocess.run(
+                ["uv", "tool", "install", "--from", str(ROOT), PACKAGE],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(os.path.exists(f"{tmp}/bin/docker"))
 
     def test_readme_states_the_supported_release_once(self) -> None:
         requirements = self.readme.split("## Requirements", 1)[1].split(
