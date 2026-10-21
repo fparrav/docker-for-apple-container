@@ -43,6 +43,9 @@ jobs:
         # The read-only matrix check and the live tier both run against it;
         # the step fails when the candidate is missing a matrix flag or a
         # live test fails.
+        # Exit status: 0 = every requested check ran and held, 1 = a check
+        # failed, 2 = usage or invalid matrix, 3 = incomplete (the live tier
+        # was requested but no test ran, or a live entry's test did not run).
         run: python3 scripts/validate-runtime.py --container /opt/homebrew/bin/container --output runtime-report.md
       - name: Upload report
         if: always()
