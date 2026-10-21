@@ -53,7 +53,7 @@ class ClassificationTests(unittest.TestCase):
                 self.assertEqual((rule.status, rule.effect), (caps.UNSUPPORTED, caps.RESTRICT))
 
     def test_tables_declare_valid_statuses(self):
-        tables = [caps.SERVICE_KEYS, caps.BUILD_KEYS, caps.MOUNT_OPTIONS, caps.DEPLOY_KEYS]
+        tables = [caps.SERVICE_KEYS, caps.BUILD_KEYS, caps.DEPLOY_KEYS]
         tables.extend(caps.RESOURCE_ATTRIBUTES.values())
         for table in tables:
             for name, rule in table.items():
@@ -81,11 +81,11 @@ class ClassificationTests(unittest.TestCase):
             unknown = [f for f in report.refusals if "unknown" in f.message]
             self.assertEqual(unknown, [], path.name)
 
-    def test_module_depends_only_on_security(self):
+    def test_module_depends_only_on_security_and_mounts(self):
         source = (ROOT / "src" / "container_docker_shim" / "compose_capabilities.py").read_text()
         imports = re.findall(r"^from \. import (\w+)|^from \.(\w+) import", source, re.M)
         names = {a or b for a, b in imports}
-        self.assertEqual(names, {"security"})
+        self.assertEqual(names, {"security", "mounts"})
 
 
 class IsolationTests(unittest.TestCase):
@@ -192,9 +192,71 @@ class BuildTests(unittest.TestCase):
 
 class VolumeTests(unittest.TestCase):
     def test_modes_that_are_accepted(self):
-        for mode in ("ro", "rw", "z", "Z", "cached", "delegated", "ro,z"):
+        for mode in ("ro", "rw", "cached", "delegated"):
             with self.subTest(mode=mode):
                 self.assertTrue(run({"w": {"image": "x", "volumes": ["data:/d:" + mode]}}).ok)
+
+    def test_selinux_modes_are_refused_with_the_selinux_reason(self):
+        for mode, key in (("z", "volumes.z"), ("Z", "volumes.Z"), ("ro,z", "volumes.z"), ("Z,ro", "volumes.Z")):
+            with self.subTest(mode=mode):
+                report = run({"w": {"image": "x", "volumes": ["data:/d:" + mode]}})
+                self.assertEqual(keys(report.refusals), [("w", key)])
+                self.assertIn("SELinux", report.refusals[0].message)
+                self.assertIn("/d", report.refusals[0].message)
+                self.assertEqual(report.notices, [])
+
+    def test_long_syntax_selinux_is_refused(self):
+        entry = {"type": "bind", "source": "/h", "target": "/t", "bind": {"selinux": "z"}}
+        report = run({"w": {"image": "x", "volumes": [entry]}})
+        self.assertEqual(keys(report.refusals), [("w", "volumes.selinux")])
+        self.assertIn("SELinux", report.refusals[0].message)
+        self.assertIn("/t", report.refusals[0].message)
+
+    def test_named_volume_with_selinux_is_refused(self):
+        # The shape the normalizer emits for `data:/d:Z`.
+        entry = {"type": "volume", "source": "data", "target": "/d", "bind": {"selinux": "Z"}, "volume": {}}
+        report = run({"w": {"image": "x", "volumes": [entry]}})
+        self.assertEqual(keys(report.refusals), [("w", "volumes.selinux")])
+        self.assertIn("SELinux", report.refusals[0].message)
+        self.assertIn("/d", report.refusals[0].message)
+
+    def test_empty_or_absent_selinux_is_accepted(self):
+        for entry in (
+            {"type": "volume", "source": "data", "target": "/d", "bind": {"selinux": ""}, "volume": {}},
+            {"type": "volume", "source": "data", "target": "/d", "volume": {}},
+        ):
+            with self.subTest(entry=entry):
+                self.assertTrue(run({"w": {"image": "x", "volumes": [entry]}}).ok)
+
+    def test_unknown_nested_key_is_refused(self):
+        entry = {"type": "bind", "source": "/h", "target": "/t", "bind": {"weird": 1}}
+        report = run({"w": {"image": "x", "volumes": [entry]}})
+        self.assertEqual(keys(report.refusals), [("w", "volumes.weird")])
+        self.assertIn("/t", report.refusals[0].message)
+
+    def test_refusals_are_not_waived_by_the_allow_list(self):
+        names = [
+            key
+            for key, rule in caps.SERVICE_KEYS.items()
+            if rule.status == caps.UNSUPPORTED and rule.waivable and key not in caps.SECURITY_KEYS
+        ]
+        names += [
+            name
+            for name, rule in security.RULES.items()
+            if rule.status == security.UNSUPPORTED and rule.waivable
+        ]
+        env = {security.ENV_ALLOW: ",".join(sorted(names))}
+        self.assertEqual(caps.unknown_waivers(env), [])
+        for volumes in (
+            ["data:/d:z"],
+            ["data:/d:ro,z"],
+            [{"type": "volume", "source": "data", "target": "/d", "bind": {"selinux": "Z"}, "volume": {}}],
+            [{"type": "bind", "source": "/h", "target": "/t", "bind": {"propagation": "shared"}}],
+        ):
+            with self.subTest(volumes=volumes):
+                report = run({"w": {"image": "x", "volumes": volumes}}, env=env)
+                self.assertTrue(report.refusals)
+                self.assertEqual(report.notices, [])
 
     def test_unsupported_short_option_is_refused(self):
         report = run({"w": {"image": "x", "volumes": ["data:/d:nocopy"]}})
@@ -207,6 +269,16 @@ class VolumeTests(unittest.TestCase):
     def test_long_syntax_read_only_bind_is_accepted(self):
         entry = {"type": "bind", "source": "/h", "target": "/t", "read_only": True, "bind": {"create_host_path": True}}
         self.assertTrue(run({"w": {"image": "x", "volumes": [entry]}}).ok)
+
+    def test_consistency_is_accepted_without_effect(self):
+        entry = {"type": "volume", "source": "data", "target": "/d", "consistency": "delegated"}
+        report = run({"w": {"image": "x", "volumes": [entry]}})
+        self.assertTrue(report.ok)
+
+    def test_image_mount_type_is_refused(self):
+        report = run({"w": {"image": "x", "volumes": [{"type": "image", "source": "img", "target": "/t"}]}})
+        self.assertEqual(keys(report.refusals), [("w", "volumes.image")])
+        self.assertIn("/t", report.refusals[0].message)
 
     def test_tmpfs_mount_type_is_refused(self):
         report = run({"w": {"image": "x", "volumes": [{"type": "tmpfs", "target": "/t"}]}})

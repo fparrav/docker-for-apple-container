@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from container_docker_shim import compose  # noqa: E402
 from container_docker_shim import compose_capabilities  # noqa: E402
+from container_docker_shim import compose_normalizer  # noqa: E402
 
 TIER = "fake"
 
@@ -68,6 +69,10 @@ def take(a, i):
 
 
 a = sys.argv[1:]
+
+if os.environ.get("FAKE_CONTAINER_CALLS"):
+    with open(os.environ["FAKE_CONTAINER_CALLS"], "a") as calls_log:
+        calls_log.write(json.dumps(a) + "\n")
 
 if a[:1] == ["--version"]:
     print("container CLI version 1.5.0 (fake)"); raise SystemExit(0)
@@ -150,6 +155,8 @@ if a[:1] == ["run"]:
     save(d); print(name); raise SystemExit(0)
 
 if a[:2] == ["image", "inspect"]:
+    if a[-1] in os.environ.get("FAKE_CONTAINER_MISSING_IMAGES", "").split(","):
+        print("image not found", file=sys.stderr); raise SystemExit(1)
     print(json.dumps([{"id": "fakeid-" + a[-1], "configuration": {"name": a[-1]}, "variants": [
         {"platform": {"os": "linux", "architecture": "arm64"},
          "config": {"config": {"Entrypoint": ["/entry"], "Cmd": ["serve"]}}}]}]))
@@ -500,6 +507,7 @@ class ComposeE2ETests(unittest.TestCase):
             {
                 "CONTAINER_DOCKER_SHIM_CONTAINER": str(self.fake),
                 "FAKE_CONTAINER_STATE": str(self.state),
+                "FAKE_CONTAINER_CALLS": str(self.root / "calls.log"),
             }
         )
         # Keep project name deterministic regardless of the temp dir name.
@@ -530,6 +538,22 @@ class ComposeE2ETests(unittest.TestCase):
 
     def load_state(self) -> dict:
         return json.loads(self.state.read_text())
+
+    def runtime_calls(self) -> list:
+        """Every argv the fake `container` received, in order."""
+        log = self.root / "calls.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def assert_nothing_was_created(self) -> None:
+        """No network, volume, image build or container call reached the runtime."""
+        mutating = [
+            call for call in self.runtime_calls()
+            if call[:2] in (["network", "create"], ["volume", "create"])
+            or call[:1] in (["build"], ["run"], ["create"])
+        ]
+        self.assertEqual(mutating, [])
 
     def clear_action_log(self) -> None:
         state = self.load_state()
@@ -3299,6 +3323,60 @@ class ComposeE2ETests(unittest.TestCase):
             ],
         )
 
+    def test_official_normalizer_receives_every_env_file_in_order(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        log = self.install_fake_normalizer(self.web_model())
+        result = self.docker(
+            "compose",
+            "--env-file", "one.env",
+            "--env-file", "two.env",
+            "--env-file", "three.env",
+            "up", "-d",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.normalizer_calls(log)[0]["argv"],
+            [
+                "--env-file", "one.env",
+                "--env-file", "two.env",
+                "--env-file", "three.env",
+                "config", "--format", "json",
+            ],
+        )
+
+    def test_equals_spellings_behave_like_the_separate_form(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        log = self.install_fake_normalizer(self.web_model())
+        separate = self.docker(
+            "compose", "--env-file", "e.env", "--project-directory", str(self.project),
+            "--profile", "debug", "-p", "custom", "-f", "docker-compose.yml", "up", "-d",
+        )
+        equals = self.docker(
+            "compose", "--env-file=e.env", f"--project-directory={self.project}",
+            "--profile=debug", "--project-name=custom", "--file=docker-compose.yml", "up", "-d",
+        )
+        self.assertEqual(separate.returncode, 0, separate.stderr)
+        self.assertEqual(equals.returncode, 0, equals.stderr)
+        configs = [
+            call["argv"] for call in self.normalizer_calls(log) if "config" in call["argv"]
+        ]
+        self.assertEqual(len(configs), 2)
+        self.assertEqual(configs[0], configs[1])
+
+    def test_empty_or_missing_global_option_values_exit_64(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx:latest\n")
+        for option in ("--env-file", "--project-directory", "--file", "--profile", "--project-name"):
+            for args in ((option, ""), (f"{option}=",)):
+                with self.subTest(args=args):
+                    result = self.docker("compose", *args, "up", "-d")
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn(option, result.stderr)
+            with self.subTest(option=option, missing=True):
+                result = self.docker("compose", option)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("requires a value", result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
     def test_official_normalizer_failure_is_reported(self) -> None:
         self.write_compose("services:\n  web:\n    image: nginx:latest\n")
         self.install_fake_normalizer(self.web_model())
@@ -3479,6 +3557,226 @@ class ComposeE2ETests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertIn("brew install docker-compose", result.stderr)
                 self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_builtin_source_refuses_several_env_files_with_the_install_hint(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        (self.project / "e1.env").write_text("A=1\n")
+        (self.project / "e2.env").write_text("B=2\n")
+        result = self.docker("compose", "--env-file", "e1.env", "--env-file", "e2.env", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("brew install docker-compose", result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_builtin_source_refuses_compose_env_files_with_the_install_hint(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        (self.project / "e1.env").write_text("A=1\n")
+        self.env["COMPOSE_ENV_FILES"] = "e1.env"
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("COMPOSE_ENV_FILES", result.stderr)
+        self.assertIn("brew install docker-compose", result.stderr)
+        # The command line wins over the variable, so one --env-file still works.
+        explicit = self.docker("compose", "--env-file", "e1.env", "up", "-d")
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+
+    def test_builtin_source_fails_for_an_explicit_missing_env_file(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        result = self.docker("compose", "--env-file", "nope.env", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("couldn't find env file", result.stderr)
+        self.assertIn(os.path.join(os.path.realpath(self.project), "nope.env"), result.stderr)
+        self.assertFalse(self.state.exists() and self.load_state()["containers"])
+
+    def test_builtin_source_ignores_a_missing_default_dotenv(self) -> None:
+        self.write_compose("services:\n  web:\n    image: nginx\n")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_invalid_mount_in_a_later_service_stops_before_any_side_effect(self) -> None:
+        self.write_compose(
+            """
+            services:
+              a:
+                image: nginx
+                volumes: ["data:/d"]
+              b:
+                image: nginx
+                volumes: ["./data:/data:Z"]
+            volumes:
+              data: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assertIn("'b'", result.stderr)
+        self.assertIn("SELinux", result.stderr)
+        self.assertNotIn("Creating", result.stdout + result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_untranslatable_mounts_are_refused_together_without_a_traceback(self) -> None:
+        self.write_compose(
+            """
+            services:
+              a:
+                image: nginx
+                volumes: ["/tmp/a,b:/d"]
+              b:
+                image: nginx
+                volumes: ["data:relative"]
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stderr.count("REFUSED:"), 2, result.stderr)
+        self.assertIn("'a'", result.stderr)
+        self.assertIn("'b'", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_build_also_stops_before_any_build_on_an_invalid_mount(self) -> None:
+        self.write_compose(
+            """
+            services:
+              a:
+                build: .
+                volumes: ["data:/d:Z"]
+            """
+        )
+        result = self.docker("compose", "build")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_selinux_refusal_is_not_waivable_and_leaves_the_file_alone(self) -> None:
+        body = "services:\n  web:\n    image: nginx\n    volumes: ['./d:/d:z']\n"
+        self.write_compose(body)
+        self.env["CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED"] = "volumes.z,volumes.Z,volumes.selinux"
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("remove it", result.stderr)
+        self.assertEqual((self.project / "docker-compose.yml").read_text(), body)
+        self.assert_nothing_was_created()
+
+    SECRET_PROJECT = """
+        services:
+          api:
+            image: api:local
+            build:
+              context: .
+              secrets:
+                - %s
+        secrets:
+          %s
+        """
+
+    def write_secret_project(self, source: str, definition: str) -> None:
+        self.write_compose(self.SECRET_PROJECT % (source, definition))
+        self.env["FAKE_CONTAINER_MISSING_IMAGES"] = "api:local"
+
+    def test_missing_secret_file_is_refused_before_any_side_effect(self) -> None:
+        self.write_secret_project("tok", "tok:\n            file: ./missing-token.txt")
+        for command in (("up", "-d"), ("build",)):
+            with self.subTest(command=command):
+                result = self.docker("compose", *command)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("REFUSED:", result.stderr)
+                self.assertIn("'api'", result.stderr)
+                self.assertIn("'tok'", result.stderr)
+                self.assertIn("missing-token.txt", result.stderr)
+                self.assert_nothing_was_created()
+
+    def test_unset_secret_variable_is_refused_and_never_echoed(self) -> None:
+        self.write_secret_project("tok", "tok:\n            environment: UNSET_SECRET_VAR")
+        self.env.pop("UNSET_SECRET_VAR", None)
+        self.env["OTHER_SECRET_VALUE"] = "sentinel-do-not-print"
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("UNSET_SECRET_VAR", result.stderr)
+        self.assertIn("export", result.stderr)
+        self.assertNotIn("sentinel-do-not-print", result.stdout + result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_variable_only_in_dotenv_is_refused(self) -> None:
+        self.write_secret_project("tok", "tok:\n            environment: DOTENV_ONLY_SECRET")
+        (self.project / ".env").write_text("DOTENV_ONLY_SECRET=value-from-dotenv\n")
+        self.env.pop("DOTENV_ONLY_SECRET", None)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("DOTENV_ONLY_SECRET", result.stderr)
+        self.assertNotIn("value-from-dotenv", result.stdout + result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_structurally_invalid_secret_definitions_are_refused(self) -> None:
+        cases = {
+            "undefined": ("ghost", "other:\n            file: ./x.txt"),
+            "external": ("tok", "tok:\n            external: true"),
+            "both": ("tok", "tok:\n            file: ./x.txt\n            environment: VAR"),
+            "neither": ("tok", "tok: {}"),
+        }
+        for label, (source, definition) in cases.items():
+            with self.subTest(label):
+                self.write_secret_project(source, definition)
+                result = self.docker("compose", "up", "-d")
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn("REFUSED:", result.stderr)
+                self.assertIn(source, result.stderr)
+                self.assert_nothing_was_created()
+
+    def test_present_image_without_build_does_not_need_the_secret_file(self) -> None:
+        self.write_secret_project("tok", "tok:\n            file: ./missing-token.txt")
+        self.env.pop("FAKE_CONTAINER_MISSING_IMAGES")  # the image exists locally
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # ... but `--build` makes the build (and its secret) real again.
+        rebuilt = self.docker("compose", "up", "-d", "--build")
+        self.assertEqual(rebuilt.returncode, 64, rebuilt.stderr)
+        self.assertIn("missing-token.txt", rebuilt.stderr)
+
+    def test_present_image_still_refuses_a_structurally_invalid_definition(self) -> None:
+        self.write_secret_project("tok", "tok:\n            external: true")
+        self.env.pop("FAKE_CONTAINER_MISSING_IMAGES")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("tok", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_runtime_secrets_stay_refused_next_to_a_build_secret(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: api:local
+                build:
+                  context: .
+                  secrets: [tok]
+                secrets: [tok]
+            secrets:
+              tok:
+                file: ./token.txt
+            """
+        )
+        (self.project / "token.txt").write_text("dummy\n")
+        self.env["FAKE_CONTAINER_MISSING_IMAGES"] = "api:local"
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertTrue(
+            any("REFUSED:" in line and "secrets" in line for line in result.stderr.splitlines()),
+            result.stderr,
+        )
+        self.assert_nothing_was_created()
+
+    def test_secret_value_reaches_no_output_and_no_argument(self) -> None:
+        self.write_secret_project("tok", "tok:\n            environment: BUILD_SECRET_VAR")
+        self.env["BUILD_SECRET_VAR"] = "sentinel-secret-value-123"
+        result = self.docker("compose", "build")  # the fake runtime then fails the build
+        everything = result.stdout + result.stderr + json.dumps(self.runtime_calls())
+        self.assertNotIn("sentinel-secret-value-123", everything)
+        secret_args = [
+            call[i + 1] for call in self.runtime_calls() if call[:1] == ["build"]
+            for i, arg in enumerate(call) if arg == "--secret"
+        ]
+        self.assertEqual(secret_args, ["id=tok,env=BUILD_SECRET_VAR"])
 
     def test_builtin_source_refuses_an_automatic_override_file(self) -> None:
         self.write_compose("services:\n  web:\n    image: nginx\n")
@@ -3749,6 +4047,47 @@ class ComposeEnvironmentFlagTests(unittest.TestCase):
     def test_compose_profiles_are_appended_after_flags(self) -> None:
         env = {"COMPOSE_PROFILES": "b, c,,"}
         self.assertEqual(self.apply([], ["a"], env), ([], ["a", "b", "c"]))
+
+
+class GlobalOptionParsingTests(unittest.TestCase):
+    """`main` collects every --env-file and stops at the subcommand."""
+
+    def dispatched(self, argv):
+        captured = {}
+
+        def fake_dispatch(sub, sub_args, **kwargs):
+            captured.update(kwargs, sub=sub, sub_args=sub_args)
+            return 0
+
+        original = compose._dispatch
+        compose._dispatch = fake_dispatch
+        try:
+            self.assertEqual(compose.main(argv), 0)
+        finally:
+            compose._dispatch = original
+        return captured
+
+    def test_env_files_keep_their_order(self) -> None:
+        got = self.dispatched(["--env-file", "a", "--env-file=b", "--env-file", "c", "ps"])
+        self.assertEqual(got["env_files"], ("a", "b", "c"))
+        self.assertEqual(got["sub"], "ps")
+
+    def test_no_env_file_gives_an_empty_tuple(self) -> None:
+        self.assertEqual(self.dispatched(["ps"])["env_files"], ())
+
+    def test_exec_env_file_is_left_to_exec(self) -> None:
+        got = self.dispatched(["exec", "--env-file", "x.env", "web", "true"])
+        self.assertEqual(got["env_files"], ())
+        self.assertEqual(got["sub_args"], ["--env-file", "x.env", "web", "true"])
+
+    def test_equals_forms_fill_the_same_fields(self) -> None:
+        got = self.dispatched(
+            ["--project-directory=app", "--file=a.yml", "--profile=p", "--project-name=n", "ps"]
+        )
+        self.assertEqual(got["project_dir"], "app")
+        self.assertEqual(got["files"], ["a.yml"])
+        self.assertEqual(got["profiles"], ["p"])
+        self.assertEqual(got["project_name"], "n")
 
 
 class RunNormalizerTests(unittest.TestCase):
@@ -4084,6 +4423,84 @@ class BuildKeyForwardingTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 64)
         self.assertIn("missing", str(caught.exception))
 
+    def test_target_renames_the_secret_id(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  secrets:
+                    - source: npmrc
+                      target: registry
+            secrets:
+              npmrc:
+                file: ./npmrc.txt
+            """
+        )
+        self.assertEqual(args[args.index("--secret") + 1], "id=registry,src=/tmp/p/npmrc.txt")
+
+    def test_dollar_in_a_secret_path_is_kept_single(self) -> None:
+        args = self.build_args(
+            """
+            services:
+              web:
+                build:
+                  context: .
+                  secrets: [npmrc]
+            secrets:
+              npmrc:
+                file: /tmp/a$b.txt
+            """
+        )
+        self.assertEqual(args[args.index("--secret") + 1], "id=npmrc,src=/tmp/a$b.txt")
+
+    def test_ignored_attributes_print_a_not_applied_notice(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            args = self.build_args(
+                """
+                services:
+                  web:
+                    build:
+                      context: .
+                      secrets:
+                        - source: npmrc
+                          uid: "1000"
+                          mode: 0400
+                secrets:
+                  npmrc:
+                    file: ./npmrc.txt
+                """
+            )
+        self.assertEqual(args[args.index("--secret") + 1], "id=npmrc,src=/tmp/p/npmrc.txt")
+        self.assertIn("NOT APPLIED", err.getvalue())
+        self.assertIn("uid", err.getvalue())
+        self.assertIn("mode", err.getvalue())
+
+    def test_normalizer_shaped_model_gives_the_same_arguments(self) -> None:
+        fixture = (
+            Path(__file__).resolve().parent
+            / "fixtures" / "compose" / "normalized" / "build-secrets.json"
+        )
+        raw = json.loads(fixture.read_text(encoding="utf-8").replace("__PROJECT_DIR__", "/project"))
+        model = compose_normalizer.convert_model(raw, "5.6.0")
+        proj = compose.Project("bsec", model, "/project")
+        self.assertEqual(sorted(proj.secrets), ["api_key", "npm_token"])
+        captured: list = []
+        original = compose._run_container_passthrough
+        compose._run_container_passthrough = lambda args: captured.append(args) or 0
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                compose._run_build(proj.services["api"], proj, "bsec-api:latest")
+        finally:
+            compose._run_container_passthrough = original
+        args = captured[0]
+        pairs = [args[i + 1] for i, arg in enumerate(args) if arg == "--secret"]
+        self.assertEqual(
+            pairs, ["id=npm_token,src=/project/npm-token.txt", "id=registry,env=API_KEY"]
+        )
+
     def test_ssh_default_is_forwarded(self) -> None:
         args = self.build_args(
             """
@@ -4134,9 +4551,8 @@ class VolumeMountTranslationTests(unittest.TestCase):
             ("data:/d", ["--mount", "type=volume,source=p_data,target=/d"]),
             ("data:/d:ro", ["--mount", "type=volume,source=p_data,target=/d,readonly"]),
             ("data:/d:rw", ["--mount", "type=volume,source=p_data,target=/d"]),
-            ("data:/d:z", ["--mount", "type=volume,source=p_data,target=/d"]),
-            ("data:/d:ro,z", ["--mount", "type=volume,source=p_data,target=/d,readonly"]),
             ("data:/d:cached", ["--mount", "type=volume,source=p_data,target=/d"]),
+            ("data:/d:delegated", ["--mount", "type=volume,source=p_data,target=/d"]),
             ("/abs:/d", ["--mount", "type=bind,source=/abs,target=/d"]),
             ("/abs:/d:ro", ["--mount", "type=bind,source=/abs,target=/d,readonly"]),
             ("./rel:/d", ["--mount", "type=bind,source=/tmp/p/rel,target=/d"]),
@@ -4171,8 +4587,66 @@ class VolumeMountTranslationTests(unittest.TestCase):
 
     def test_bind_noop_modes_are_dropped(self) -> None:
         self.assertEqual(
-            self.translate("/abs:/d:rw,z"), ["--mount", "type=bind,source=/abs,target=/d"]
+            self.translate("/abs:/d:rw,cached"), ["--mount", "type=bind,source=/abs,target=/d"]
         )
+
+    def test_selinux_relabeling_is_refused_in_every_shape(self) -> None:
+        refused = [
+            "data:/d:z",
+            "data:/d:Z",
+            "data:/d:ro,z",
+            "/abs:/d:Z",
+            "./rel:/d:Z,ro",
+            {"type": "bind", "source": "/abs", "target": "/d", "bind": {"selinux": "z"}},
+            # The shape the official normalizer gives a named volume with `:Z`.
+            {"type": "volume", "source": "data", "target": "/d", "volume": {}, "bind": {"selinux": "Z"}},
+        ]
+        for entry in refused:
+            with self.subTest(entry=entry):
+                with self.assertRaises(compose.ShimError) as caught:
+                    self.translate(entry)
+                self.assertEqual(caught.exception.code, 64)
+                self.assertIn("SELinux", str(caught.exception))
+                self.assertIn("/d", str(caught.exception))
+
+    def test_long_syntax_options_match_the_short_ones(self) -> None:
+        long_ro = {"type": "bind", "source": "/abs", "target": "/d", "read_only": True}
+        self.assertEqual(self.translate(long_ro), self.translate("/abs:/d:ro"))
+        with_noops = {
+            "type": "volume", "source": "data", "target": "/d", "consistency": "cached",
+            "bind": {"create_host_path": True}, "volume": {},
+        }
+        self.assertEqual(self.translate(with_noops), self.translate("data:/d"))
+
+    def test_service_mounts_is_pure(self) -> None:
+        proj = compose.Project("p", {"services": {}}, "/tmp/p")
+        service = compose.Service("web", {"volumes": ["data:/d:ro", "./rel:/r", "/abs:/a"]})
+        original = compose._ensure_named_volume
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("_service_mounts must not create volumes")
+
+        compose._ensure_named_volume = forbidden
+        try:
+            planned = compose._service_mounts(service, proj)
+        finally:
+            compose._ensure_named_volume = original
+        self.assertEqual(
+            [(m.mount.kind, m.mount.source, m.mount.readonly, m.volume_key) for m in planned],
+            [
+                ("volume", "p_data", True, "data"),
+                ("bind", "/tmp/p/rel", False, None),
+                ("bind", "/abs", False, None),
+            ],
+        )
+
+    def test_service_volume_keys_lists_only_named_volumes(self) -> None:
+        service = compose.Service(
+            "web",
+            {"volumes": ["data:/d", "./rel:/r", {"type": "bind", "source": "/abs", "target": "/a"},
+                         {"type": "volume", "source": "other", "target": "/o"}]},
+        )
+        self.assertEqual(compose._service_volume_keys(service), ["data", "other"])
 
 
 class ResourceProvisioningTests(unittest.TestCase):

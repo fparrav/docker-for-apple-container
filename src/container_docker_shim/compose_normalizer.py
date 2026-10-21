@@ -18,6 +18,12 @@ EXECUTABLE_ENV = "CONTAINER_DOCKER_SHIM_COMPOSE"
 # a `docker compose` plugin wrapper that re-invokes the shim) can be
 # detected and refused.
 MARKER_ENV = "CONTAINER_DOCKER_SHIM_NORMALIZING"
+# Top-level keys of the normalized output that ``convert_model`` drops on
+# purpose. ``x-*`` extension keys are dropped too (their names are not
+# fixed), and secrets no service build references are dropped from the
+# preserved ``secrets`` key (the official binary already prunes the ones
+# nothing uses).
+DROPPED_TOP_LEVEL = frozenset({"configs"})
 
 
 class NormalizerError(Exception):
@@ -269,21 +275,55 @@ def _convert_service(service: Mapping[str, Any]) -> dict:
     return result
 
 
+def _build_secrets(
+    services: Mapping[str, Any], definitions: Mapping[str, Any]
+) -> dict:
+    """Return the secret definitions every service build references.
+
+    For every service whose ``build`` is a mapping, each ``secrets``
+    entry (a string, or a mapping with a ``source``) names a definition
+    to copy from ``definitions`` whole; a referenced name that is missing
+    there is simply not copied (the resolver reports it later). A build
+    that is a plain string, or has no ``secrets``, contributes nothing.
+    """
+    kept: dict = {}
+    for service in services.values():
+        build = service.get("build")
+        if not isinstance(build, dict):
+            continue
+        for entry in build.get("secrets") or []:
+            if isinstance(entry, str):
+                source = entry
+            elif isinstance(entry, dict):
+                source = entry.get("source")
+            else:
+                source = None
+            if isinstance(source, str) and source in definitions:
+                kept[source] = definitions[source]
+    return kept
+
+
 def convert_model(raw: Any, version: str) -> dict:
     """Convert the normalized JSON into the model dictionary ``compose.py`` reads.
 
-    Returns ``{"name", "services", "networks", "volumes"}`` taken from
-    ``raw`` (missing ``networks``/``volumes`` become ``{}``); inside every
-    service, keys whose value is ``None`` are dropped (no recursion) and
-    each ``ports`` object becomes a port string (see :func:`_convert_port`);
-    the ``$$`` escape the normalizer adds is undone in every service string
-    (see :func:`_unescape_dollars`); every other service value is copied unchanged, and top-level ``x-*``
-    keys and everything else are ignored.
+    Returns ``{"name", "services", "networks", "volumes", "secrets"}``
+    taken from ``raw`` (missing ``networks``/``volumes``/``secrets``
+    become ``{}``); ``secrets`` keeps only the definitions referenced by a
+    service ``build.secrets`` entry, whole and un-escaped (see
+    :func:`_build_secrets`); inside every service, keys whose value is
+    ``None`` are dropped (no recursion) and each ``ports`` object becomes a
+    port string (see :func:`_convert_port`); the ``$$`` escape the
+    normalizer adds is undone in every service string and in the preserved
+    ``networks``, ``volumes`` and ``secrets`` sections (see
+    :func:`_unescape_dollars`); every other service value is copied
+    unchanged. Top-level ``x-*`` keys, ``configs`` (see
+    :data:`DROPPED_TOP_LEVEL`) and everything else are ignored.
 
     A ``raw`` that is not a mapping, has no ``name`` string, has
-    ``services`` that is not a mapping, or has a service that is not a
-    mapping raises ``NormalizerError`` whose message names
-    ``Docker Compose <version>`` and the offending key.
+    ``services`` that is not a mapping, has a service that is not a
+    mapping, or has ``secrets`` that is not a mapping raises
+    ``NormalizerError`` whose message names ``Docker Compose <version>``
+    and the offending key.
     """
     if not isinstance(raw, dict):
         raise NormalizerError(
@@ -304,6 +344,15 @@ def convert_model(raw: Any, version: str) -> dict:
             "Docker Compose %s: 'services' must be a mapping, got %s"
             % (version, type(services).__name__)
         )
+    secrets = raw.get("secrets")
+    if secrets is None:
+        secrets = {}
+    if not isinstance(secrets, dict):
+        raise NormalizerError(
+            "Docker Compose %s: 'secrets' must be a mapping, got %s"
+            % (version, type(secrets).__name__)
+        )
+    secrets = _unescape_dollars(secrets)
     converted: dict = {}
     for service_name, service in services.items():
         if not isinstance(service, dict):
@@ -315,6 +364,7 @@ def convert_model(raw: Any, version: str) -> dict:
     return {
         "name": name,
         "services": converted,
-        "networks": raw.get("networks") or {},
-        "volumes": raw.get("volumes") or {},
+        "networks": _unescape_dollars(raw.get("networks") or {}),
+        "volumes": _unescape_dollars(raw.get("volumes") or {}),
+        "secrets": _build_secrets(converted, secrets),
     }

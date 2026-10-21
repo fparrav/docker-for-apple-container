@@ -1,0 +1,71 @@
+{
+  "name": "msel",
+  "networks": {
+    "default": {
+      "name": "msel_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "a": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine:3.20",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "__PROJECT_DIR__/data",
+          "target": "/data",
+          "bind": {
+            "selinux": "Z"
+          }
+        }
+      ]
+    },
+    "b": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine:3.20",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "data",
+          "target": "/d",
+          "bind": {
+            "selinux": "Z"
+          },
+          "volume": {}
+        }
+      ]
+    },
+    "c": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine:3.20",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "__PROJECT_DIR__/conf",
+          "target": "/etc/conf",
+          "bind": {
+            "selinux": "z"
+          }
+        }
+      ]
+    }
+  },
+  "volumes": {
+    "data": {
+      "name": "msel_data"
+    }
+  }
+}

@@ -405,6 +405,29 @@ options) now exit 64. Remove the key, or for waivable restrictions name it in
 translated to `--mount ...,readonly` and `build.target`, `labels`, `no_cache`,
 `pull`, `secrets` and `ssh: default` reach the build.
 
+**SELinux labels are refused.** `:z` and `:Z` (short syntax) and
+`bind.selinux` (long syntax, which the official normalizer also produces for a
+short `:z` on a named volume) exit 64 with a `REFUSED:` line naming the service,
+the target and the option, and nothing is created. Apple `container` has no
+SELinux relabeling and macOS has no SELinux, so the flag is safe to remove from
+a file you only run here. `rw`, `cached`, `delegated` and `consistency` are
+accepted without effect, and `bind.create_host_path` is accepted without effect
+too: a missing bind source is never created, and the runtime refuses to start
+the container.
+
+**Build secrets.** A secret listed in a service's `build.secrets` is passed to
+`container build --secret`. Its id is the entry's `target` when it has one, else
+the secret name, so `RUN --mount=type=secret,id=<id>` must use that id. A `file`
+secret is resolved to an absolute path against the project directory. An
+`environment` secret passes the variable *name* to the runtime, which reads its
+value from the environment of the shim command: export it in that shell (a
+value only in `.env` or `--env-file` does not reach the build, and `up`/`build`
+exit 64 naming the variable). `uid`, `gid` and `mode` print `NOT APPLIED:` as in
+Docker Compose. Missing files, unset variables, undefined or `external` secrets
+and ambiguous definitions are refused before any network, volume or container is
+created; an image that already exists does not need its secret file unless
+`--build` is given. Secret values are never printed or put in an argument list.
+
 Compose keys that change behaviour but have no Apple equivalent (the
 service-level `restart` policy, `hostname`, `deploy` replicas, `extra_hosts`,
 and network aliases) are accepted, and `up` prints one `NOT APPLIED:` line per
@@ -443,6 +466,15 @@ order, the automatic `compose.override.yaml`, `--env-file` and `.env`,
 them. `docker compose config` prints the normalized JSON and `config -q` only
 validates it.
 
+`--env-file` may be repeated; the files are forwarded in the order given and
+later files override earlier ones, exactly as Docker Compose resolves them, and
+`COMPOSE_ENV_FILES` is honoured when no `--env-file` is on the command line. The
+long options `--env-file`, `--project-directory`, `--file`, `--profile` and
+`--project-name` accept `--opt value` and `--opt=value`; an empty value exits 64.
+A missing explicit env file exits 1 with `couldn't find env file: <path>` before
+anything is created. The global `--env-file` only feeds interpolation; a
+service's `env_file` only feeds that service.
+
 `docker compose version` prints `normalizer: official <version>` or
 `normalizer: built-in subset`. Switching normalizer changes the model's
 fingerprint, so the next `up` may recreate containers once.
@@ -453,7 +485,8 @@ interpolation. It **refuses, with exit 64 and the install hint**, everything it
 cannot read instead of misreading it: anchors, aliases, merge keys, `|`/`>`
 block scalars, multi-document files, `include`, `extends` and `profiles`; several
 `-f` files, `--profile`, `COMPOSE_PROFILES` and an automatically merged override
-file are refused as well.
+file are refused as well, and so are several `--env-file` flags and
+`COMPOSE_ENV_FILES`: merging env files needs the official binary.
 
 ### Refused, by design
 
@@ -657,7 +690,7 @@ API). Known differences are called out in the `note` column.
 | compose build.provenance | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
 | compose build.pull | SUPPORTED | - | unit | Forwarded to the build. |
 | compose build.sbom | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
-| compose build.secrets | SUPPORTED | - | unit | Forwarded to the build. |
+| compose build.secrets | SUPPORTED | - | live | Forwarded to the build as --secret id=<target or name>,src=<abs path>\|env=<VAR>; file and environment secrets (environment must be exported) are pre-checked before any side effect; uid/gid/mode are NOT APPLIED. |
 | compose build.shm_size | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
 | compose build.ssh | SUPPORTED | - | unit | Forwarded to the build. |
 | compose build.tags | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: not forwarded to the Apple container build. |
@@ -777,24 +810,26 @@ API). Known differences are called out in the `note` column.
 | compose userns_mode | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose uts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
-| compose volumes.Z | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.Z | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
 | compose volumes.bind | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.cached | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.consistency | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.create_host_path | SUPPORTED | - | live | Accepted in long volume syntax without effect: Apple container 1.5.0 never creates a missing bind source and refuses to start the container (findings F5). |
 | compose volumes.delegated | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.image | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: image mounts are not supported. |
 | compose volumes.nocopy | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
 | compose volumes.propagation | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
-| compose volumes.read_only | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
-| compose volumes.ro | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.read_only | SUPPORTED | - | live | Accepted in short and long volume syntax. |
+| compose volumes.ro | SUPPORTED | - | live | Accepted in short and long volume syntax. |
 | compose volumes.rw | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.selinux | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
 | compose volumes.source | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.subpath | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: Apple container 1.5.0 has no equivalent. |
 | compose volumes.target | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.tmpfs | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: tmpfs mounts in `volumes` are not translated; use the service `tmpfs` key. |
 | compose volumes.type | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.volume | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
-| compose volumes.z | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
+| compose volumes.z | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
 | compose volumes_from | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose working_dir | SUPPORTED | -w | fake | Forwards to Apple -w. |
 | compose x-shim-boot-hosts | SUPPORTED | - | fake | Shim extension: false skips the boot-time /etc/hosts entrypoint wrapper for the service. |

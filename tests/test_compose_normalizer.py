@@ -456,7 +456,9 @@ class ConvertModelTests(unittest.TestCase):
 
     def test_full_default_model(self):
         model = self._convert("full-default.json")
-        self.assertEqual(set(model), {"name", "services", "networks", "volumes"})
+        self.assertEqual(
+            set(model), {"name", "services", "networks", "volumes", "secrets"}
+        )
         self.assertEqual(model["name"], "full")
         self.assertEqual(
             model["networks"], {"default": {"name": "full_default", "ipam": {}}}
@@ -566,7 +568,13 @@ class ConvertModelTests(unittest.TestCase):
         )
         self.assertEqual(
             model,
-            {"name": "p", "services": {"s": {"image": "x"}}, "networks": {}, "volumes": {}},
+            {
+                "name": "p",
+                "services": {"s": {"image": "x"}},
+                "networks": {},
+                "volumes": {},
+                "secrets": {},
+            },
         )
 
     def test_non_mapping_raw_raises_naming_the_version(self):
@@ -607,6 +615,122 @@ class ConvertModelTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("Docker Compose %s" % self.VERSION, message)
         self.assertIn("web", message)
+
+
+class BuildSecretsModelTests(unittest.TestCase):
+    """convert_model keeps build-referenced secrets and un-escapes everything."""
+
+    VERSION = "5.6.0"
+
+    @staticmethod
+    def _load_fixture(filename: str) -> dict:
+        return ConvertModelTests._load_fixture(filename)
+
+    def _convert(self, filename: str) -> dict:
+        return compose_normalizer.convert_model(
+            self._load_fixture(filename), self.VERSION
+        )
+
+    def test_build_referenced_secrets_kept_whole_and_absolute(self):
+        model = self._convert("build-secrets.json")
+        self.assertEqual(set(model["secrets"]), {"npm_token", "api_key"})
+        self.assertEqual(
+            model["secrets"]["npm_token"],
+            {"name": "bsec_npm_token", "file": "/project/npm-token.txt"},
+        )
+        self.assertEqual(
+            model["secrets"]["api_key"],
+            {"name": "bsec_api_key", "environment": "API_KEY"},
+        )
+
+    def test_unreferenced_and_runtime_only_secrets_absent(self):
+        model = self._convert("build-secrets.json")
+        self.assertNotIn("unreferenced", model["secrets"])
+        self.assertNotIn("runtime_only", model["secrets"])
+
+    def test_mounts_selinux_fixture_loads_and_converts(self):
+        model = self._convert("mounts-selinux.json")
+        self.assertEqual(
+            set(model), {"name", "services", "networks", "volumes", "secrets"}
+        )
+        self.assertEqual(model["name"], "msel")
+        self.assertEqual(model["secrets"], {})
+        self.assertEqual(
+            model["services"]["a"]["volumes"],
+            [
+                {
+                    "type": "bind",
+                    "source": "/project/data",
+                    "target": "/data",
+                    "bind": {"selinux": "Z"},
+                }
+            ],
+        )
+
+    def test_secrets_key_always_present_when_nothing_referenced(self):
+        model = compose_normalizer.convert_model(
+            {"name": "p", "services": {"s": {"image": "x"}}}, self.VERSION
+        )
+        self.assertEqual(model["secrets"], {})
+
+    def test_referenced_name_missing_from_raw_is_not_copied(self):
+        raw = {
+            "name": "p",
+            "services": {
+                "s": {"image": "x", "build": {"context": ".", "secrets": ["ghost"]}}
+            },
+            "secrets": {},
+        }
+        model = compose_normalizer.convert_model(raw, self.VERSION)
+        self.assertEqual(model["secrets"], {})
+
+    def test_plain_string_build_contributes_nothing(self):
+        raw = {
+            "name": "p",
+            "services": {"s": {"image": "x", "build": "./dir"}},
+            "secrets": {"tok": {"name": "p_tok", "file": "/project/t.txt"}},
+        }
+        model = compose_normalizer.convert_model(raw, self.VERSION)
+        self.assertEqual(model["secrets"], {})
+
+    def test_non_mapping_secrets_raises_naming_the_version_and_key(self):
+        with self.assertRaises(compose_normalizer.NormalizerError) as ctx:
+            compose_normalizer.convert_model(
+                {"name": "p", "services": {}, "secrets": ["s"]}, self.VERSION
+            )
+        message = str(ctx.exception)
+        self.assertIn("Docker Compose %s" % self.VERSION, message)
+        self.assertIn("secrets", message)
+
+    def test_dollars_unescaped_in_secrets_networks_and_volumes(self):
+        raw = {
+            "name": "p",
+            "services": {
+                "s": {
+                    "image": "x",
+                    "build": {"context": ".", "secrets": ["tok"]},
+                }
+            },
+            "secrets": {"tok": {"name": "p_tok", "file": "/project/to$$k.txt"}},
+            "networks": {"default": {"name": "p_default", "labels": {"a": "$$b"}}},
+            "volumes": {"data": {"name": "p_data", "labels": {"c": "$$d"}}},
+        }
+        model = compose_normalizer.convert_model(raw, self.VERSION)
+        self.assertEqual(model["secrets"]["tok"]["file"], "/project/to$k.txt")
+        self.assertEqual(model["networks"]["default"]["labels"], {"a": "$b"})
+        self.assertEqual(model["volumes"]["data"]["labels"], {"c": "$d"})
+
+    def test_configs_and_extension_keys_are_dropped(self):
+        raw = {
+            "name": "p",
+            "services": {"s": {"image": "x"}},
+            "configs": {"cfg": {"name": "p_cfg"}},
+            "x-anything": {"environment": {}},
+        }
+        model = compose_normalizer.convert_model(raw, self.VERSION)
+        self.assertNotIn("configs", model)
+        self.assertNotIn("x-anything", model)
+        self.assertEqual(compose_normalizer.DROPPED_TOP_LEVEL, frozenset({"configs"}))
 
 
 if __name__ == "__main__":

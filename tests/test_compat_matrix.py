@@ -32,6 +32,7 @@ import compat_matrix  # noqa: E402
 from container_docker_shim import cli  # noqa: E402
 from container_docker_shim import compose  # noqa: E402
 from container_docker_shim import compose_capabilities  # noqa: E402
+from container_docker_shim import mounts  # noqa: E402
 
 
 TIER = "unit"
@@ -258,7 +259,11 @@ class MatrixCoverageTests(unittest.TestCase):
         wanted |= {f"compose {key}" for key in caps.SERVICE_KEYS}
         wanted |= {f"compose build.{key}" for key in caps.BUILD_KEYS}
         wanted |= {f"compose deploy.{key}" for key in caps.DEPLOY_KEYS}
-        wanted |= {f"compose volumes.{key}" for key in caps.MOUNT_OPTIONS}
+        wanted |= {f"compose volumes.{key}" for key in mounts.MODE_RULES}
+        wanted |= {
+            f"compose volumes.{key.rsplit('.', 1)[-1]}" for key in mounts.ATTRIBUTE_RULES
+        }
+        wanted |= {f"compose volumes.{key}" for key in ("type", "source", "target", *mounts.LONG_SECTIONS)}
         for kind, attrs in caps.RESOURCE_ATTRIBUTES.items():
             wanted |= {f"compose top-level {kind}.{key}" for key in attrs}
         missing = sorted(entry for entry in wanted if entry not in self.ids)

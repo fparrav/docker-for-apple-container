@@ -145,7 +145,12 @@ A fixture can describe something the shim must refuse. `n-network-none` asks for
 `network_mode: none`: the live tier asserts `up` exits 64 with a `REFUSED:` line
 and creates nothing, while the conformance tier asserts real Docker starts the
 service with only the loopback interface. `m-readonly-volume` mounts a named
-volume and a bind read-only, and both tiers assert that a write fails.
+volume and a bind read-only in the short (`:ro`) and the long (`read_only: true`)
+syntax, plus a read-write control, and both tiers assert that the four writes
+fail and the control succeeds. `r-selinux-refused` asks for `:Z`: the live tier
+asserts `up` exits 64 with a `REFUSED:` line naming SELinux and creates nothing,
+while the conformance tier asserts real Docker accepts the file (the documented
+difference).
 
 Two fixtures cover resource identity and service selection.
 `o-external-volume` declares a volume `external: true` with `name: ${EXT_VOLUME}`;
@@ -154,6 +159,15 @@ the test pre-creates a disposable `shimtest-` volume, passes its name through a
 that no `<project>_` copy is created. `p-selective-up` has `api` depending on
 `db` (healthy) plus an unrelated `worker`: `up -d api` must create `db` and
 `api` only, after `db` is healthy, and `up -d --no-deps api` creates `api` alone.
+
+`q-build-secrets` builds an image whose Dockerfile reads a file secret and an
+environment secret renamed through `target` with `RUN --mount=type=secret`. The
+Dockerfile carries only the SHA-256 of each dummy value, because the build log
+echoes every `RUN` line. The environment secret reaches the build only through
+the process environment (`Q_ENV_SECRET`), the image name arrives through a
+`.env` override, and the test removes the image by its exact name. The live
+tier also asserts that `up` exits 64 naming the variable, and creates nothing,
+when `Q_ENV_SECRET` is not exported.
 
 ## Conformance tier in CI
 

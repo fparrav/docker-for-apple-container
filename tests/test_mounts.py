@@ -92,5 +92,208 @@ class MountParsingTests(unittest.TestCase):
                     mounts.parse_mount(value)
 
 
+class ShortModePolicyTests(unittest.TestCase):
+    """check_short_modes reads MODE_RULES for bind and named sources."""
+
+    def test_readonly_and_noop_verdicts(self):
+        for source in ("/host/data", "cache"):
+            for mode, expected in (
+                ("ro", True),
+                ("rw", False),
+                ("cached", False),
+                ("delegated", False),
+                ("ro,rw,cached,delegated", True),
+                ("rw,cached,delegated", False),
+            ):
+                with self.subTest(source=source, mode=mode):
+                    self.assertEqual(mounts.check_short_modes(mode, "/data"), expected)
+
+    def test_selinux_modes_are_refused_naming_option_and_target(self):
+        for source in ("/host/data", "cache"):
+            for mode, option in (
+                ("z", "z"),
+                ("Z", "Z"),
+                ("ro,Z", "Z"),
+                ("Z,ro", "Z"),
+                ("cached,Z", "Z"),
+            ):
+                with self.subTest(source=source, mode=mode):
+                    with self.assertRaises(mounts.MountSpecError) as caught:
+                        mounts.check_short_modes(mode, "/data")
+                    message = str(caught.exception)
+                    self.assertIn(option, message)
+                    self.assertIn("/data", message)
+                    self.assertIn("SELinux", message)
+                    self.assertIn("macOS", message)
+
+    def test_unknown_mode_is_refused_naming_option_and_target(self):
+        for source in ("/host/data", "cache"):
+            with self.subTest(source=source):
+                with self.assertRaises(mounts.MountSpecError) as caught:
+                    mounts.check_short_modes("weird", "/data")
+                message = str(caught.exception)
+                self.assertIn("weird", message)
+                self.assertIn("/data", message)
+
+    def test_parse_volume_spec_applies_the_table(self):
+        self.assertTrue(mounts.parse_volume_spec("cache:/cache:ro").readonly)
+        self.assertTrue(mounts.parse_volume_spec("./data:/data:ro").readonly)
+        self.assertFalse(mounts.parse_volume_spec("cache:/cache:rw").readonly)
+        self.assertFalse(mounts.parse_volume_spec("/host:/data:cached").readonly)
+        self.assertFalse(mounts.parse_volume_spec("/host:/data:delegated").readonly)
+        for value, option, target in (
+            ("cache:/cache:z", "z", "/cache"),
+            ("cache:/cache:Z", "Z", "/cache"),
+            ("/host:/data:ro,Z", "Z", "/data"),
+            ("./data:/data:Z,ro", "Z", "/data"),
+            ("cache:/cache:nocopy", "nocopy", "/cache"),
+            ("/host:/data:weird", "weird", "/data"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(mounts.MountSpecError) as caught:
+                    mounts.parse_volume_spec(value, cwd="/project")
+                message = str(caught.exception)
+                self.assertIn(option, message)
+                self.assertIn(target, message)
+
+
+class LongSyntaxPolicyTests(unittest.TestCase):
+    """mount_from_entry validates every key against ATTRIBUTE_RULES."""
+
+    def _bind(self, **extra) -> dict:
+        entry = {"type": "bind", "source": "./data", "target": "/data"}
+        entry.update(extra)
+        return entry
+
+    def _named(self, **extra) -> dict:
+        entry = {"type": "volume", "source": "cache", "target": "/cache"}
+        entry.update(extra)
+        return entry
+
+    def _refused(self, entry: dict, option: str, target: str) -> str:
+        with self.assertRaises(mounts.MountSpecError) as caught:
+            mounts.mount_from_entry(entry, "/project")
+        message = str(caught.exception)
+        self.assertIn(option, message)
+        self.assertIn(target, message)
+        return message
+
+    def test_read_only_attribute(self):
+        self.assertTrue(mounts.mount_from_entry(self._bind(read_only=True), "/project").readonly)
+        self.assertTrue(mounts.mount_from_entry(self._named(read_only=True), "/project").readonly)
+        self.assertFalse(mounts.mount_from_entry(self._named(read_only=False), "/project").readonly)
+        # A non-boolean read_only is refused, not guessed.
+        self._refused(self._named(read_only="true"), "read_only", "/cache")
+
+    def test_consistency_is_accepted_without_effect(self):
+        for entry in (self._bind(consistency="cached"), self._named(consistency="delegated")):
+            with self.subTest(entry=entry):
+                self.assertFalse(mounts.mount_from_entry(entry, "/project").readonly)
+
+    def test_create_host_path_is_accepted_without_effect(self):
+        mount = mounts.mount_from_entry(self._bind(bind={"create_host_path": True}), "/project")
+        self.assertEqual((mount.kind, mount.readonly), ("bind", False))
+
+    def test_selinux_attribute_is_refused_naming_option_and_target(self):
+        for entry in (
+            self._bind(bind={"selinux": "z"}),
+            self._bind(bind={"selinux": "Z"}),
+            # The normalizer emits bind.selinux even for a named volume.
+            {
+                "type": "volume",
+                "source": "data",
+                "target": "/d",
+                "bind": {"selinux": "Z"},
+                "volume": {},
+            },
+        ):
+            with self.subTest(entry=entry):
+                message = self._refused(entry, "selinux", entry["target"])
+                self.assertIn("SELinux", message)
+                self.assertIn("macOS", message)
+
+    def test_empty_selinux_is_accepted_without_effect(self):
+        for value in ("", None):
+            for entry in (
+                self._bind(bind={"selinux": value}),
+                self._named(bind={"selinux": value}),
+            ):
+                with self.subTest(value=value, entry=entry):
+                    self.assertFalse(mounts.mount_from_entry(entry, "/project").readonly)
+
+    def test_unsupported_attributes_are_refused_naming_option_and_target(self):
+        for entry, option, target in (
+            (self._bind(bind={"propagation": "rshared"}), "propagation", "/data"),
+            (self._named(bind={"propagation": "rslave"}), "propagation", "/cache"),
+            (self._named(volume={"nocopy": True}), "nocopy", "/cache"),
+            (self._named(volume={"subpath": "/sub"}), "subpath", "/cache"),
+        ):
+            with self.subTest(entry=entry):
+                self._refused(entry, option, target)
+
+    def test_unknown_keys_are_refused_naming_option_and_target(self):
+        for entry, option, target in (
+            (self._bind(bind={"foo": 1}), "foo", "/data"),
+            (self._named(volume={"foo": 1}), "foo", "/cache"),
+            (self._bind(foo="bar"), "foo", "/data"),
+            (self._named(foo="bar"), "foo", "/cache"),
+        ):
+            with self.subTest(entry=entry):
+                self._refused(entry, option, target)
+
+    def test_refused_and_unknown_types_name_type_and_target(self):
+        for entry, option, target in (
+            ({"type": "image", "source": "alpine", "target": "/img"}, "image", "/img"),
+            ({"type": "tmpfs", "target": "/scratch"}, "tmpfs", "/scratch"),
+            ({"type": "npipe", "source": "x", "target": "/x"}, "npipe", "/x"),
+        ):
+            with self.subTest(entry=entry):
+                self._refused(entry, option, target)
+
+    def test_comma_in_source_is_refused_naming_source_and_target(self):
+        for entry in (
+            {"type": "bind", "source": "/a,b", "target": "/data"},
+            {"type": "volume", "source": "a,b", "target": "/cache"},
+        ):
+            with self.subTest(entry=entry):
+                self._refused(entry, entry["source"], entry["target"])
+        # The short syntax refuses the same source.
+        with self.assertRaises(mounts.MountSpecError) as caught:
+            mounts.parse_volume_spec("a,b:/data", cwd="/project")
+        message = str(caught.exception)
+        self.assertIn("a,b", message)
+        self.assertIn("/data", message)
+
+    def test_relative_target_is_refused_naming_the_target(self):
+        for entry in (
+            {"type": "bind", "source": "./data", "target": "relative"},
+            {"type": "volume", "source": "cache", "target": "relative"},
+        ):
+            with self.subTest(entry=entry):
+                self._refused(entry, "relative", "relative")
+        with self.assertRaises(mounts.MountSpecError) as caught:
+            mounts.parse_volume_spec("cache:relative", cwd="/project")
+        self.assertIn("relative", str(caught.exception))
+
+    def test_sources_resolve_against_the_project_directory(self):
+        mount = mounts.mount_from_entry(self._bind(), "/project")
+        self.assertEqual(
+            (mount.kind, mount.source, mount.target, mount.readonly),
+            ("bind", "/project/data", "/data", False),
+        )
+        mount = mounts.mount_from_entry(
+            {"type": "bind", "source": "/abs", "target": "/data"}, "/project"
+        )
+        self.assertEqual((mount.kind, mount.source), ("bind", "/abs"))
+        mount = mounts.mount_from_entry(self._named(), "/project", volume_name="p_cache")
+        self.assertEqual((mount.kind, mount.source, mount.target), ("volume", "p_cache", "/cache"))
+        mount = mounts.mount_from_entry(self._named(), "/project")
+        self.assertEqual((mount.kind, mount.source), ("volume", "cache"))
+
+    def test_non_mapping_entry_is_refused(self):
+        with self.assertRaises(mounts.MountSpecError):
+            mounts.mount_from_entry("cache:/cache", "/project")
+
+
 if __name__ == "__main__":
     unittest.main()
