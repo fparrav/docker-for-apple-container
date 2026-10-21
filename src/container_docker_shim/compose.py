@@ -62,6 +62,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from . import compose_build_secrets
 from . import compose_capabilities
 from .cli import (
     DOCKER_ZERO_TIME,
@@ -80,7 +81,8 @@ from .cli import (
     cmd_stop as docker_stop,
     translate_build_argv,
 )
-from .mounts import parse_volume as _translate_volume
+from .mounts import Mount, MountSpecError, is_host_path, mount_from_entry, parse_volume_spec
+from .mounts import emit as emit_mount
 from . import security
 from . import compose_health
 from . import compose_normalizer
@@ -347,7 +349,8 @@ def parse_yaml(text: str) -> Any:
 # ========================================================================== #
 
 
-def _load_env_file(path: str) -> dict[str, str]:
+def _load_env_file(path: str, *, required: bool = False) -> dict[str, str]:
+    """Read a dotenv file; a missing file is silent unless ``required`` (explicit ``--env-file``)."""
     env: dict[str, str] = {}
     try:
         with open(path, encoding="utf-8") as handle:
@@ -365,7 +368,8 @@ def _load_env_file(path: str) -> dict[str, str]:
                     value = value[1:-1]
                 env[key.strip()] = value
     except FileNotFoundError:
-        pass
+        if required:
+            raise ShimError(f"couldn't find env file: {os.path.abspath(path)}", 1)
     return env
 
 
@@ -558,6 +562,7 @@ class Project:
             self.services[str(svc_name)] = Service(str(svc_name), spec)
         self.networks = doc.get("networks") or {}
         self.volumes = doc.get("volumes") or {}
+        self.secrets = doc.get("secrets") or {}
         # The official normalizer's JSON as received; None for the built-in parser.
         self.normalized: dict[str, Any] | None = None
         self._resources: compose_resources.Resources | None = None
@@ -673,12 +678,12 @@ def _normalizer_inputs(
     compose_paths: list[str],
     project_name: str | None,
     project_dir: str | None,
-    env_file: str | None,
+    env_files: tuple[str, ...],
 ) -> compose_normalizer.Inputs:
     """Flags for the official binary; defaults are left to it so overrides still merge."""
     return compose_normalizer.Inputs(
         files=tuple(compose_paths) if files else (),
-        env_files=(env_file,) if env_file else (),
+        env_files=tuple(env_files),
         profiles=tuple(profiles),
         project_name=project_name,
         project_dir=project_dir,
@@ -752,11 +757,15 @@ _OVERRIDE_FILENAMES = (
 
 
 def _require_builtin_subset_inputs(
-    files: list[str], profiles: list[str], compose_paths: list[str]
+    files: list[str],
+    profiles: list[str],
+    compose_paths: list[str],
+    env_files: tuple[str, ...] = (),
 ) -> None:
     """Refuse inputs only the official normalizer can honour (exit 64).
 
-    Several files, profiles and an automatically merged override file all
+    Several files, profiles, several env files, ``COMPOSE_ENV_FILES`` (when no
+    ``--env-file`` overrides it) and an automatically merged override file all
     change the model, and the built-in parser would silently ignore them.
     """
     if len(compose_paths) > 1:
@@ -769,6 +778,18 @@ def _require_builtin_subset_inputs(
         raise ShimError(
             "compose: --profile and COMPOSE_PROFILES are not supported by the "
             f"built-in parser; {_INSTALL_HINT}",
+            64,
+        )
+    if len(env_files) > 1:
+        raise ShimError(
+            "compose: merging several --env-file files is not supported by the "
+            f"built-in parser; {_INSTALL_HINT}",
+            64,
+        )
+    if not env_files and os.environ.get("COMPOSE_ENV_FILES"):
+        raise ShimError(
+            "compose: COMPOSE_ENV_FILES is not supported by the built-in "
+            f"parser; {_INSTALL_HINT}",
             64,
         )
     if not files:
@@ -788,7 +809,7 @@ def _load_project(
     profiles: list[str],
     project_name: str | None,
     project_dir: str | None,
-    env_file: str | None,
+    env_files: tuple[str, ...],
 ) -> Project:
     directory = os.path.abspath(project_dir or os.getcwd())
     compose_paths = _find_compose_files(files, directory)
@@ -797,7 +818,7 @@ def _load_project(
     executable = _resolve_normalizer()
     if executable is not None:
         inputs = _normalizer_inputs(
-            files, profiles, compose_paths, project_name, project_dir, env_file
+            files, profiles, compose_paths, project_name, project_dir, env_files
         )
         try:
             model, raw = _load_normalized_model(executable, inputs)
@@ -811,7 +832,7 @@ def _load_project(
         project.normalized = raw
         return project
 
-    _require_builtin_subset_inputs(files, profiles, compose_paths)
+    _require_builtin_subset_inputs(files, profiles, compose_paths, env_files)
     compose_path = compose_paths[0]
 
     with open(compose_path, encoding="utf-8") as handle:
@@ -824,7 +845,10 @@ def _load_project(
     if not isinstance(raw_doc, dict):
         raise ShimError("compose: top-level document must be a mapping", 64)
 
-    env = _load_env_file(env_file or os.path.join(project_dir_resolved, ".env"))
+    if env_files:
+        env = _load_env_file(env_files[0], required=True)
+    else:
+        env = _load_env_file(os.path.join(project_dir_resolved, ".env"))
     env.update(os.environ)  # shell environment overrides .env, like Docker
     doc = _interpolate(raw_doc, env)
 
@@ -892,6 +916,45 @@ def _translate_environment(spec_env: Any) -> list[str]:
     return args
 
 
+@dataclasses.dataclass(frozen=True)
+class _PlannedMount:
+    """One validated mount: the typed mount and, for a named volume, its Compose key."""
+
+    mount: Mount
+    volume_key: Optional[str] = None
+
+
+def _entry_mount(entry: Any, project: Project) -> _PlannedMount:
+    """Pure translation of one volume entry (short or long syntax) into a mount.
+
+    Mode and attribute policy lives in :mod:`.mounts`; a named volume's source is
+    replaced by the runtime name the project resolved for it. Raises
+    ``MountSpecError`` for anything the policy or the translator refuses.
+    """
+    if isinstance(entry, dict):
+        mount = mount_from_entry(entry, project.directory)
+    else:
+        text = _as_str(entry)
+        if len(text.split(":")) < 2:
+            raise MountSpecError(f"invalid volume entry: {text!r}")
+        mount = parse_volume_spec(text, cwd=project.directory)
+    if mount.kind != "volume":
+        return _PlannedMount(mount)
+    key = mount.source
+    return _PlannedMount(
+        dataclasses.replace(mount, source=_volume_resource(project, key).name), key
+    )
+
+
+def _service_mounts(service: Service, project: Project) -> list[_PlannedMount]:
+    """Every mount of a service, validated without touching the runtime."""
+    return [_entry_mount(entry, project) for entry in _as_list(service.spec.get("volumes"))]
+
+
+def _mount_error(service: Service, exc: MountSpecError) -> ShimError:
+    return ShimError(f"compose: service {service.name!r}: {exc}", 64)
+
+
 def _classify_and_translate_volume(
     entry: Any, project: Project, ensured_volumes: set[str]
 ) -> list[str]:
@@ -899,84 +962,28 @@ def _classify_and_translate_volume(
 
     Host-path sources (``./data``, ``/abs``) become bind mounts. Bare names
     are project-scoped Apple **named volumes** (created on demand), mounted
-    with the native ``-v name:/target`` form.
+    with the native ``--mount type=volume`` form.
     """
-    if isinstance(entry, dict):
-        source = _as_str(entry.get("source"))
-        target = _as_str(entry.get("target"))
-        if not target:
-            raise ShimError(f"compose: volume entry missing target: {entry!r}", 64)
-        if entry.get("type") == "bind" or _is_host_path(source):
-            host = _resolve_host_path(source, project.directory)
-            mode = "ro" if entry.get("read_only") is True else ""
-            return _translate_volume(_join_volume(host, target, mode))
-        mode = "ro" if entry.get("read_only") is True else ""
-        return _named_volume_args(source, target, mode, project, ensured_volumes)
-
-    text = _as_str(entry)
-    parts = text.split(":")
-    if len(parts) < 2:
-        raise ShimError(f"compose: invalid volume entry: {text!r}", 64)
-    source, target = parts[0], parts[1]
-    mode = parts[2] if len(parts) > 2 else ""
-    if _is_host_path(source):
-        host = _resolve_host_path(source, project.directory)
-        readonly = _mount_readonly(mode, target)
-        return _translate_volume(_join_volume(host, target, "ro" if readonly else ""))
-    return _named_volume_args(source, target, mode, project, ensured_volumes)
+    try:
+        planned = _entry_mount(entry, project)
+    except MountSpecError as exc:
+        raise ShimError(f"compose: {exc}", 64)
+    return _emit_planned(planned, project, ensured_volumes)
 
 
-def _is_host_path(source: str) -> bool:
-    """A compose volume source is a host path if it looks like one, not a name."""
-    return source.startswith((".", "/", "~")) or "/" in source
-
-
-def _resolve_host_path(source: str, project_dir: str) -> str:
-    expanded = os.path.expanduser(source)
-    if os.path.isabs(expanded):
-        return expanded
-    return os.path.normpath(os.path.join(project_dir, expanded))
-
-
-def _join_volume(source: str, target: str, mode: str) -> str:
-    return f"{source}:{target}:{mode}" if mode else f"{source}:{target}"
-
-
-# Short-syntax mode flags with no effect on Apple's mounts.
-_NOOP_MOUNT_MODES = frozenset({"rw", "z", "Z", "cached", "delegated"})
-
-
-def _mount_readonly(mode: str, target: str) -> bool:
-    """Whether the short-syntax ``mode`` asks for read-only; refuse other flags."""
-    readonly = False
-    for flag in (item.strip() for item in mode.split(",")):
-        if flag == "ro":
-            readonly = True
-        elif flag and flag not in _NOOP_MOUNT_MODES:
-            raise ShimError(
-                f"compose: volume option {flag!r} on {target!r} has no Apple "
-                "container equivalent",
-                64,
-            )
-    return readonly
-
-
-def _named_volume_args(
-    source: str, target: str, mode: str, project: Project, ensured_volumes: set[str]
+def _emit_planned(
+    planned: _PlannedMount, project: Project, ensured_volumes: set[str]
 ) -> list[str]:
-    volume = _volume_resource(project, source)
-    resource = volume.name
-    readonly = _mount_readonly(mode, target)
-    if resource not in ensured_volumes:
+    """The only effect of mount translation: create the named volume on demand."""
+    key, resource = planned.volume_key, planned.mount.source
+    if key is not None and resource not in ensured_volumes:
+        volume = _volume_resource(project, key)
         if volume.managed:
-            declared = project.volumes.get(source) if isinstance(project.volumes, dict) else None
+            declared = project.volumes.get(key) if isinstance(project.volumes, dict) else None
             labels = declared.get("labels") if isinstance(declared, dict) else None
             _ensure_named_volume(resource, project.name, labels, key=volume.key)
         ensured_volumes.add(resource)
-    spec = f"type=volume,source={resource},target={target}"
-    if readonly:
-        spec += ",readonly"
-    return ["--mount", spec]
+    return emit_mount(planned.mount)
 
 
 def _service_network_keys(service: Service) -> list[str]:
@@ -1002,7 +1009,7 @@ def _service_volume_keys(service: Service) -> list[str]:
             source = _as_str(entry.get("source"))
         else:
             source = _as_str(entry).split(":")[0]
-        if source and not _is_host_path(source):
+        if source and not is_host_path(source):
             keys.append(source)
     return keys
 
@@ -1100,8 +1107,12 @@ def _build_run_args(
     for port in _as_list(spec.get("ports")):
         args.extend(["-p", _compose_port_to_publish(port)])
 
-    for volume in _as_list(spec.get("volumes")):
-        args.extend(_classify_and_translate_volume(volume, project, ensured_volumes))
+    try:
+        planned_mounts = _service_mounts(service, project)
+    except MountSpecError as exc:
+        raise _mount_error(service, exc)
+    for planned in planned_mounts:
+        args.extend(_emit_planned(planned, project, ensured_volumes))
 
     # Compose entrypoint follows the same string-splitting rules as command.
     entrypoint = _command_list(spec["entrypoint"]) if spec.get("entrypoint") is not None else None
@@ -1188,6 +1199,73 @@ def _resource_limits(spec: dict[str, Any]) -> tuple[str, str]:
     return cpus, memory
 
 
+def _mount_problems(
+    project: Project, services: list[Service], reported: list[str]
+) -> list[str]:
+    """``REFUSED:`` lines for mounts the translator cannot express.
+
+    The capability gate already reports refused mount options; a problem whose
+    text it printed is not repeated. What is left is what only translation
+    knows (a comma in a path, a relative target, a malformed entry).
+    """
+    found: list[str] = []
+    for service in services:
+        for entry in _as_list(service.spec.get("volumes")):
+            try:
+                _entry_mount(entry, project)
+            except MountSpecError as exc:
+                if any(str(exc) in line for line in reported):
+                    continue
+                found.append(
+                    compose_capabilities.refused(f"service {service.name!r}: volumes: {exc}")
+                )
+    return found
+
+
+def _build_secret_problems(project: Project, services: list[Service]) -> list[str]:
+    """Structural problems of every ``build.secrets`` entry (pure, no filesystem)."""
+    found: list[str] = []
+    for service in services:
+        build = service.spec.get("build")
+        if not isinstance(build, dict) or not build.get("secrets"):
+            continue
+        _secrets, problems, _notices = compose_build_secrets.resolve(
+            service, build.get("secrets"), project.secrets, project.directory
+        )
+        found.extend(problem.removeprefix("compose: ") for problem in problems)
+    return found
+
+
+def _check_build_secrets(
+    project: Project, services: list[Service], *, build: bool, no_build: bool
+) -> None:
+    """Refuse missing secret files and unset variables before any side effect.
+
+    Only the services that will build are checked: with the image present and no
+    ``--build`` Docker never reads the secret either. Read-only (one
+    ``image inspect`` per candidate); no value is ever read or printed.
+    """
+    if no_build:
+        return
+    problems: list[str] = []
+    for service in services:
+        spec_build = service.spec.get("build")
+        if not isinstance(spec_build, dict) or not spec_build.get("secrets"):
+            continue
+        if not (build or not _image_exists(_build_tag(service, project))):
+            continue
+        secrets, _problems, _notices = compose_build_secrets.resolve(
+            service, spec_build.get("secrets"), project.secrets, project.directory
+        )
+        problems.extend(
+            compose_build_secrets.check(secrets, os.path.isfile, os.environ, service.name)
+        )
+    if problems:
+        for line in problems:
+            print(compose_capabilities.refused(line.removeprefix("compose: ")), file=sys.stderr)
+        raise ShimError("compose: nothing was created; fix the problems above", 64)
+
+
 def _validate_plan(project: Project, services: list[Service]) -> None:
     """Validate every service about to be acted on, before any side effect.
 
@@ -1205,6 +1283,11 @@ def _validate_plan(project: Project, services: list[Service]) -> None:
         compose_capabilities.refused(f"service {f.service!r}: {f.key}: {f.message}")
         for f in report.refusals
     ]
+    problems.extend(_mount_problems(project, services, problems))
+    problems.extend(
+        compose_capabilities.refused(line)
+        for line in _build_secret_problems(project, services)
+    )
     dependency_notices: list[str] = []
     try:
         dependency_notices = _validate_dependencies(services)
@@ -2248,6 +2331,7 @@ def cmd_up(
         _warn(notice)
 
     _validate_plan(project, services)
+    _check_build_secrets(project, services, build=build, no_build=no_build)
     detach = detach or wait  # --wait implies --detach
 
     # Read-only: external resources must exist and managed names must be ours,
@@ -2586,6 +2670,7 @@ def cmd_build(project: Project, *, only: list[str]) -> int:
         wanted = set(only)
         services = [svc for svc in services if svc.name in wanted]
     _validate_plan(project, services)
+    _check_build_secrets(project, services, build=True, no_build=False)
     built = 0
     for service in services:
         if "build" not in service.spec:
@@ -2824,10 +2909,14 @@ def _compose_exec_value_option(
 # ========================================================================== #
 
 
+def _build_tag(service: Service, project: Project) -> str:
+    return _as_str(service.spec.get("image")) or f"{project.name}-{service.name}"
+
+
 def _resolve_image(service: Service, project: Project, *, build: bool, no_build: bool) -> str:
     spec = service.spec
     if "build" in spec and not no_build:
-        tag = _as_str(spec.get("image")) or f"{project.name}-{service.name}"
+        tag = _build_tag(service, project)
         if build or not _image_exists(tag):
             _run_build(service, project, tag)
         return tag
@@ -2861,33 +2950,14 @@ def _image_id(image: str) -> str:
 
 def _build_secret_args(service: Service, project: Project, build: dict[str, Any]) -> list[str]:
     """``--secret`` arguments for ``build.secrets``; the shim never reads the files."""
-    definitions = project.doc.get("secrets")
-    if not isinstance(definitions, dict):
-        definitions = {}
-    args: list[str] = []
-    for item in _as_list(build.get("secrets")):
-        name = _as_str(item.get("source") if isinstance(item, dict) else item)
-        definition = definitions.get(name)
-        if not isinstance(definition, dict):
-            raise ShimError(
-                f"compose: service {service.name!r} build.secrets names {name!r}, "
-                "which is not defined in the top-level 'secrets'",
-                64,
-            )
-        if definition.get("file"):
-            path = _as_str(definition["file"])
-            if not os.path.isabs(path):
-                path = os.path.normpath(os.path.join(project.directory, path))
-            args.extend(["--secret", f"id={name},src={path}"])
-        elif definition.get("environment"):
-            args.extend(["--secret", f"id={name},env={_as_str(definition['environment'])}"])
-        else:
-            raise ShimError(
-                f"compose: service {service.name!r} build secret {name!r} needs a "
-                "'file' or 'environment' source",
-                64,
-            )
-    return args
+    secrets, problems, notices = compose_build_secrets.resolve(
+        service, build.get("secrets"), project.secrets, project.directory
+    )
+    if problems:
+        raise ShimError("\n".join(problems), 64)
+    for line in notices:
+        print(line, file=sys.stderr)
+    return compose_build_secrets.to_args(secrets)
 
 
 def _run_build(service: Service, project: Project, tag: str) -> None:
@@ -3043,50 +3113,70 @@ def _apply_compose_environment(
     return list(files), list(profiles) + [item for item in extra if item]
 
 
+# Global options that take a value, as `--opt value` or `--opt=value`, mapped
+# to their long name (the value is checked for emptiness under that name).
+_GLOBAL_VALUE_OPTIONS = {
+    "-f": "--file",
+    "--file": "--file",
+    "--profile": "--profile",
+    "-p": "--project-name",
+    "--project-name": "--project-name",
+    "--project-directory": "--project-directory",
+    "--env-file": "--env-file",
+}
+
+
+def _global_option(argv: list[str], index: int) -> tuple[str, str, int] | None:
+    """Read the global option at ``index``: ``(long name, value, next index)``.
+
+    Returns None when the argument is not a global option that takes a value.
+    A missing or empty value exits 64 naming the option.
+    """
+    arg = argv[index]
+    if arg in _GLOBAL_VALUE_OPTIONS:
+        option = _GLOBAL_VALUE_OPTIONS[arg]
+        value, following = _take(argv, index, arg)
+    else:
+        name, equals, value = arg.partition("=")
+        if not equals or not name.startswith("--") or name not in _GLOBAL_VALUE_OPTIONS:
+            return None
+        option, following = _GLOBAL_VALUE_OPTIONS[name], index + 1
+    if not value:
+        raise ShimError(f"compose: {option} requires a non-empty value", 64)
+    return option, value, following
+
+
 def main(argv: list[str]) -> int:
     """Parse `docker compose` global flags, then dispatch the subcommand."""
     files: list[str] = []
     profiles: list[str] = []
     project_name: str | None = None
     project_dir: str | None = None
-    env_file: str | None = None
+    env_files: list[str] = []
 
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("-f", "--file"):
-            value, i = _take(argv, i, arg)
-            files.append(value)
-            continue
-        if arg == "--profile":
-            value, i = _take(argv, i, arg)
-            profiles.append(value)
-            continue
-        if arg in ("-p", "--project-name"):
-            project_name, i = _take(argv, i, arg)
-            continue
-        if arg == "--project-directory":
-            project_dir, i = _take(argv, i, arg)
-            continue
-        if arg == "--env-file":
-            env_file, i = _take(argv, i, arg)
-            continue
-        if arg.startswith("--file="):
-            files.append(arg.split("=", 1)[1])
-            i += 1
-            continue
-        if arg.startswith("--profile="):
-            profiles.append(arg.split("=", 1)[1])
-            i += 1
-            continue
-        if arg.startswith("--project-name="):
-            project_name = arg.split("=", 1)[1]
-            i += 1
-            continue
         if arg in ("-h", "--help"):
             print(_USAGE)
             return 0
-        break
+        try:
+            parsed = _global_option(argv, i)
+        except ShimError as exc:
+            return _die(str(exc), exc.code)
+        if parsed is None:
+            break
+        option, value, i = parsed
+        if option == "--file":
+            files.append(value)
+        elif option == "--profile":
+            profiles.append(value)
+        elif option == "--project-name":
+            project_name = value
+        elif option == "--project-directory":
+            project_dir = value
+        else:
+            env_files.append(value)
 
     rest = argv[i:]
     if not rest:
@@ -3103,10 +3193,12 @@ def main(argv: list[str]) -> int:
             profiles=profiles,
             project_name=project_name,
             project_dir=project_dir,
-            env_file=env_file,
+            env_files=tuple(env_files),
         )
     except ShimError as exc:
         return _die(str(exc), exc.code)
+    except MountSpecError as exc:  # a mount error that escaped validation: no traceback
+        return _die(f"compose: {exc}", 64)
 
 
 def _dispatch(
@@ -3117,7 +3209,7 @@ def _dispatch(
     profiles: list[str],
     project_name: str | None,
     project_dir: str | None,
-    env_file: str | None,
+    env_files: tuple[str, ...],
 ) -> int:
     def project() -> Project:
         return _load_project(
@@ -3125,7 +3217,7 @@ def _dispatch(
             profiles=profiles,
             project_name=project_name,
             project_dir=project_dir,
-            env_file=env_file,
+            env_files=env_files,
         )
 
     def optional_project() -> Project | None:
