@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 
 class MountSpecError(ValueError):
@@ -18,12 +19,44 @@ class Mount:
     readonly: bool = False
 
 
-_NOOP_SHORT_MODES = frozenset({"rw", "cached", "delegated"})
-# Docker's z/Z short modes request SELinux relabeling. Apple container 1.5.0
-# documents --mount as type/source/target/readonly only and live-rejects the
-# directive ("unknown directive selinux when parsing mount"), so the shim must
-# refuse z/Z instead of silently dropping them.
-_SELINUX_SHORT_MODES = frozenset({"z", "Z"})
+# One verdict per mount option, shared by `docker run` and Compose (design
+# D4); nothing else owns a copy of this policy.
+READ_ONLY = "read-only"
+NO_EFFECT = "no-effect"
+REFUSED = "refused"
+
+# Short-syntax modes: the comma list in `source:target:mode`.
+MODE_RULES: dict[str, str] = {
+    "ro": READ_ONLY,
+    "rw": NO_EFFECT,
+    "cached": NO_EFFECT,
+    "delegated": NO_EFFECT,
+    # Docker's z/Z request SELinux relabeling. Apple container 1.5.0 documents
+    # --mount as type/source/target/readonly only and live-rejects the
+    # directive ("unknown directive selinux when parsing mount"), so the shim
+    # refuses z/Z instead of silently dropping them.
+    "z": REFUSED,
+    "Z": REFUSED,
+}
+
+# Long-syntax attributes, keyed "section.name" (no section: the entry
+# itself); `image` and `tmpfs` are refused `type` values.
+ATTRIBUTE_RULES: dict[str, str] = {
+    "read_only": READ_ONLY,
+    "consistency": NO_EFFECT,
+    # Observed live (findings.md F5): Docker creates a missing bind source by
+    # default, Apple container 1.5.0 refuses to start and creates nothing, so
+    # the option is accepted but changes nothing.
+    "bind.create_host_path": NO_EFFECT,
+    "bind.selinux": REFUSED,
+    "bind.propagation": REFUSED,
+    "volume.nocopy": REFUSED,
+    "volume.subpath": REFUSED,
+    "image": REFUSED,
+    "tmpfs": REFUSED,
+}
+
+# Key names of Docker's comma-list `--mount` dialect.
 _LONG_KEYS = frozenset({"type", "source", "src", "target", "dst", "destination", "readonly", "ro"})
 
 
@@ -45,15 +78,21 @@ def _validate_target(target: str) -> None:
     if not target.startswith("/"):
         raise MountSpecError(f"mount target must be an absolute path: {target!r}")
     if "," in target:
-        raise MountSpecError("mount targets containing commas are unsupported")
+        raise MountSpecError(f"mount targets containing commas are unsupported: {target!r}")
+
+
+def _validate_source(source: str, target: str) -> None:
+    if not source:
+        raise MountSpecError("mount source is required")
+    if "," in source:
+        raise MountSpecError(
+            f"mount sources containing commas are unsupported: {source!r} on {target!r}"
+        )
 
 
 def _mount(source: str, target: str, readonly: bool, cwd: str | None = None) -> Mount:
     _validate_target(target)
-    if not source:
-        raise MountSpecError("mount source is required")
-    if "," in source:
-        raise MountSpecError("mount sources containing commas are unsupported")
+    _validate_source(source, target)
     if is_host_path(source):
         return Mount("bind", _resolve_host_path(source, cwd), target, readonly)
     return Mount("volume", source, target, readonly)
@@ -90,6 +129,34 @@ def emit(mount: Mount) -> list[str]:
     raise MountSpecError(f"unsupported mount type: {mount.kind!r}")
 
 
+def _selinux_refusal(name: str, target: str) -> str:
+    """Refusal text for an SELinux directive: names the option and the target."""
+    return (
+        f"{name} on {target!r} requests SELinux relabeling, which Apple container "
+        "cannot represent; remove it because macOS has no SELinux"
+    )
+
+
+def check_short_modes(mode: str, target: str) -> bool:
+    """Classify a short-syntax mode list against ``MODE_RULES``.
+
+    Returns the read-only verdict. A refused or unknown mode raises
+    ``MountSpecError`` naming the mode and the target.
+    """
+    readonly = False
+    for flag in (item.strip() for item in mode.split(",")):
+        if not flag:
+            continue
+        rule = MODE_RULES.get(flag)
+        if rule == READ_ONLY:
+            readonly = True
+        elif rule == REFUSED:
+            raise MountSpecError(_selinux_refusal(f"volume mode {flag!r}", target))
+        elif rule is None:
+            raise MountSpecError(f"unsupported volume mode {flag!r} on {target!r}")
+    return readonly
+
+
 def parse_volume_spec(value: str, *, cwd: str | None = None) -> Mount:
     """Parse Docker ``-v source:target[:mode]`` into a typed mount."""
     parts = value.split(":", 2)
@@ -97,23 +164,95 @@ def parse_volume_spec(value: str, *, cwd: str | None = None) -> Mount:
         raise MountSpecError(f"unsupported volume syntax: {value}")
     source, target = parts[:2]
     mode = parts[2] if len(parts) == 3 else ""
-    readonly = False
-    for flag in (item.strip() for item in mode.split(",")):
-        if flag in _SELINUX_SHORT_MODES:
-            raise MountSpecError(
-                f"volume mode {flag!r} requests SELinux relabeling, which Apple "
-                "container cannot represent"
-            )
-        if flag == "ro":
-            readonly = True
-        elif flag and flag not in _NOOP_SHORT_MODES:
-            raise MountSpecError(f"unsupported volume mode {flag!r} on {target!r}")
+    readonly = check_short_modes(mode, target)
     return _mount(source, target, readonly, cwd)
 
 
 def parse_volume(value: str, *, cwd: str | None = None) -> list[str]:
     """Parse Docker ``-v`` syntax and emit Apple arguments."""
     return emit(parse_volume_spec(value, cwd=cwd))
+
+
+# Long-syntax keys that carry structure, not options; every other key must be
+# an entry in ``ATTRIBUTE_RULES``.
+STRUCTURAL_KEYS = frozenset({"type", "source", "src", "target", "dst", "destination"})
+LONG_SECTIONS = ("bind", "volume")
+
+
+def attribute_rule(name: str, value: Any, target: str) -> str:
+    """Classify one long-syntax attribute; a refused or unknown one raises."""
+    rule = ATTRIBUTE_RULES.get(name)
+    if rule == REFUSED:
+        if name == "bind.selinux" and not value:
+            return NO_EFFECT
+        if name == "bind.selinux":
+            raise MountSpecError(_selinux_refusal(f"volume option {name!r}", target))
+        raise MountSpecError(f"unsupported volume option {name!r} on {target!r}")
+    if rule is None:
+        raise MountSpecError(f"unknown volume option {name!r} on {target!r}")
+    return rule
+
+
+def mount_from_entry(
+    entry: Mapping[str, Any],
+    project_dir: str | None = None,
+    volume_name: str | None = None,
+) -> Mount:
+    """Translate one long-syntax Compose volume entry into a typed mount.
+
+    Every key is checked against ``ATTRIBUTE_RULES``: a refused option or an
+    unknown key raises ``MountSpecError`` naming the option and the target,
+    never a silent drop. ``project_dir`` resolves relative bind sources;
+    ``volume_name`` is the runtime name the caller resolved for a named
+    volume (the entry's ``source`` stands in when it is absent).
+    """
+    if not isinstance(entry, Mapping):
+        raise MountSpecError(f"volume entry must be a mapping, got {type(entry).__name__}")
+    sources = [
+        str(entry[key]) for key in ("source", "src") if key in entry and entry[key] is not None
+    ]
+    targets = [
+        str(entry[key])
+        for key in ("target", "dst", "destination")
+        if key in entry and entry[key] is not None
+    ]
+    if len(sources) > 1:
+        raise MountSpecError("use only one of source or src")
+    if len(targets) > 1:
+        raise MountSpecError("use only one of target, dst, or destination")
+    source = sources[0] if sources else ""
+    target = targets[0] if targets else ""
+    _validate_target(target)
+
+    kind = str(entry.get("type") or ("bind" if is_host_path(source) else "volume"))
+    if kind not in ("bind", "volume"):
+        if ATTRIBUTE_RULES.get(kind) == REFUSED:
+            raise MountSpecError(
+                f"unsupported volume type {kind!r} on {target!r}: Apple container "
+                "cannot represent it"
+            )
+        raise MountSpecError(f"unknown volume type {kind!r} on {target!r}")
+    _validate_source(source, target)
+
+    readonly = False
+    for key, value in entry.items():
+        if key in STRUCTURAL_KEYS:
+            continue
+        if key in LONG_SECTIONS:
+            if not isinstance(value, Mapping):
+                raise MountSpecError(f"volume option {key!r} on {target!r} must be a mapping")
+            for name, sub in value.items():
+                attribute_rule(f"{key}.{name}", sub, target)
+            continue
+        rule = attribute_rule(key, value, target)
+        if rule == READ_ONLY:
+            if not isinstance(value, bool):
+                raise MountSpecError(f"volume option {key!r} on {target!r} must be a boolean")
+            readonly = value
+
+    if kind == "bind":
+        return Mount("bind", _resolve_host_path(source, project_dir), target, readonly)
+    return Mount("volume", volume_name if volume_name is not None else source, target, readonly)
 
 
 def parse_mount_spec(value: str, *, cwd: str | None = None) -> Mount:
