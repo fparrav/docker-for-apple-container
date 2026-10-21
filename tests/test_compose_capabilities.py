@@ -81,11 +81,11 @@ class ClassificationTests(unittest.TestCase):
             unknown = [f for f in report.refusals if "unknown" in f.message]
             self.assertEqual(unknown, [], path.name)
 
-    def test_module_depends_only_on_security_and_mounts(self):
+    def test_module_depends_only_on_security_mounts_and_resource_compat(self):
         source = (ROOT / "src" / "container_docker_shim" / "compose_capabilities.py").read_text()
         imports = re.findall(r"^from \. import (\w+)|^from \.(\w+) import", source, re.M)
         names = {a or b for a, b in imports}
-        self.assertEqual(names, {"security", "mounts"})
+        self.assertEqual(names, {"security", "mounts", "compose_resource_compat"})
 
 
 class IsolationTests(unittest.TestCase):
@@ -115,6 +115,42 @@ class IsolationTests(unittest.TestCase):
             "b": {"image": "x", "secrets": ["pw"]},
         })
         self.assertEqual(keys(report.refusals), [("a", "network_mode"), ("b", "secrets")])
+
+
+class NetworkModeMessageTests(unittest.TestCase):
+    def test_string_values_get_the_specific_message(self):
+        for value, fragment in (
+            ("host", "host.docker.internal"),
+            ("none", "disable a service's networking"),
+            ("service:db", "attach a service to another"),
+        ):
+            with self.subTest(value=value):
+                report = run({"worker": {"image": "x", "network_mode": value}})
+                self.assertEqual(keys(report.refusals), [("worker", "network_mode")])
+                message = report.refusals[0].message
+                # The report line supplies "network_mode: "; the message starts
+                # with the value so the key is not said twice.
+                self.assertTrue(message.startswith("%s is not supported" % value), message)
+                self.assertIn(fragment, message)
+                self.assertIn(
+                    "Isolation requests cannot be waived, even when named in %s."
+                    % security.ENV_ALLOW,
+                    message,
+                )
+                self.assertEqual(report.notices, [])
+
+    def test_non_string_values_keep_the_generic_reason(self):
+        report = run({"worker": {"image": "x", "network_mode": {"weird": 1}}})
+        self.assertEqual(keys(report.refusals), [("worker", "network_mode")])
+        self.assertIn("project network", report.refusals[0].message)
+
+    def test_waiver_still_refuses_with_the_specific_message(self):
+        env = {security.ENV_ALLOW: "network_mode"}
+        report = run({"worker": {"image": "x", "network_mode": "host"}}, env=env)
+        self.assertEqual(keys(report.refusals), [("worker", "network_mode")])
+        self.assertIn("host.docker.internal", report.refusals[0].message)
+        self.assertIn("cannot be waived", report.refusals[0].message)
+        self.assertEqual(report.notices, [])
 
 
 class RestrictionTests(unittest.TestCase):
@@ -302,6 +338,9 @@ class ResourceTests(unittest.TestCase):
         project = {"volumes": {"data": {"driver_opts": {"type": "nfs"}}}}
         report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
         self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+        message = report.refusals[0].message
+        self.assertIn("volume data", message)
+        self.assertIn("type", message)
 
     def test_unreferenced_resources_are_not_validated(self):
         project = {"volumes": {"other": {"driver_opts": {"type": "nfs"}}}}
@@ -320,6 +359,106 @@ class ResourceTests(unittest.TestCase):
         project = {"networks": {"default": {"driver": "overlay"}}}
         report = run({"w": {"image": "x"}}, project)
         self.assertEqual(keys(report.refusals), [("w", "networks.driver")])
+
+
+class LocalBindVolumeTests(unittest.TestCase):
+    def project(self, opts, driver=None):
+        spec = {"driver_opts": opts}
+        if driver is not None:
+            spec["driver"] = driver
+        return {"volumes": {"data": spec}}
+
+    def test_the_local_bind_idiom_produces_no_finding(self):
+        project = self.project({"type": "none", "o": "bind", "device": "/abs"}, driver="local")
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual((report.refusals, report.notices), ([], []))
+
+    def test_read_only_and_recursive_tokens_are_accepted(self):
+        for o in ("bind,ro", "rbind"):
+            with self.subTest(o=o):
+                project = self.project({"type": "none", "o": o, "device": "/abs"})
+                report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+                self.assertEqual((report.refusals, report.notices), ([], []))
+
+    def test_empty_driver_opts_stay_silent(self):
+        project = {"volumes": {"data": {"driver_opts": {}}}}
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual((report.refusals, report.notices), ([], []))
+
+    def test_non_local_driver_is_refused_once(self):
+        project = self.project({"type": "none", "o": "bind", "device": "/abs"}, driver="nfs")
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "volumes.driver")])
+        self.assertIn("nfs", report.refusals[0].message)
+        self.assertEqual(report.notices, [])
+
+    def test_nfs_type_is_refused_naming_the_volume_and_option(self):
+        project = self.project({"type": "nfs", "o": "bind", "device": "/abs"})
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+        message = report.refusals[0].message
+        self.assertIn("volume data", message)
+        self.assertIn("type", message)
+        self.assertEqual(report.notices, [])
+
+    def test_relative_device_is_refused_naming_the_device(self):
+        project = self.project({"type": "none", "o": "bind", "device": "./data"})
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+        self.assertIn("./data", report.refusals[0].message)
+
+    def test_unlisted_o_token_is_refused_naming_the_token(self):
+        project = self.project({"type": "none", "o": "bind,uid=1", "device": "/abs"})
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+        self.assertIn("uid=1", report.refusals[0].message)
+
+    def test_refusal_is_not_waivable(self):
+        project = self.project({"type": "nfs", "o": "bind", "device": "/abs"})
+        env = {security.ENV_ALLOW: "volumes.driver_opts"}
+        report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project, env)
+        self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+        self.assertEqual(report.notices, [])
+
+
+class NetworkDriverOptsTests(unittest.TestCase):
+    def project(self, opts):
+        return {"networks": {"back": {"driver_opts": opts}}}
+
+    def test_bridge_name_alone_is_a_notice_not_a_refusal(self):
+        project = self.project({"com.docker.network.bridge.name": "docker"})
+        report = run({"w": {"image": "x", "networks": ["back"]}}, project)
+        self.assertEqual(report.refusals, [])
+        self.assertEqual(keys(report.notices), [("w", "networks.driver_opts")])
+        message = report.notices[0].message
+        self.assertIn("back", message)
+        self.assertIn("com.docker.network.bridge.name", message)
+
+    def test_bridge_name_plus_other_option_is_refused(self):
+        project = self.project({
+            "com.docker.network.bridge.name": "docker",
+            "com.docker.network.driver.mtu": "1500",
+        })
+        report = run({"w": {"image": "x", "networks": ["back"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "networks.driver_opts")])
+        message = report.refusals[0].message
+        self.assertIn("back", message)
+        self.assertIn("com.docker.network.driver.mtu", message)
+        self.assertEqual(keys(report.notices), [("w", "networks.driver_opts")])
+
+    def test_other_option_alone_is_refused(self):
+        project = self.project({"com.docker.network.driver.mtu": "1500"})
+        report = run({"w": {"image": "x", "networks": ["back"]}}, project)
+        self.assertEqual(keys(report.refusals), [("w", "networks.driver_opts")])
+        self.assertIn("com.docker.network.driver.mtu", report.refusals[0].message)
+        self.assertEqual(report.notices, [])
+
+    def test_refusal_is_not_waivable(self):
+        project = self.project({"com.docker.network.driver.mtu": "1500"})
+        env = {security.ENV_ALLOW: "networks.driver_opts"}
+        report = run({"w": {"image": "x", "networks": ["back"]}}, project, env)
+        self.assertEqual(keys(report.refusals), [("w", "networks.driver_opts")])
+        self.assertEqual(report.notices, [])
 
 
 class UnknownWaiverTests(unittest.TestCase):

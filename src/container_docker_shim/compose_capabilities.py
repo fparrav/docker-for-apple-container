@@ -4,7 +4,10 @@
 services about to be created and returns every refusal and every partial
 application, without touching the runtime or the filesystem. The tables below
 decide what a Compose key means for this shim; mount modes and attributes are
-classified by the shared policy in :mod:`.mounts` (design D4).
+classified by the shared policy in :mod:`.mounts` (design D4), and the
+top-level ``driver_opts`` and ``network_mode`` verdicts come from the shared
+pure module :mod:`.compose_resource_compat` (design D1, D6), so the gate and
+the translator cannot diverge.
 
 Classification:
 
@@ -23,6 +26,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from . import compose_resource_compat
 from . import mounts
 from . import security
 
@@ -336,8 +340,33 @@ def _service(
             _service_networks(name, value, report)
         elif key == "volumes":
             _service_volumes(name, value, report)
+        elif key == "network_mode":
+            _network_mode(name, value, report)
         else:
             _apply_rule(rule, name, key, value, allowed, report)
+
+
+def _network_mode(name: str, value: Any, report: Report) -> None:
+    """The isolation refusal: never waivable, with a specific message per value.
+
+    A non-empty string value gets the message from the shared pure module
+    (one per value family); any other value keeps the generic reason.
+    """
+    if not requested(value):
+        return
+    rule = SERVICE_KEYS["network_mode"]
+    # The report line already starts with the key, so the message's own
+    # "network_mode: " lead-in is dropped to avoid saying it twice.
+    body = (
+        compose_resource_compat.network_mode_message(value).removeprefix("network_mode: ")
+        if isinstance(value, str)
+        else rule.reason
+    )
+    _refuse(
+        report, name, "network_mode",
+        "%s. Isolation requests cannot be waived, even when named in %s."
+        % (body, security.ENV_ALLOW),
+    )
 
 
 def _build(name: str, value: Any, report: Report) -> None:
@@ -516,8 +545,38 @@ def _resources(
             elif attr == "driver":
                 if requested(item) and item not in _DEFAULT_DRIVERS[kind]:
                     _refuse(report, owner, "%s.driver" % kind, "%s: driver '%s' is not supported" % (subject, item))
+            elif attr == "driver_opts":
+                _driver_opts(kind, key, attrs, owner, report)
             elif rule.status == UNSUPPORTED and requested(item):
                 _refuse(report, owner, "%s.%s" % (kind, attr), "%s: %s" % (subject, rule.reason))
+
+
+def _driver_opts(
+    kind: str, key: str, attrs: Mapping[str, Any], owner: str, report: Report
+) -> None:
+    """The value-sensitive ``driver_opts`` verdict from the shared pure module.
+
+    A volume that is the local bind idiom is applied (no finding); every other
+    volume form is refused with the offending option named. A network's bridge
+    name is reported as not applied; every other network option is refused and
+    named. Neither verdict is waivable.
+    """
+    item = attrs.get("driver_opts")
+    if not requested(item):
+        return
+    if kind == "volumes":
+        driver = attrs.get("driver")
+        if requested(driver) and driver not in _DEFAULT_DRIVERS[kind]:
+            return  # the driver check above already refused this volume
+        verdict = compose_resource_compat.local_bind(attrs)
+        if isinstance(verdict, compose_resource_compat.Problem):
+            _refuse(report, owner, "volumes.driver_opts", "volume %s: %s" % (key, verdict.message))
+        return
+    not_applied, refused = compose_resource_compat.classify_network_options(item)
+    for message in not_applied:
+        _notice(report, owner, "networks.driver_opts", "network %s: %s" % (key, message))
+    for message in refused:
+        _refuse(report, owner, "networks.driver_opts", "network %s: %s" % (key, message))
 
 
 def unknown_waivers(environ: Mapping[str, str] | None = None) -> list[str]:
