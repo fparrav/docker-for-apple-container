@@ -1,0 +1,24 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# The build reads a file secret and an environment secret (renamed to
+# `renamed`) through `RUN --mount=type=secret` and bakes only `ok` into the
+# image; the running service prints the marker, so the secret values must
+# never appear in any output.
+services:
+  app:
+    image: ${Q_IMAGE}
+    build:
+      context: .
+      secrets:
+        - filesecret
+        - source: envsecret
+          target: renamed
+    command:
+      - "sh"
+      - "-c"
+      - "cat /marker; sleep 3600"
+secrets:
+  filesecret:
+    file: ./secret.txt
+  envsecret:
+    environment: Q_ENV_SECRET

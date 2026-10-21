@@ -41,6 +41,7 @@ import unittest
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -60,6 +61,8 @@ from test_live_fixtures import (  # noqa: E402
     FIXTURE_N,
     FIXTURE_O,
     FIXTURE_P,
+    FIXTURE_Q,
+    FIXTURE_R,
     FIXTURES_DIR,
     HTTP_URL,
     UP_TIMEOUT_SECONDS,
@@ -576,13 +579,26 @@ class ConformanceFixtureTests(unittest.TestCase):
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        self._wait_for_log(harness, "writer", "VOL_WRITE_BLOCKED")
-        self._wait_for_log(harness, "writer", "BIND_WRITE_BLOCKED")
+        # The same markers the live tier asserts: the two short-syntax `:ro`
+        # mounts and the two long-syntax `read_only: true` mounts block, the
+        # read-write control accepts.
+        for marker in (
+            "VOL_WRITE_BLOCKED",
+            "BIND_WRITE_BLOCKED",
+            "VOL2_WRITE_BLOCKED",
+            "BIND2_WRITE_BLOCKED",
+            "RW_WRITE_OK",
+        ):
+            self._wait_for_log(harness, "writer", marker)
 
-        for target in ("/vol/y", "/shared/y"):
+        for target in ("/vol/y", "/shared/y", "/vol2/y", "/shared2/y"):
             attempt = harness.compose("exec", "-T", "writer", "touch", target)
             self.assertNotEqual(attempt.returncode, 0, f"write to {target} succeeded")
             self.assertIn("Read-only file system", attempt.stdout + attempt.stderr)
+
+        # The read-write control accepts the same write.
+        control = harness.compose("exec", "-T", "writer", "touch", "/rw/y")
+        self.assertEqual(control.returncode, 0, f"write to /rw/y failed: {control.stdout + control.stderr}")
 
     @tiers.conformance_tier()
     def test_fixture_n_network_mode_none_has_no_connectivity(self) -> None:
@@ -595,6 +611,54 @@ class ConformanceFixtureTests(unittest.TestCase):
         interfaces = harness.compose("exec", "-T", "isolated", "ls", "/sys/class/net")
         self.assertEqual(interfaces.returncode, 0, interfaces.stdout + interfaces.stderr)
         self.assertEqual(interfaces.stdout.split(), ["lo"])
+
+    @tiers.conformance_tier()
+    def test_fixture_r_selinux_refused_by_shim_but_accepted_on_engine(self) -> None:
+        # The documented difference: the shim refuses `:Z` (exit 64, nothing
+        # created) because Apple container cannot represent SELinux relabeling,
+        # while a real Docker Engine accepts the flag — a no-op where SELinux
+        # is not enabled — and starts the service.
+        harness = FixtureHarness(self, FIXTURE_R, docker=_client(), prefix="conf")
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @tiers.conformance_tier()
+    def test_fixture_q_build_secrets_reach_the_build_and_never_the_output(self) -> None:
+        client = _client()
+
+        # The built image gets a disposable name; a cleanup removes it by the
+        # exact name through the real client (a `down -v` never removes
+        # images).
+        image = tiers.disposable_name("qsec") + ":fx"
+        self.addCleanup(lambda: _run([client, "image", "rm", image]))
+
+        # The environment secret reaches the build only through the compose
+        # process's environment (the harness copies os.environ at call time),
+        # so the patch is entered before the harness: its cleanups then run
+        # while the variable is still set.
+        self.enterContext(
+            mock.patch.dict(os.environ, {"Q_ENV_SECRET": "dummy-env-secret"})
+        )
+
+        harness = FixtureHarness(
+            self,
+            FIXTURE_Q,
+            overrides={".env": f"Q_IMAGE={image}\n"},
+            docker=client,
+            prefix="conf",
+        )
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # The build baked `ok` into /marker and the running service prints it;
+        # the secret values must appear in no output at all.
+        self._wait_for_log(harness, "app", "ok")
+        logs = _run([client, "logs", f"{harness.project}-app-1"])
+        output = result.stdout + result.stderr + logs.stdout + logs.stderr
+        self.assertNotIn("dummy-file-secret", output)
+        self.assertNotIn("dummy-env-secret", output)
 
     @tiers.conformance_tier()
     def test_fixture_k_exited_container_reports_numeric_exit_code(self) -> None:

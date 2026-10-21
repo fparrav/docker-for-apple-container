@@ -32,6 +32,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -56,6 +57,8 @@ FIXTURE_M = "m-readonly-volume"
 FIXTURE_O = "o-external-volume"
 FIXTURE_P = "p-selective-up"
 FIXTURE_N = "n-network-none"
+FIXTURE_R = "r-selinux-refused"
+FIXTURE_Q = "q-build-secrets"
 FIXTURE_L = "l-partial-failure"
 TIMEOUT_SECONDS = 120
 UP_TIMEOUT_SECONDS = 300
@@ -384,6 +387,31 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
         self.assertEqual(read.stdout, "persisted")
         self.assertFalse(host_path.exists(), "the named volume created no path in the working directory")
+
+    @tiers.live_tier()
+    def test_missing_bind_source_is_neither_created_nor_started(self) -> None:
+        # Classifies `bind.create_host_path` (task 3.5): Docker creates a missing
+        # bind source by default, Apple container 1.5.0 refuses to start and
+        # creates nothing, so the option is accepted without effect.
+        self.require_images("alpine:3.20")
+        name = tiers.disposable_name("bind-missing")
+        temp = tempfile.TemporaryDirectory(prefix="shimtest-bind-missing-")
+        self.addCleanup(temp.cleanup)
+        cwd = Path(temp.name)
+        missing = cwd / "does-not-exist" / "sub"
+        self.addCleanup(lambda: _run([str(SHIM), "rm", "-f", name], cwd=cwd))
+
+        result = _run(
+            [str(SHIM), "run", "--name", name, "-v", f"{missing}:/d",
+             "alpine:3.20", "true"],
+            cwd=cwd,
+        )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn("does not exist", output)
+        self.assertFalse(missing.parent.exists(), "the missing bind source must not be created")
+        listed = _run([_container(), "list", "--all"])
+        self.assertNotIn(name, listed.stdout, "no container may remain for a failed bind")
 
     @tiers.live_tier()
     def test_docker_kill_normalizes_signal_and_delivers_sigterm(self) -> None:
@@ -765,14 +793,26 @@ class LiveFixtureTests(unittest.TestCase):
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        # The service prints what its own write attempts did.
-        self._wait_for_log(harness, "writer", "VOL_WRITE_BLOCKED")
-        self._wait_for_log(harness, "writer", "BIND_WRITE_BLOCKED")
+        # The service prints what its own write attempts did: the two
+        # short-syntax `:ro` mounts and the two long-syntax `read_only: true`
+        # mounts block, the read-write control accepts.
+        for marker in (
+            "VOL_WRITE_BLOCKED",
+            "BIND_WRITE_BLOCKED",
+            "VOL2_WRITE_BLOCKED",
+            "BIND2_WRITE_BLOCKED",
+            "RW_WRITE_OK",
+        ):
+            self._wait_for_log(harness, "writer", marker)
 
-        for target in ("/vol/y", "/shared/y"):
+        for target in ("/vol/y", "/shared/y", "/vol2/y", "/shared2/y"):
             attempt = harness.compose("exec", "-T", "writer", "touch", target)
             self.assertNotEqual(attempt.returncode, 0, f"write to {target} succeeded")
             self.assertIn("Read-only file system", attempt.stdout + attempt.stderr)
+
+        # The read-write control accepts the same write.
+        control = harness.compose("exec", "-T", "writer", "touch", "/rw/y")
+        self.assertEqual(control.returncode, 0, f"write to /rw/y failed: {control.stdout + control.stderr}")
 
     @tiers.live_tier()
     def test_fixture_n_network_mode_none_is_refused_and_creates_nothing(self) -> None:
@@ -791,6 +831,90 @@ class LiveFixtureTests(unittest.TestCase):
             listing = _run([_container(), *kind])
             self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
             self.assertNotIn(project, listing.stdout + listing.stderr)
+
+    @tiers.live_tier()
+    def test_fixture_r_selinux_relabeling_is_refused_and_creates_nothing(self) -> None:
+        self.require_images("alpine:3.20")
+        harness = FixtureHarness(self, FIXTURE_R)
+        project = harness.project
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertIn("REFUSED:", result.stderr, result.stderr)
+        self.assertIn("selinux", result.stderr, result.stderr)
+        self.assertIn("/data", result.stderr, result.stderr)
+        self.assertIn("SELinux", result.stderr, result.stderr)
+
+        # Nothing of this project exists: no container, network or volume.
+        for kind in (["ls", "--all"], ["network", "ls"], ["volume", "ls"]):
+            listing = _run([_container(), *kind])
+            self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+            self.assertNotIn(project, listing.stdout + listing.stderr)
+
+    @tiers.live_tier()
+    def test_fixture_q_build_secrets_reach_the_build_and_never_the_output(self) -> None:
+        self.require_images("alpine:3.20")
+
+        # The built image gets a disposable name; a cleanup removes it by the
+        # exact name (a `down -v` never removes images).
+        image = tiers.disposable_name("qsec") + ":fx"
+        self.addCleanup(lambda: _run([_container(), "image", "rm", image]))
+
+        # The environment secret reaches the build only through the shim
+        # process's environment (the harness copies os.environ at call time),
+        # so the patch is entered before the harness: its cleanups then run
+        # while the variable is still set.
+        self.enterContext(
+            mock.patch.dict(os.environ, {"Q_ENV_SECRET": "dummy-env-secret"})
+        )
+
+        harness = FixtureHarness(
+            self, FIXTURE_Q, overrides={".env": f"Q_IMAGE={image}\n"}
+        )
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # The build baked `ok` into /marker and the running service prints it;
+        # the secret values must appear in no output at all.
+        self._wait_for_log(harness, "app", "ok")
+        logs = harness.compose("logs", "app")
+        output = result.stdout + result.stderr + logs.stdout + logs.stderr
+        self.assertNotIn("dummy-file-secret", output)
+        self.assertNotIn("dummy-env-secret", output)
+
+    @tiers.live_tier()
+    def test_fixture_q_missing_env_secret_is_refused_and_creates_nothing(self) -> None:
+        self.require_images("alpine:3.20")
+        image = tiers.disposable_name("qsec") + ":fx"
+        self.addCleanup(lambda: _run([_container(), "image", "rm", image]))
+
+        harness = FixtureHarness(
+            self, FIXTURE_Q, overrides={".env": f"Q_IMAGE={image}\n"}
+        )
+        project = harness.project
+
+        # Q_ENV_SECRET must be absent from the shim process's environment.
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop("Q_ENV_SECRET", None)
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertIn("Q_ENV_SECRET", result.stdout + result.stderr)
+
+        # Nothing of this project exists: no container, network or volume.
+        for kind in (["ls", "--all"], ["network", "ls"], ["volume", "ls"]):
+            listing = _run([_container(), *kind])
+            self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+            self.assertNotIn(project, listing.stdout + listing.stderr)
+
+        # The refused build created no image either.
+        images = _run([_container(), "image", "ls"])
+        self.assertEqual(images.returncode, 0, images.stdout + images.stderr)
+        self.assertFalse(
+            _image_available(images.stdout + images.stderr, *image.split(":", 1)),
+            f"the refused build created the image: {images.stdout}",
+        )
 
     @tiers.live_tier()
     def test_fixture_k_exited_service_reported_exited_and_exit_code_refused(self) -> None:

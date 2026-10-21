@@ -1,0 +1,11 @@
+# tiers: live, conformance
+# images: alpine:3.20
+# `:Z` requests SELinux relabeling: the shim refuses it (exit 64) and creates
+# nothing, while real Docker honours the flag (a no-op where SELinux is not
+# enabled) — the documented difference between the two.
+services:
+  selinux:
+    image: alpine:3.20
+    volumes:
+      - ./data:/data:Z
+    command: ["sleep", "3600"]

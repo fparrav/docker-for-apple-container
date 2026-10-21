@@ -1,15 +1,29 @@
 # tiers: live, conformance
 # images: alpine:3.20
-# Both mounts are read-only: a write must fail on Docker and on the shim.
+# Four read-only mounts, one per syntax per kind: `:ro` (short) and
+# `read_only: true` (long) on a named volume and on a bind; a write to each
+# must fail on Docker and on the shim. The fifth mount is a read-write
+# control: a write to it must succeed.
 services:
   writer:
     image: alpine:3.20
     volumes:
       - data:/vol:ro
       - ./shared:/shared:ro
+      - type: volume
+        source: data2
+        target: /vol2
+        read_only: true
+      - type: bind
+        source: ./shared
+        target: /shared2
+        read_only: true
+      - data3:/rw
     command:
       - "sh"
       - "-c"
-      - "(touch /vol/x 2>/dev/null && echo VOL_WRITE_OK || echo VOL_WRITE_BLOCKED); (touch /shared/x 2>/dev/null && echo BIND_WRITE_OK || echo BIND_WRITE_BLOCKED); sleep 3600"
+      - "(touch /vol/x 2>/dev/null && echo VOL_WRITE_OK || echo VOL_WRITE_BLOCKED); (touch /shared/x 2>/dev/null && echo BIND_WRITE_OK || echo BIND_WRITE_BLOCKED); (touch /vol2/x 2>/dev/null && echo VOL2_WRITE_OK || echo VOL2_WRITE_BLOCKED); (touch /shared2/x 2>/dev/null && echo BIND2_WRITE_OK || echo BIND2_WRITE_BLOCKED); (touch /rw/x 2>/dev/null && echo RW_WRITE_OK || echo RW_WRITE_BLOCKED); sleep 3600"
 volumes:
   data: {}
+  data2: {}
+  data3: {}
