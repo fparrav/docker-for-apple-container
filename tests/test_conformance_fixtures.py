@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 import urllib.request
@@ -63,6 +65,8 @@ from test_live_fixtures import (  # noqa: E402
     FIXTURE_P,
     FIXTURE_Q,
     FIXTURE_R,
+    FIXTURE_S,
+    FIXTURE_T,
     FIXTURES_DIR,
     HTTP_URL,
     UP_TIMEOUT_SECONDS,
@@ -607,10 +611,14 @@ class ConformanceFixtureTests(unittest.TestCase):
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        # Docker honours the isolation request: only the loopback interface.
-        interfaces = harness.compose("exec", "-T", "isolated", "ls", "/sys/class/net")
-        self.assertEqual(interfaces.returncode, 0, interfaces.stdout + interfaces.stderr)
-        self.assertEqual(interfaces.stdout.split(), ["lo"])
+        # Docker honours the isolation request: only the loopback interface
+        # has an address. The interface list itself is not a usable signal:
+        # Docker Desktop's kernel creates down tunnel devices (tunl0, gre0,
+        # sit0, ...) in every network namespace.
+        addresses = harness.compose("exec", "-T", "isolated", "ip", "-o", "addr")
+        self.assertEqual(addresses.returncode, 0, addresses.stdout + addresses.stderr)
+        names = {line.split()[1].split("@")[0] for line in addresses.stdout.splitlines() if line.strip()}
+        self.assertEqual(names, {"lo"})
 
     @tiers.conformance_tier()
     def test_fixture_r_selinux_refused_by_shim_but_accepted_on_engine(self) -> None:
@@ -622,6 +630,123 @@ class ConformanceFixtureTests(unittest.TestCase):
 
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @tiers.conformance_tier()
+    def test_fixture_s_anonymous_volumes_copy_up_and_reuse(self) -> None:
+        harness = FixtureHarness(self, FIXTURE_S, docker=_client(), prefix="conf")
+
+        # 1. Detached up: real Docker creates the two anonymous volumes; the
+        #    one over /etc/apk is filled from the image, the one over the
+        #    missing path starts empty.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. The same copy-up the live tier asserts: /etc/apk/repositories
+        #    (present in alpine:3.20) is non-empty inside the container.
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "the image content was not copied into the anonymous volume",
+        )
+
+        # 3. The volume over the missing path is empty and usable. Docker
+        #    volumes carry no lost+found, so the listing is truly empty.
+        listing = harness.compose("exec", "-T", "app", "ls", "/var/cache/shim-anon")
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        self.assertEqual(listing.stdout.strip(), "")
+
+        # 4. Write a marker into the copied-up volume.
+        marker = harness.compose(
+            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
+        )
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+
+        # 5. A second up with REV=2 recreates the container; Docker reuses
+        #    the anonymous volumes, so the marker and the image content
+        #    survive. No down+up survival assertion: Docker drops anonymous
+        #    volumes across a full down, while the shim keeps them by design.
+        with mock.patch.dict(os.environ, {"REV": "2"}):
+            result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        marker = harness.compose("exec", "-T", "app", "cat", "/etc/apk/marker")
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        self.assertEqual(marker.stdout, "kept")
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "the recreated container lost the image content already in the volume",
+        )
+
+    @tiers.conformance_tier()
+    def test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them(self) -> None:
+        client = _client()
+
+        # The host directory the local bind idiom points at: a fresh system
+        # temp directory, removed by its exact path in cleanup. It is passed
+        # to the fixture through a `.env` override, so the compose file stays
+        # identical to the live tier's. The value is the *resolved* path:
+        # Docker Desktop's file sharing resolves the /var -> /private symlink,
+        # and its read-only local-volume mount fails for the symlinked form
+        # ("no such file or directory") while the real /private/... path
+        # mounts fine. On a Linux runner resolve() is a no-op and the daemon
+        # runs natively, so the same code works there.
+        data_dir = Path(tempfile.mkdtemp(prefix="shimtest-tbind-"))
+        self.addCleanup(lambda: shutil.rmtree(data_dir, ignore_errors=True))
+
+        harness = FixtureHarness(
+            self,
+            FIXTURE_T,
+            overrides={".env": f"DATA_DIR={data_dir.resolve()}\n"},
+            docker=client,
+            prefix="conf",
+        )
+
+        # 1. Detached up: real Docker creates the two volumes (their local
+        #    driver backend is the bind of ${DATA_DIR}) and starts both
+        #    services.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. A write from the read-write service appears in the host
+        #    directory.
+        written = harness.compose(
+            "exec", "-T", "writer", "sh", "-c", "printf hello > /data/f"
+        )
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        marker = data_dir / "f"
+        self.assertTrue(
+            marker.is_file(),
+            f"the write did not reach the host directory: "
+            f"{sorted(entry.name for entry in data_dir.iterdir())}",
+        )
+        self.assertEqual(marker.read_text(), "hello")
+
+        # 3. The read-only service can read the same file but cannot write:
+        #    the failed write leaves no file behind on the host.
+        read = harness.compose("exec", "-T", "reader", "cat", "/data/f")
+        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+        self.assertEqual(read.stdout, "hello")
+        blocked = harness.compose(
+            "exec", "-T", "reader", "sh", "-c", "printf x > /data/g"
+        )
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        self.assertFalse(
+            (data_dir / "g").exists(),
+            "the read-only mount accepted a write",
+        )
+
+        # 4. `down -v` removes the project's volumes but leaves the host
+        #    directory and its file untouched.
+        result = harness.compose("down", "-v")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            marker.is_file(),
+            "down -v removed the host directory's file",
+        )
+        self.assertEqual(marker.read_text(), "hello")
 
     @tiers.conformance_tier()
     def test_fixture_q_build_secrets_reach_the_build_and_never_the_output(self) -> None:

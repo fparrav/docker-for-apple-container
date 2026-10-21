@@ -59,6 +59,8 @@ FIXTURE_O = "o-external-volume"
 FIXTURE_P = "p-selective-up"
 FIXTURE_N = "n-network-none"
 FIXTURE_R = "r-selinux-refused"
+FIXTURE_S = "s-anonymous-volume"
+FIXTURE_T = "t-local-bind-volume"
 FIXTURE_Q = "q-build-secrets"
 FIXTURE_L = "l-partial-failure"
 TIMEOUT_SECONDS = 120
@@ -819,6 +821,144 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertEqual(control.returncode, 0, f"write to /rw/y failed: {control.stdout + control.stderr}")
 
     @tiers.live_tier()
+    def test_fixture_s_anonymous_volumes_copy_up_reuse_and_down_v_removes(self) -> None:
+        self.require_images("alpine:3.20")
+        harness = FixtureHarness(self, FIXTURE_S)
+        project = harness.project
+
+        # 1. Detached up: the two anonymous volumes are created; the one over
+        #    /etc/apk is filled from the image, the one over the missing path
+        #    starts empty.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. The copy-up happened: /etc/apk/repositories (present in
+        #    alpine:3.20) is non-empty inside the container.
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "the image content was not copied into the anonymous volume",
+        )
+
+        # 3. The volume over the missing path is empty and usable: the Apple
+        #    runtime's lost+found is the only entry a fresh volume may carry.
+        listing = harness.compose("exec", "-T", "app", "ls", "/var/cache/shim-anon")
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        entries = set(listing.stdout.split())
+        self.assertTrue(
+            entries <= {"lost+found"},
+            f"the anonymous volume over the missing path is not empty: {sorted(entries)}",
+        )
+
+        # 4. Write a marker into the copied-up volume.
+        marker = harness.compose(
+            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
+        )
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+
+        # 5. A second up with REV=2 recreates the container; the volumes are
+        #    reused, not refilled: the marker and the image content are both
+        #    still there.
+        with mock.patch.dict(os.environ, {"REV": "2"}):
+            result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        marker = harness.compose("exec", "-T", "app", "cat", "/etc/apk/marker")
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        self.assertEqual(marker.stdout, "kept")
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "the recreated container lost the image content already in the volume",
+        )
+
+        # 6. `down -v` removes the project's anonymous volumes: no volume
+        #    whose name starts with the project and contains `_app_anon-`
+        #    remains.
+        result = harness.compose("down", "-v")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        volumes = _run([_container(), "volume", "list", "--format", "json"])
+        self.assertEqual(volumes.returncode, 0, volumes.stdout + volumes.stderr)
+        for entry in json.loads(volumes.stdout or "[]"):
+            name = tiers._object_name(entry)
+            self.assertFalse(
+                name is not None and name.startswith(project) and "_app_anon-" in name,
+                f"down -v left the anonymous volume {name!r} behind",
+            )
+
+    @tiers.live_tier()
+    def test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them(self) -> None:
+        self.require_images("alpine:3.20")
+
+        # The host directory the local bind idiom points at: a fresh temp
+        # directory, removed by its exact path in cleanup. It is passed to
+        # the fixture through a `.env` override (the same mechanism the
+        # h-dotenv and o-external-volume tests use), so the compose file
+        # stays identical on both tiers.
+        data_dir = Path(tempfile.mkdtemp(prefix="shimtest-tbind-"))
+        self.addCleanup(lambda: shutil.rmtree(data_dir, ignore_errors=True))
+
+        harness = FixtureHarness(
+            self, FIXTURE_T, overrides={".env": f"DATA_DIR={data_dir}\n"}
+        )
+        project = harness.project
+
+        # 1. Detached up succeeds: the two local bind volumes are translated
+        #    into bind mounts, so no runtime volume is created for them.
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # 2. A write from the read-write service appears in the host
+        #    directory: the mount is a bind of ${DATA_DIR}, not a volume.
+        written = harness.compose(
+            "exec", "-T", "writer", "sh", "-c", "printf hello > /data/f"
+        )
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        marker = data_dir / "f"
+        self.assertTrue(
+            marker.is_file(),
+            f"the write did not reach the host directory: "
+            f"{sorted(entry.name for entry in data_dir.iterdir())}",
+        )
+        self.assertEqual(marker.read_text(), "hello")
+
+        # 3. The read-only service can read the same file but cannot write:
+        #    the failed write leaves no file behind on the host.
+        read = harness.compose("exec", "-T", "reader", "cat", "/data/f")
+        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+        self.assertEqual(read.stdout, "hello")
+        blocked = harness.compose(
+            "exec", "-T", "reader", "sh", "-c", "printf x > /data/g"
+        )
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        self.assertFalse(
+            (data_dir / "g").exists(),
+            "the read-only mount accepted a write",
+        )
+
+        # 4. The runtime lists no volume whose name carries the project and
+        #    the `shared` key: the idiom is a bind, not a volume.
+        volumes = _run([_container(), "volume", "list", "--format", "json"])
+        self.assertEqual(volumes.returncode, 0, volumes.stdout + volumes.stderr)
+        for entry in json.loads(volumes.stdout or "[]"):
+            name = tiers._object_name(entry)
+            self.assertFalse(
+                name is not None and name.startswith(project) and "shared" in name,
+                f"a runtime volume exists for the local bind key: {name!r}",
+            )
+
+        # 5. `down -v` leaves the host directory and its file untouched.
+        result = harness.compose("down", "-v")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            marker.is_file(),
+            "down -v removed the host directory's file",
+        )
+        self.assertEqual(marker.read_text(), "hello")
+
+    @tiers.live_tier()
     def test_fixture_n_network_mode_none_is_refused_and_creates_nothing(self) -> None:
         self.require_images("alpine:3.20")
         harness = FixtureHarness(self, FIXTURE_N)
@@ -829,6 +969,39 @@ class LiveFixtureTests(unittest.TestCase):
         self.assertIn("REFUSED:", result.stderr, result.stderr)
         self.assertIn("isolated", result.stderr, result.stderr)
         self.assertIn("network_mode", result.stderr, result.stderr)
+
+        # Nothing of this project exists: no container, network or volume.
+        for kind in (["ls", "--all"], ["network", "ls"], ["volume", "ls"]):
+            listing = _run([_container(), *kind])
+            self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+            self.assertNotIn(project, listing.stdout + listing.stderr)
+
+    @tiers.live_tier()
+    def test_network_mode_host_is_refused_with_the_host_message_and_creates_nothing(self) -> None:
+        self.require_images("alpine:3.20")
+        # An inline file on top of the `n` fixture directory: only the value of
+        # network_mode differs from the `none` case.
+        harness = FixtureHarness(
+            self,
+            FIXTURE_N,
+            overrides={
+                "compose.yaml": (
+                    "services:\n"
+                    "  hostnet:\n"
+                    "    image: alpine:3.20\n"
+                    "    command: [\"sleep\", \"3600\"]\n"
+                    "    network_mode: host\n"
+                )
+            },
+        )
+        project = harness.project
+
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertIn("REFUSED:", result.stderr, result.stderr)
+        self.assertIn("hostnet", result.stderr, result.stderr)
+        self.assertIn("network_mode: host", result.stderr, result.stderr)
+        self.assertIn("host.docker.internal", result.stderr, result.stderr)
 
         # Nothing of this project exists: no container, network or volume.
         for kind in (["ls", "--all"], ["network", "ls"], ["volume", "ls"]):
