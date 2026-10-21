@@ -3,7 +3,8 @@
 ``validate`` is a pure function: it inspects the normalized model of the
 services about to be created and returns every refusal and every partial
 application, without touching the runtime or the filesystem. The tables below
-are the only place that decides what a Compose key means for this shim.
+decide what a Compose key means for this shim; mount modes and attributes are
+classified by the shared policy in :mod:`.mounts` (design D4).
 
 Classification:
 
@@ -22,6 +23,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from . import mounts
 from . import security
 
 
@@ -162,24 +164,9 @@ BUILD_KEYS: dict[str, Rule] = {
     },
 }
 
-# Short-syntax mode flags and long-syntax mount keys.
-MOUNT_OPTIONS: dict[str, Rule] = {
-    **{key: _ok() for key in ("ro", "rw", "z", "Z", "cached", "delegated")},
-    **{
-        key: _ok()
-        for key in ("type", "source", "target", "read_only", "consistency", "bind", "volume")
-    },
-    "tmpfs": _no("tmpfs mounts in `volumes` are not translated; use the service `tmpfs` key", False),
-    "image": _no("image mounts are not supported", False),
-    "nocopy": _no(_NO_EQUIVALENT, False),
-    "propagation": _no(_NO_EQUIVALENT, False),
-    "subpath": _no(_NO_EQUIVALENT, False),
-}
+# The `type` values a long-syntax entry may carry; every other value is
+# classified by the mounts policy.
 MOUNT_TYPES = frozenset({"bind", "volume"})
-MOUNT_SUBKEYS = {
-    "bind": {"create_host_path": _ok(), "selinux": _ok(), "propagation": MOUNT_OPTIONS["propagation"]},
-    "volume": {"nocopy": MOUNT_OPTIONS["nocopy"], "subpath": MOUNT_OPTIONS["subpath"]},
-}
 
 DEPLOY_KEYS: dict[str, Rule] = {
     "resources": _ok(),
@@ -439,22 +426,27 @@ def _service_networks(name: str, value: Any, report: Report) -> None:
                 _notice(report, name, key, text)
 
 
-def _mount_option(
-    name: str,
-    option: str,
-    report: Report,
-    allowed_rules: Mapping[str, Rule] = MOUNT_OPTIONS,
-    target: str = "",
-) -> None:
-    where = " on mount target '%s'" % target if target else ""
-    rule = allowed_rules.get(option)
-    if rule is None:
-        _refuse(report, name, "volumes.%s" % option, "unknown volume option '%s'%s" % (option, where))
-    elif rule.status == UNSUPPORTED:
-        _refuse(
-            report, name, "volumes.%s" % option,
-            "volume option '%s'%s: %s" % (option, where, rule.reason),
-        )
+def _mount_mode(name: str, option: str, report: Report, target: str) -> None:
+    """One short-syntax mode flag, classified by the shared mounts policy."""
+    try:
+        mounts.check_short_modes(option, target)
+    except mounts.MountSpecError as exc:
+        _refuse(report, name, "volumes.%s" % option, str(exc))
+
+
+def _mount_attribute(name: str, option: str, value: Any, report: Report, target: str) -> None:
+    """One long-syntax attribute (or `type` value), classified by the mounts policy."""
+    try:
+        mounts.attribute_rule(option, value, target)
+    except mounts.MountSpecError as exc:
+        _refuse(report, name, "volumes.%s" % option.rsplit(".", 1)[-1], str(exc))
+
+
+def _mount_type(name: str, value: Any, report: Report, target: str) -> None:
+    kind = "" if value is None else str(value)
+    if not kind or kind in MOUNT_TYPES:
+        return
+    _mount_attribute(name, kind, value, report, target)
 
 
 def _service_volumes(name: str, value: Any, report: Report) -> None:
@@ -464,20 +456,23 @@ def _service_volumes(name: str, value: Any, report: Report) -> None:
         if isinstance(entry, Mapping):
             target = str(entry.get("target") or "")
             for option, item in entry.items():
-                if option in MOUNT_SUBKEYS and isinstance(item, Mapping):
-                    for sub in item:
-                        _mount_option(name, sub, report, MOUNT_SUBKEYS[option], target)
-                else:
-                    _mount_option(name, option, report, target=target)
-            kind = entry.get("type")
-            if kind and kind not in MOUNT_TYPES:
-                _mount_option(name, kind, report, target=target)
+                if option in mounts.LONG_SECTIONS:
+                    if isinstance(item, Mapping):
+                        for sub, subvalue in item.items():
+                            _mount_attribute(name, "%s.%s" % (option, sub), subvalue, report, target)
+                    continue
+                if option == "type":
+                    _mount_type(name, item, report, target)
+                    continue
+                if option in mounts.STRUCTURAL_KEYS:
+                    continue
+                _mount_attribute(name, option, item, report, target)
         elif isinstance(entry, str):
             parts = entry.split(":")
             if len(parts) > 2:
                 for option in parts[2].split(","):
                     if option:
-                        _mount_option(name, option, report, target=parts[1])
+                        _mount_mode(name, option, report, target=parts[1])
 
 
 def _collect_resources(
