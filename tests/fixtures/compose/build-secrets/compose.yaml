@@ -1,0 +1,17 @@
+services:
+  app:
+    build:
+      context: .
+      secrets:
+        - filesecret
+        - source: envsecret
+          target: renamed
+    secrets:
+      - unused
+secrets:
+  filesecret:
+    file: ./secret.txt
+  envsecret:
+    environment: BUILD_SECRET_VAR
+  unused:
+    environment: UNUSED_VAR
