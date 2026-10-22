@@ -18,7 +18,8 @@ name: Release
 #
 # One set of files (design D8): `package` builds the sdist and wheel once,
 # `smoke` installs that wheel in a clean virtual environment on the Python floor
-# and on the newest release (`scripts/verify_wheel.py`), and `release` publishes
+# (pinned to ubuntu-24.04, the last image that ships it) and on the newest release
+# (`scripts/verify_wheel.py`), and `release` publishes
 # the same files without building again. The build checks out with full history
 # (`fetch-depth: 0`) so hatch-vcs derives the version from the tag. The tag must
 # be a valid PEP 440 version: `v0.0.1` builds, but a label such as
@@ -89,15 +90,22 @@ jobs:
 
   smoke:
     name: Wheel smoke test (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: package
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # The floor from pyproject.toml (requires-python) and the newest release.
-        python: ["3.9", "3.x"]
+        include:
+          # The floor from pyproject.toml (requires-python). Pinned to
+          # ubuntu-24.04 because it is the last hosted image whose
+          # actions/python-versions manifest still ships CPython 3.9.
+          - python: "3.9"
+            os: ubuntu-24.04
+          # The newest release, on the image that moves with GitHub.
+          - python: "3.x"
+            os: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
