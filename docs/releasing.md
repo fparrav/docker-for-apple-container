@@ -43,7 +43,7 @@ tag cannot be mistaken for a release.
 
 ## What the release workflow does
 
-`.github/workflows/release.yml` has two jobs, both on hosted `ubuntu-latest`
+`.github/workflows/release.yml` has four jobs, all on hosted `ubuntu-latest`
 runners:
 
 1. `checks` (hosted checks, `contents: read`): the test report for the `unit`
@@ -52,17 +52,31 @@ runners:
    block check, a byte-compile of the sources, and the release evidence
    verifier (`scripts/verify_release_evidence.py --tag "$TAG"`, with the tag
    passed through the environment).
-2. `release` (`needs: checks`, `contents: write` — the only job with write
-   permission): checks out with full history so `hatch-vcs` can derive the
-   version from the tag, builds the sdist and wheel (`python -m build`),
+2. `package` (`needs: checks`, `contents: read`): checks out with full history
+   so `hatch-vcs` can derive the version from the tag, builds the sdist and
+   wheel once (`python -m build`) and uploads `dist/` as an artifact.
+3. `smoke` (`needs: package`, `contents: read`, a matrix on the Python floor
+   from `pyproject.toml` and `3.x`): downloads that artifact and runs
+   `scripts/verify_wheel.py --dist dist --expect-version "${TAG#v}"`, which
+   installs the wheel in a clean virtual environment and checks the `docker`
+   entry point, the import location, `docker version` and the message without a
+   `container` CLI (the tag reaches the script only through the environment).
+4. `release` (`needs: [checks, smoke]`, `contents: write` — the only job with
+   write permission): downloads the same artifact without building again,
    generates the release notes, appends the live evidence section, and
    creates the GitHub Release with `softprops/action-gh-release`, attaching
    everything in `dist/`, using the notes as the body and marking pre-release
-   tags as pre-releases.
+   tags as pre-releases. The files that were installed and tested are the files
+   that are published.
 
-The release job runs only after the checks pass. It uses GitHub's
+Pull requests and pushes to `main` run the same wheel check in the `wheel` job
+of `ci.yml`, without the version expectation. The package supports the Python
+floor `requires-python = ">=3.9"`; the unit suite and `verify_wheel.py` were run
+under Python 3.9.6 when this check was added and passed.
+
+The release job runs only after the checks and the smoke test pass. It uses GitHub's
 job-scoped `GITHUB_TOKEN` with `contents: write` to create the release; it
-requires no external credentials or repository secrets. Both jobs run only on
+requires no external credentials or repository secrets. Every job runs only on
 hosted runners, and every third-party action is pinned to a full commit SHA.
 There is no package index publishing step and no trusted-publishing permission
 (see [Index publishing is not enabled](#index-publishing-is-not-enabled)).
@@ -101,8 +115,8 @@ Hosted runners cannot run the `live` tier, so a final release is gated on a
 file that a maintainer produces on a macOS 26 machine and commits. The
 sequence for a final release `vX.Y.Z`:
 
-1. Start from a clean tree: `git status --porcelain -- src scripts tests` must
-   print nothing, because the evidence is bound to `HEAD`.
+1. Start from a clean tree: `git status --porcelain -- src scripts tests
+   pyproject.toml` must print nothing, because the evidence is bound to `HEAD`.
 2. With the supported Apple `container` release installed and its apiserver
    running (`container system start`), run
    `python3 scripts/validate-runtime.py --evidence`. It writes
@@ -118,10 +132,12 @@ sequence for a final release `vX.Y.Z`:
    - records result `passed` with counts that add up and every declared live
      test passed (no failed, skipped or not-run test);
    - names the Apple `container` version in `SUPPORTED_CONTAINER_VERSION`;
-   - has the same tree hash as the tagged commit — the sha256 of the git tree
-     identifiers of `src/`, `scripts/` and `tests/`, so a change to any of the
-     three after the run invalidates it, while README, `docs/`, workflow and
-     evidence commits do not;
+   - has the same tree hash as the tagged commit — the sha256 of the git
+     identifiers of `src/`, `scripts/`, `tests/` and `pyproject.toml` (schema 2
+     of the file), so a change to any of the four after the run invalidates it,
+     while README, `docs/`, workflow and evidence commits do not. A file with an
+     earlier schema is refused with a message naming both numbers; run
+     `validate-runtime.py --evidence` again;
    - is at most 30 days old (`--max-age-days` changes the limit) and not dated
      in the future.
 

@@ -352,8 +352,9 @@ when available, then fall back to stable service-name order from labels.
   together with the services that depend on it, printing what is recreated and
   why. `--force-recreate` recreates everything, `--no-recreate` never recreates
   an existing container (it still creates missing ones); the two are mutually
-  exclusive. `-V` (`--renew-anon-volumes`) also discards the anonymous volumes
-  of the services being recreated (see *Anonymous volumes* below). Containers of
+  exclusive. `-V` (`--renew-anon-volumes`) mounts new anonymous volumes into the
+  services being recreated instead of the ones their containers used (see
+  *Anonymous volumes* below). Containers of
   services no longer in the file are reported as
   orphans and removed only with `--remove-orphans`. All images are resolved
   before any container is touched, and a failing service is named in the error
@@ -379,8 +380,9 @@ when available, then fall back to stable service-name order from labels.
   restart on failure, and `up` warns about a declared healthcheck that nothing
   evaluates.
 - **Volumes survive recreation.** Recreating a service never removes a volume.
-  `down` removes no volume; `down -v` removes only the managed volumes the Compose
-  file declares and that carry the project label, never external or
+  `down` removes no volume; `down -v` removes the managed volumes the Compose
+  file declares and that carry the project label, plus every anonymous volume
+  that carries the project and anonymous labels, never external or
   other-project volumes.
 - **The Compose model comes from the official `docker-compose` when it is
   installed**, and from a small built-in parser otherwise. See
@@ -445,26 +447,31 @@ intentionally out of scope.
 
 **Anonymous volumes.** A volume entry without a source (`- /app/node_modules`,
 or `{type: volume, target: ...}`) becomes a project-labelled Apple volume named
-`<project>_<service>_anon-<10 hex>`, where the hex is derived from the target
-path. Apple `container` volumes start empty, so on first creation the shim runs
-a short helper container from the service image that copies the image's content
-at the target into the new volume, as Docker does. This needs `/bin/sh` and
-`cp` in the image; if the copy fails, the volume is removed and `up` exits 1
-naming the service, image and target, instead of starting the service with an
-empty directory. An existing volume is never filled again, so data survives
-recreating an existing container of the service, as in Docker. A new container
-never inherits one: `docker compose down` followed by `up` gives the service a
-fresh anonymous volume seeded from the image again (a plain `down` leaves the
-volume behind, and the next `up` that creates the container discards it; only a
-volume labelled for that project and service is removed, and an unlabelled one
-with the same name stops `up`). **Breaking change:** data that used to survive
-`down` + `up` in an anonymous volume no longer does; use a named volume for data
-that must persist. `up -V` (`--renew-anon-volumes`) discards and seeds again the
-anonymous volumes of the services it recreates; it does nothing to a container
-that is kept or only started, and never touches named volumes. `down -v` removes
-the project's anonymous volumes. Apple volumes carry a `lost+found` directory at
-their root, also in a volume that was filled from the image. Named volumes get no
-copy-up (existing behavior).
+`<project>_<service>_anon-<10 hex>`; the hex is random, so every creation gets
+a new volume and none is ever overwritten. Apple `container` volumes start
+empty, so the shim runs a short helper container from the service image that
+copies the image's content at the target into the new volume, as Docker does.
+This needs `/bin/sh` and `cp` in the image; if the copy fails, only the volume
+just created is removed and `up` exits 1 naming the service, image and target,
+instead of starting the service with an empty directory.
+
+The shim never deletes an anonymous volume on its own. Recreating an existing
+container (a changed definition or image, or `--force-recreate`) mounts the
+volume that container used at each target, found from the container's own
+mounts, so the data survives as in Docker. A container created because none
+exists for the service (after `docker compose down`, or after `docker rm`)
+gets a new volume seeded from the image; the previous volume stays as an
+orphan, as in Docker. `up -V` (`--renew-anon-volumes`) does the same for the
+services it recreates: it mounts new volumes and leaves the old ones; it does
+nothing to a container that is kept or only started, and never touches named
+volumes. `down -v` removes every volume that carries the project and anonymous
+labels, including the orphans no container mounts any more, and exits 1 naming
+any volume the runtime refuses to remove. Orphans can be listed with
+`docker volume ls --filter label=com.docker.compose.project=<project>` and
+removed one by one with `docker volume rm`. Data that must persist across
+`down` + `up` belongs in a named volume. Apple volumes carry a `lost+found`
+directory at their root, also in a volume that was filled from the image.
+Named volumes get no copy-up (existing behavior).
 
 **Local-driver bind volumes.** A top-level volume with `driver: local` (or none)
 and `driver_opts` `type: none`, `o: bind` (optionally with `ro` or `rw`) and an
@@ -864,7 +871,7 @@ API). Known differences are called out in the `note` column.
 | compose uts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
 | compose volumes.Z | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
-| compose volumes.anonymous | SUPPORTED | - | live | A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled from the image's content at the target (copy-up) by a helper container when a container of the service is created, reused only when an existing container is recreated, discarded and seeded again by up after down (only if it carries the project, service and anonymous labels), and removed by down -v; if the copy fails the volume is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down). |
+| compose volumes.anonymous | SUPPORTED | - | live | A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<10 hex> with a unique name, filled from the image's content at the target (copy-up) by a helper container. Recreating an existing container (a changed configuration, --force-recreate) mounts the volume that container used; a container created because none existed gets a new volume and the old one is left in place, as Docker does. Nothing is deleted implicitly: down -v removes every project-labelled anonymous volume, orphans included; if the copy fails only the volume just created is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_follow_the_container_and_are_never_deleted_implicitly). |
 | compose volumes.bind | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.cached | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.consistency | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
@@ -924,7 +931,7 @@ API). Known differences are called out in the `note` column.
 | build --ulimit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag. |
 | build -c | UNSUPPORTED | - | fake | Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build -c; see tests/option_semantics.py. |
 | compose up --no-deps | SUPPORTED | - | fake | Creates only the named services and prints a notice listing the skipped dependencies. |
-| compose up --renew-anon-volumes | SUPPORTED | - | live | -V / --renew-anon-volumes discards and seeds again the anonymous volumes of the services that up recreates; a kept or only started container and named volumes are untouched, and --dry-run changes nothing. |
+| compose up --renew-anon-volumes | SUPPORTED | - | live | -V / --renew-anon-volumes mounts new anonymous volumes, seeded from the image, into the services that up recreates and leaves the previous volumes in place; a kept or only started container and named volumes are untouched, and --dry-run changes nothing. |
 | run --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
 | run --arch | SUPPORTED | --arch | fake | Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --arch. D1 option semantics: run --arch; see tests/option_semantics.py. |
 | run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-add; see tests/option_semantics.py. |

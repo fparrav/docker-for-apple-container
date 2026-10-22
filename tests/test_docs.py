@@ -311,11 +311,22 @@ class VolumeLifecycleDocsTests(unittest.TestCase):
     def readme(self) -> str:
         return (ROOT / "README.md").read_text(encoding="utf-8")
 
-    def test_readme_describes_fresh_anonymous_volumes_after_down(self) -> None:
+    def test_readme_describes_orphans_renewal_and_down_v(self) -> None:
         text = " ".join(self.readme().split())
-        self.assertIn("`docker compose down` followed by `up` gives the service a fresh anonymous volume", text)
+        self.assertIn("The shim never deletes an anonymous volume on its own", text)
         self.assertIn("`up -V` (`--renew-anon-volumes`)", text)
-        self.assertIn("**Breaking change:** data that used to survive", text)
+        self.assertIn("orphan", text)
+        self.assertIn("`down -v` removes every volume that carries the project and anonymous labels", text)
+        self.assertIn("docker volume ls --filter label=com.docker.compose.project=<project>", text)
+
+    def test_readme_no_longer_says_up_discards_or_reseeds_leftover_volumes(self) -> None:
+        text = " ".join(self.readme().split())
+        self.assertNotIn("**Breaking change:** data that used to survive", text)
+        self.assertNotIn("the next `up` that creates the container discards it", text)
+        self.assertNotIn("discards and seeds again", text)
+        matrix = (ROOT / "tests" / "compat" / "matrix.json").read_text(encoding="utf-8")
+        self.assertNotIn("discards and seeds again", matrix)
+        self.assertNotIn("discarded and seeded again", matrix)
 
     def test_no_document_says_the_shim_keeps_anonymous_volumes_across_down(self) -> None:
         for name in ("README.md", "docs/testing.md", "docs/releasing.md"):
@@ -368,6 +379,26 @@ class ReleaseEvidenceDocsTests(unittest.TestCase):
         self.assertIn("--evidence", text)
         self.assertIn("--require", text)
         self.assertIn("releasing.md#release-evidence", text)
+
+    def test_releasing_documents_the_wheel_check_and_the_evidence_inputs(self) -> None:
+        text = self.releasing()
+        text = " ".join(text.split())
+        for needle in (
+            "verify_wheel.py",
+            "`package`",
+            "`smoke`",
+            "files that were installed and tested are the files",
+            "`pyproject.toml`",
+            "schema 2",
+        ):
+            self.assertIn(needle, text, needle)
+        self.assertNotIn("`src/`, `scripts/` and `tests/`", text)
+
+    def test_testing_documents_waiting_and_the_wheel_check(self) -> None:
+        text = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
+        for needle in ("wait_until", "tests/waiting.py", "pg_isready -h 127.0.0.1", "verify_wheel.py"):
+            self.assertIn(needle, text, needle)
+        self.assertIn("`pyproject.toml`", text)
 
 
 class ReleaseLiteralScannerTests(unittest.TestCase):

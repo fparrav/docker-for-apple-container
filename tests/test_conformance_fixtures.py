@@ -38,7 +38,6 @@ import os
 import shutil
 import sys
 import tempfile
-import time
 import unittest
 import urllib.request
 from datetime import datetime, timezone
@@ -49,6 +48,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
 import tiers  # noqa: E402
+import waiting  # noqa: E402
 
 from test_live_fixtures import (  # noqa: E402
     FIXTURE_A,
@@ -126,31 +126,41 @@ class ConformanceFixtureTests(unittest.TestCase):
     # -- helpers ---------------------------------------------------------
 
     def _wait_for_http_200(self, url: str, wait_seconds: float = HTTP_WAIT_SECONDS) -> None:
-        """Poll ``url`` with urllib until it answers HTTP 200, or fail after the deadline."""
-        deadline = time.monotonic() + wait_seconds
-        last_error = "not attempted"
-        while time.monotonic() < deadline:
+        """Wait until ``url`` answers HTTP 200 (polled with urllib)."""
+        last = ["not attempted"]
+
+        def answers() -> bool:
             try:
                 with urllib.request.urlopen(url, timeout=5) as response:
                     if response.code == 200:
-                        return
-                    last_error = f"HTTP {response.code} from {url}"
+                        return True
+                    last[0] = f"HTTP {response.code} from {url}"
             except OSError as exc:
-                last_error = f"{url} unreachable: {exc}"
-            time.sleep(1)
-        self.fail(f"{url} did not answer HTTP 200 within {wait_seconds:.0f}s: {last_error}")
+                last[0] = f"{url} unreachable: {exc}"
+            return False
+
+        waiting.wait_until(
+            answers, wait_seconds, lambda: f"{url} did not answer HTTP 200: {last[0]}"
+        )
 
     def _wait_for_postgres_ready(self, harness: FixtureHarness, wait_seconds: float = POSTGRES_WAIT_SECONDS) -> None:
-        """Poll ``db`` with ``pg_isready`` until it accepts connections, or fail after the deadline."""
-        result = harness.compose("exec", "-T", "db", "pg_isready", "-U", "postgres")
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline and result.returncode != 0:
-            time.sleep(2)
-            result = harness.compose("exec", "-T", "db", "pg_isready", "-U", "postgres")
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"db was not ready within {wait_seconds:.0f}s: {result.stdout + result.stderr}",
+        """Wait until ``db`` accepts connections on TCP.
+
+        The postgres image initialises the data directory with a temporary
+        server that listens only on the unix socket; only the real server
+        listens on TCP, so readiness is asked of ``127.0.0.1``.
+        """
+        last = [""]
+
+        def ready() -> bool:
+            result = harness.compose(
+                "exec", "-T", "db", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"
+            )
+            last[0] = result.stdout + result.stderr
+            return result.returncode == 0
+
+        waiting.wait_until(
+            ready, wait_seconds, lambda: f"db was not ready: {last[0]}", interval=2
         )
 
     def _wait_for_log(
@@ -160,54 +170,56 @@ class ConformanceFixtureTests(unittest.TestCase):
         needle: str,
         wait_seconds: float = 20.0,
     ) -> None:
-        """Poll the container's logs until ``needle`` appears, or fail after the deadline.
+        """Wait until the container's logs show ``needle``.
 
         The live tier reads the same logs through ``compose logs <service>``;
         the conformance tier reads them raw through ``docker logs
         <container>``. Compose prefixes each line with the container name,
         which would let the short needle "hi" match the "shimtest" prefix;
         the raw stream is the line the container actually printed. A one-shot
-        read right after ``up`` can miss it, hence the poll.
+        read right after ``up`` can miss it, hence the wait.
         """
         container = f"{harness.project}-{service}-1"
-        deadline = time.monotonic() + wait_seconds
-        last = ""
-        while time.monotonic() < deadline:
+        last = [""]
+
+        def shown() -> bool:
             result = _run([_client(), "logs", container])
             if result.returncode == 0 and needle in result.stdout:
-                return
-            last = result.stdout + result.stderr
-            time.sleep(1)
-        self.fail(
-            f"{container} logs never showed {needle!r} within "
-            f"{wait_seconds:.0f}s:\n{last}"
+                return True
+            last[0] = result.stdout + result.stderr
+            return False
+
+        waiting.wait_until(
+            shown,
+            wait_seconds,
+            lambda: f"{container} logs never showed {needle!r}:\n{last[0]}",
         )
 
     def _wait_for_exited(
         self, container_name: str, wait_seconds: float = STATE_WAIT_SECONDS
     ) -> str:
-        """Poll ``docker inspect`` until the container is exited; return its exit code.
+        """Wait until ``docker inspect`` shows the container exited; return its exit code.
 
         A one-shot inspect right after ``up -d`` can still show the container
         running, so the numeric exit code is read only once the state has
         settled to ``exited``.
         """
         client = _client()
-        deadline = time.monotonic() + wait_seconds
-        last = ""
-        while time.monotonic() < deadline:
+        last = [""]
+
+        def exited() -> bool:
             state = _run(
                 [client, "inspect", "--format", "{{.State.Status}}", container_name]
             )
-            if state.returncode == 0 and state.stdout.strip() == "exited":
-                code = _run(
-                    [client, "inspect", "--format", "{{.State.ExitCode}}", container_name]
-                )
-                self.assertEqual(code.returncode, 0, code.stdout + code.stderr)
-                return code.stdout.strip()
-            last = state.stdout + state.stderr
-            time.sleep(1)
-        self.fail(f"{container_name} never reached exited within {wait_seconds:.0f}s: {last}")
+            last[0] = state.stdout + state.stderr
+            return state.returncode == 0 and state.stdout.strip() == "exited"
+
+        waiting.wait_until(
+            exited, wait_seconds, lambda: f"{container_name} never reached exited: {last[0]}"
+        )
+        code = _run([client, "inspect", "--format", "{{.State.ExitCode}}", container_name])
+        self.assertEqual(code.returncode, 0, code.stdout + code.stderr)
+        return code.stdout.strip()
 
     # -- tests -----------------------------------------------------------
 
@@ -640,80 +652,99 @@ class ConformanceFixtureTests(unittest.TestCase):
         else:
             self.assertNotEqual(found.returncode, 0, why + ": " + found.stdout)
 
+    def assert_copy_up(self, harness: "FixtureHarness", why: str) -> None:
+        """The image content of /etc/apk is present in the anonymous volume."""
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(repositories.stdout.strip(), why)
+
+    def write_marker(self, harness: "FixtureHarness") -> None:
+        marker = harness.compose(
+            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
+        )
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        self.assert_marker(harness, present=True, why="the marker was not written")
+
     @tiers.conformance_tier()
-    def test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down(self) -> None:
-        harness = FixtureHarness(self, FIXTURE_S, docker=_client(), prefix="conf")
+    def test_fixture_s_anonymous_volumes_follow_the_container_and_are_never_deleted_implicitly(self) -> None:
+        client = _client()
+        seen: set = set()
+
+        def remove_seen_volumes() -> None:
+            # Docker leaves the volumes that `down` and `-V` orphan, so this
+            # test removes the ones it saw by exact name. Registered before
+            # the harness, it runs after the harness has removed the containers.
+            for name in sorted(seen):
+                _run([client, "volume", "rm", name])
+
+        self.addCleanup(remove_seen_volumes)
+        harness = FixtureHarness(self, FIXTURE_S, docker=client, prefix="conf")
+
+        def mounted() -> dict:
+            volumes = harness.mounted_volumes()
+            seen.update(volumes.values())
+            return volumes
 
         # 1. Detached up: real Docker creates the two anonymous volumes; the
         #    one over /etc/apk is filled from the image, the one over the
         #    missing path starts empty.
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_copy_up(harness, "the image content was not copied into the anonymous volume")
 
-        # 2. The same copy-up the live tier asserts: /etc/apk/repositories
-        #    (present in alpine:3.20) is non-empty inside the container.
-        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
-        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
-        self.assertTrue(
-            repositories.stdout.strip(),
-            "the image content was not copied into the anonymous volume",
-        )
-
-        # 3. The volume over the missing path is empty and usable. Docker
+        # 2. The volume over the missing path is empty and usable. Docker
         #    volumes carry no lost+found, so the listing is truly empty.
         listing = harness.compose("exec", "-T", "app", "ls", "/var/cache/shim-anon")
         self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
         self.assertEqual(listing.stdout.strip(), "")
 
-        # 4. Write a marker into the copied-up volume.
-        marker = harness.compose(
-            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
-        )
-        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
-
-        # 5. A second up with REV=2 recreates the container; Docker reuses
-        #    the anonymous volumes, so the marker and the image content
-        #    survive.
+        # 3. Write a marker, then recreate: Docker mounts the volumes of the
+        #    container it replaces for `--force-recreate` and for a changed
+        #    configuration (REV=2), so the marker and the content survive.
+        self.write_marker(harness)
+        first = mounted()["/etc/apk"]
+        result = harness.compose("up", "-d", "--force-recreate", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=True, why="--force-recreate lost the anonymous volume")
+        self.assertEqual(mounted()["/etc/apk"], first)
         with mock.patch.dict(os.environ, {"REV": "2"}):
             result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=True, why="a configuration change lost the volume")
+        self.assertEqual(mounted()["/etc/apk"], first)
+        self.assert_copy_up(harness, "the recreated container lost the image content")
 
-        marker = harness.compose("exec", "-T", "app", "cat", "/etc/apk/marker")
-        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
-        self.assertEqual(marker.stdout, "kept")
-        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
-        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
-        self.assertTrue(
-            repositories.stdout.strip(),
-            "the recreated container lost the image content already in the volume",
-        )
-
-        # 6. `up -V` on a recreate (REV=3) discards the anonymous volumes and
-        #    seeds them again from the image: the marker is gone, the image
-        #    content is back. The same sequence the live tier asserts.
-        with mock.patch.dict(os.environ, {"REV": "3"}):
-            result = harness.compose("up", "-d", "-V", timeout=UP_TIMEOUT_SECONDS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_marker(harness, present=False, why="up -V kept the old anonymous volume")
-        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
-        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
-        self.assertTrue(
-            repositories.stdout.strip(),
-            "up -V did not seed the new anonymous volume from the image",
-        )
-
-        # 7. A full `down` followed by `up` gives the service a fresh volume:
-        #    write the marker again, go through the cycle and it is gone.
-        marker = harness.compose(
-            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
-        )
-        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
-        self.assert_marker(harness, present=True, why="the marker was not written")
+        # 4. `down` then `up` is a new container: a new volume seeded from the
+        #    image, and the previous volume still exists.
         result = harness.compose("down")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(harness.volume_exists(first), "down removed the anonymous volume")
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        second = mounted()["/etc/apk"]
+        self.assertNotEqual(second, first)
         self.assert_marker(harness, present=False, why="down + up kept the old anonymous volume")
+        self.assert_copy_up(harness, "the new volume was not seeded from the image")
+        self.assertTrue(harness.volume_exists(first), "up removed the previous anonymous volume")
+
+        # 5. `up -V --force-recreate` mounts yet another volume and removes
+        #    nothing.
+        self.write_marker(harness)
+        result = harness.compose("up", "-d", "-V", "--force-recreate", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        third = mounted()["/etc/apk"]
+        self.assertNotIn(third, (first, second))
+        self.assert_marker(harness, present=False, why="up -V kept the old anonymous volume")
+        self.assert_copy_up(harness, "up -V did not seed the new anonymous volume from the image")
+        self.assertTrue(harness.volume_exists(first) and harness.volume_exists(second))
+
+        # 6. `down -v` removes the volume of the current container. The
+        #    earlier ones stay in Docker, which the shim deliberately does not
+        #    mirror (its live test asserts they are removed), so they are not
+        #    asserted here; cleanup removes them by name.
+        result = harness.compose("down", "-v")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(harness.volume_exists(third), "down -v left the current volume behind")
 
     @tiers.conformance_tier()
     def test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them(self) -> None:

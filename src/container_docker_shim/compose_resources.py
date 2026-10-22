@@ -4,13 +4,13 @@ Resolves every network and volume a compose project declares to exactly one
 runtime name and flags ownership, mirroring Docker Compose: an explicit
 ``name:`` wins, ``external`` resources keep their own name (or bare key), and
 managed resources take ``<project>_<key>``. A service volume entry with no
-source (an anonymous volume) takes ``<project>_<service>_anon-<hash>`` so a
-recreation reuses the same volume. Nothing in this module calls the Apple
-``container`` runtime, so the rules are unit-testable without it.
+source (an anonymous volume) is not resolved here: each one is created with a
+unique name when its container is created. Nothing in this module calls the
+Apple ``container`` runtime, so the rules are unit-testable without it.
 """
 from __future__ import annotations
 
-import hashlib
+import secrets
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional
 
@@ -43,18 +43,15 @@ class Resource:
 
 @dataclass(frozen=True)
 class Resources:
-    """All resolved networks, volumes and anonymous volumes of one project.
+    """All resolved networks and volumes of one project.
 
     The mappings are keyed by the compose file's key; the value's ``name``
     is the single runtime name every use of the resource must carry.
-    ``anonymous`` holds one entry per service volume target with no source,
-    in service order then entry order.
     """
 
     project: str
     networks: dict[str, Resource]
     volumes: dict[str, Resource]
-    anonymous: tuple[Resource, ...] = ()
 
 
 def resolve(project: object) -> Resources:
@@ -65,31 +62,45 @@ def resolve(project: object) -> Resources:
     be None or a mapping. The runtime name of a resource comes, in order,
     from the model's ``name`` (the official normalizer fills it), else the
     key when the resource is external, else ``<project>_<key>``. An
-    undeclared ``default`` network is added as managed. A ``services``
-    mapping (name to spec, or to an object with a ``spec`` attribute)
-    contributes the anonymous volumes.
+    undeclared ``default`` network is added as managed.
     """
     project_name = str(project.name)
     networks = _resolve_family(getattr(project, "networks", None), project_name)
     volumes = _resolve_family(getattr(project, "volumes", None), project_name)
     if "default" not in networks:
         networks["default"] = _resource("default", None, project_name)
-    anonymous = _resolve_anonymous(getattr(project, "services", None), project_name)
-    return Resources(project_name, networks, volumes, anonymous)
+    return Resources(project_name, networks, volumes)
 
 
-def anonymous_volume(project: str, service: str, target: str) -> Resource:
-    """The deterministic identity of one service's anonymous volume at ``target``.
+def anonymous_labels(project: str, service: str, target: str) -> dict[str, str]:
+    """The three compose labels of one service's anonymous volume at ``target``."""
+    return {
+        LABEL_PROJECT: project,
+        LABEL_SERVICE: service,
+        LABEL_ANONYMOUS: target,
+    }
 
-    The name hashes the target so the same declaration resolves to the same
-    volume on every run, and the labels let ``down -v`` find it by project.
+
+def new_anonymous_volume(
+    project: str,
+    service: str,
+    target: str,
+    *,
+    token: Optional[str] = None,
+) -> Resource:
+    """A fresh anonymous volume for one service's target with a unique name.
+
+    The name is ``<project>_<service>_anon-<token>`` and never depends on the
+    target: with no ``token`` a random 10-hex token is drawn, so two draws
+    differ. The target is carried only in the ``.anonymous`` label.
     """
-    digest = hashlib.sha256(target.encode()).hexdigest()[:10]
+    if token is None:
+        token = secrets.token_hex(5)
     return Resource(
         key=target,
-        name=f"{project}_{service}_anon-{digest}",
+        name=f"{project}_{service}_anon-{token}",
         external=False,
-        labels={LABEL_PROJECT: project, LABEL_SERVICE: service, LABEL_ANONYMOUS: target},
+        labels=anonymous_labels(project, service, target),
     )
 
 
@@ -161,67 +172,3 @@ def _labels(value: object) -> dict[str, str]:
             out[key] = val if sep else ""
         return out
     return {}
-
-
-def _resolve_anonymous(services: object, project_name: str) -> tuple[Resource, ...]:
-    """The project's anonymous volumes, in service order then entry order.
-
-    ``services`` is a mapping of service name to spec (or to an object whose
-    ``spec`` attribute is the mapping), or None; identical (service, target)
-    pairs collapse to one resource.
-    """
-    if not isinstance(services, Mapping):
-        return ()
-    out: list[Resource] = []
-    seen: set[tuple[str, str]] = set()
-    for service_name, entry in services.items():
-        name = str(service_name)
-        for target in _anonymous_targets(entry):
-            pair = (name, target)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            out.append(anonymous_volume(project_name, name, target))
-    return tuple(out)
-
-
-def _service_spec(entry: object) -> Mapping:
-    """The spec mapping of a service entry: the mapping itself, or its ``spec``."""
-    if isinstance(entry, Mapping):
-        return entry
-    spec = getattr(entry, "spec", None)
-    return spec if isinstance(spec, Mapping) else {}
-
-
-def _anonymous_targets(entry: object) -> list[str]:
-    """The anonymous volume targets of one service, in entry order."""
-    volumes = _service_spec(entry).get("volumes")
-    if not isinstance(volumes, (list, tuple)):
-        return []
-    targets: list[str] = []
-    for item in volumes:
-        target = _anonymous_target(item)
-        if target is not None:
-            targets.append(target)
-    return targets
-
-
-def _anonymous_target(entry: object) -> Optional[str]:
-    """The target of one anonymous volume entry, or None when it is not one.
-
-    Short syntax: an absolute path with no ``:`` (``/app/node_modules``).
-    Long syntax: a mapping whose ``type`` is ``volume`` (or absent) with a
-    target and no source; bind, tmpfs, image and named volumes are not.
-    """
-    if isinstance(entry, str):
-        if entry.startswith("/") and ":" not in entry:
-            return entry
-        return None
-    if not isinstance(entry, Mapping):
-        return None
-    volume_type = entry.get("type")
-    if volume_type is not None and volume_type != "volume":
-        return None
-    if _nonempty_str(entry.get("source")) or _nonempty_str(entry.get("src")):
-        return None
-    return _nonempty_str(entry.get("target"))

@@ -945,12 +945,39 @@ def _translate_environment(spec_env: Any) -> list[str]:
 
 
 @dataclasses.dataclass(frozen=True)
+class _AnonymousVolume:
+    """An anonymous volume a service asks for at ``target``.
+
+    Planning stays pure: the name of the volume is chosen when the container is
+    created (design D1, D2), so only the owner and the target are known here.
+    """
+
+    service: str
+    target: str
+
+
+@dataclasses.dataclass
+class _AnonymousPlan:
+    """How one container creation obtains its anonymous volumes (design D2, D3).
+
+    ``previous`` maps a target to the volume the container being replaced
+    mounted there; it is empty for a new container and for ``up -V``, so every
+    target gets a new volume. ``resolved`` remembers the volume chosen for each
+    target so that relaunching the same container (the unwrapped retry) mounts
+    the same ones instead of creating more.
+    """
+
+    previous: dict[str, str] = dataclasses.field(default_factory=dict)
+    resolved: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(frozen=True)
 class _PlannedMount:
     """One validated mount: the typed mount and, for a named volume, its Compose key."""
 
     mount: Mount
     volume_key: Optional[str] = None
-    anonymous: Optional[compose_resources.Resource] = None
+    anonymous: Optional[_AnonymousVolume] = None
 
 
 def _entry_mount(entry: Any, project: Project, service: str = "") -> _PlannedMount:
@@ -977,8 +1004,7 @@ def _entry_mount(entry: Any, project: Project, service: str = "") -> _PlannedMou
     if not key:
         if not service:
             raise MountSpecError(f"anonymous volume at {mount.target!r} needs its service")
-        volume = compose_resources.anonymous_volume(project.name, service, mount.target)
-        return _PlannedMount(dataclasses.replace(mount, source=volume.name), None, volume)
+        return _PlannedMount(mount, None, _AnonymousVolume(service, mount.target))
     bind = _local_bind(project, key)
     if bind is not None:
         # `driver_opts: {type: none, o: bind, device: /path}` is Docker's spelling
@@ -1009,7 +1035,7 @@ def _classify_and_translate_volume(
     ensured_volumes: set[str],
     service: str = "",
     image: str = "",
-    renew_anonymous: bool = False,
+    anonymous: Optional[_AnonymousPlan] = None,
 ) -> list[str]:
     """Translate one compose volume entry into `container run` args.
 
@@ -1027,7 +1053,7 @@ def _classify_and_translate_volume(
         ensured_volumes,
         service=service,
         image=image,
-        renew_anonymous=renew_anonymous,
+        anonymous=anonymous,
     )
 
 
@@ -1038,22 +1064,19 @@ def _emit_planned(
     *,
     service: str = "",
     image: str = "",
-    renew_anonymous: bool = False,
+    anonymous: Optional[_AnonymousPlan] = None,
 ) -> list[str]:
     """The only effect of mount translation: create the volume on demand.
 
-    A named volume is created empty; an anonymous one is created and filled
-    with the image's content at its target (Docker's copy-up). With
-    ``renew_anonymous`` an existing anonymous volume is discarded first.
+    A named volume is created empty. An anonymous one is the volume the replaced
+    container mounted at the target when ``anonymous`` knows it, and otherwise a
+    new volume filled with the image's content at its target (Docker's copy-up).
     """
     if planned.anonymous is not None:
-        volume = planned.anonymous
-        if volume.name not in ensured_volumes:
-            _ensure_anonymous_volume(
-                volume, planned.mount.target, service, image, renew=renew_anonymous
-            )
-            ensured_volumes.add(volume.name)
-        return emit_mount(planned.mount)
+        name = _anonymous_volume_name(
+            planned.anonymous, project, image, anonymous if anonymous is not None else _AnonymousPlan()
+        )
+        return emit_mount(dataclasses.replace(planned.mount, source=name))
     key, resource = planned.volume_key, planned.mount.source
     if key is not None and resource not in ensured_volumes:
         volume = _volume_resource(project, key)
@@ -1109,7 +1132,7 @@ def _build_run_args(
     boot_hosts: list[str] | None = None,
     config_hash: str | None = None,
     image_id: str | None = None,
-    renew_anonymous: bool = False,
+    anonymous: Optional[_AnonymousPlan] = None,
 ) -> tuple[list[str], bool]:
     """Translate a service into `container run` args.
 
@@ -1205,7 +1228,7 @@ def _build_run_args(
                 ensured_volumes,
                 service=service.name,
                 image=image,
-                renew_anonymous=renew_anonymous,
+                anonymous=anonymous,
             )
         )
 
@@ -1882,11 +1905,6 @@ def _check_resources(project: Project, services: list[Service]) -> list[str]:
         for key in _service_volume_keys(service, project):
             uses["volume"].setdefault(key, (_volume_resource(project, key), service.name))
     uses["network"].setdefault("default", (_network_resource(project, "default"), ""))
-    planned_services = {service.name for service in services}
-    for volume in project.resources.anonymous:
-        owner = volume.labels.get(compose_resources.LABEL_SERVICE, "")
-        if owner in planned_services:
-            uses["volume"].setdefault(volume.name, (volume, owner))
 
     notices: list[str] = []
     for family, used in uses.items():
@@ -1974,78 +1992,90 @@ _SEED_DEST = "/shim-dest"
 _SEED_SCRIPT = 'if [ -d "$1" ]; then cp -a "$1"/. ' + _SEED_DEST + '/; fi'
 
 
-def _discard_anonymous_volume(volume: compose_resources.Resource, service: str) -> None:
-    """Remove an existing anonymous volume of this project and service (design D2).
+_ANONYMOUS_NAME_ATTEMPTS = 3
 
-    Only a volume that carries the project, service and anonymous labels is
-    removed; one that merely has the deterministic name stops the command, and
-    so does a volume the runtime refuses to remove because something uses it.
+
+def _volume_mounts(row: dict[str, Any]) -> dict[str, str]:
+    """Destination -> volume name of the ``volume`` mounts of a container row.
+
+    The runtime is the only record of which volume a container uses (design D2),
+    so the rows already normalised by ``cli`` are read as they are.
     """
-    observed = _list_resources("volume").get(volume.name)
-    if observed is None:
-        return
-    if any(observed.get(name) != value for name, value in volume.labels.items()):
-        raise ShimError(
-            f"compose: service {service!r}: volume {volume.name} exists without the "
-            "labels Compose puts on its anonymous volumes; it was not removed. "
-            "Remove or rename it, then run up again",
-            1,
-        )
-    removed = _run_container_capture(["volume", "rm", volume.name])
-    if removed.returncode != 0:
-        detail = (removed.stderr or removed.stdout).strip()
-        raise ShimError(
-            f"compose: service {service!r}: could not remove the previous anonymous "
-            f"volume {volume.name} ({detail}); it may still be in use",
-            1,
-        )
+    found: dict[str, str] = {}
+    for mount in row.get("mounts") or []:
+        if not isinstance(mount, dict) or mount.get("Type") != "volume":
+            continue
+        name, destination = mount.get("Name"), mount.get("Destination")
+        if name and destination:
+            found[str(destination)] = str(name)
+    return found
 
 
-def _ensure_anonymous_volume(
-    volume: compose_resources.Resource,
-    target: str,
-    service: str,
-    image: str,
-    *,
-    renew: bool = False,
-) -> None:
-    """Create the anonymous volume and fill it from ``image`` (design D1, D5).
+def _volume_exists(name: str) -> bool:
+    return _run_container_capture(["volume", "inspect", name]).returncode == 0
 
-    Without ``renew`` an existing volume is reused as it is: the container of
-    this service is being recreated and its data is never overwritten. With
-    ``renew`` (a new container, or ``up -V``) the existing volume is discarded
-    first. When the image's content cannot be copied the new volume is removed
+
+def _anonymous_volume_name(
+    volume: _AnonymousVolume, project: Project, image: str, plan: _AnonymousPlan
+) -> str:
+    """The volume to mount at ``volume.target``, created and seeded if it is new.
+
+    The volume of the container being replaced is reused when it still exists;
+    otherwise a new one is created. The choice is remembered in ``plan`` so
+    launching the same container again mounts the same volumes.
+    """
+    if volume.target in plan.resolved:
+        return plan.resolved[volume.target]
+    name = plan.previous.get(volume.target)
+    if name is None or not _volume_exists(name):
+        name = _create_anonymous_volume(volume, project.name, image)
+    plan.resolved[volume.target] = name
+    return name
+
+
+def _create_anonymous_volume(volume: _AnonymousVolume, project: str, image: str) -> str:
+    """Create a uniquely named anonymous volume and fill it from ``image`` (design D1, D3).
+
+    A name that is already taken is never reused: another token is drawn. When
+    the image's content cannot be copied only the volume created here is removed
     and the command fails before the service starts.
     """
-    if renew:
-        _discard_anonymous_volume(volume, service)
-    elif _run_container_capture(["volume", "inspect", volume.name]).returncode == 0:
-        return
+    for _ in range(_ANONYMOUS_NAME_ATTEMPTS):
+        resource = compose_resources.new_anonymous_volume(project, volume.service, volume.target)
+        if not _volume_exists(resource.name):
+            break
+    else:
+        raise ShimError(
+            f"compose: service {volume.service!r}: could not find a free name for the "
+            f"anonymous volume at {volume.target} after {_ANONYMOUS_NAME_ATTEMPTS} attempts",
+            1,
+        )
     label_args: list[str] = []
-    for name, value in volume.labels.items():
-        label_args.extend(["--label", f"{name}={value}"])
-    created = _run_container_capture(["volume", "create", *label_args, volume.name])
+    for label, value in resource.labels.items():
+        label_args.extend(["--label", f"{label}={value}"])
+    created = _run_container_capture(["volume", "create", *label_args, resource.name])
     if created.returncode != 0:
         raise ShimError(
-            f"compose: failed to create volume {volume.name}: "
+            f"compose: failed to create volume {resource.name}: "
             f"{(created.stderr or created.stdout).strip()}",
             created.returncode,
         )
     seeded = _run_container_capture([
-        "run", "--rm", "--name", f"{volume.name}-seed",
+        "run", "--rm", "--name", f"{resource.name}-seed",
         "--entrypoint", "/bin/sh",
-        "--mount", f"type=volume,source={volume.name},target={_SEED_DEST}",
-        image, "-c", _SEED_SCRIPT, "sh", target,
+        "--mount", f"type=volume,source={resource.name},target={_SEED_DEST}",
+        image, "-c", _SEED_SCRIPT, "sh", volume.target,
     ])
     if seeded.returncode != 0:
-        _run_container_capture(["volume", "rm", volume.name])
+        _run_container_capture(["volume", "rm", resource.name])
         detail = (seeded.stderr or seeded.stdout).strip()
         raise ShimError(
-            f"compose: service {service!r}: could not copy the content of {image} at "
-            f"{target} into the new anonymous volume ({detail}); the volume was removed. "
+            f"compose: service {volume.service!r}: could not copy the content of {image} at "
+            f"{volume.target} into the new anonymous volume ({detail}); the volume was removed. "
             "The image needs /bin/sh and cp, or use a named volume",
             1,
         )
+    return resource.name
 
 
 def _resource_spec(declared: Any, key: str) -> dict[str, Any]:
@@ -2445,9 +2475,10 @@ def _create_service(
     warned: set[str],
     nets_by_service: dict[str, list[NetworkAttachment]],
     completes: bool,
-    renew_anonymous: bool = False,
+    anonymous: Optional[_AnonymousPlan] = None,
 ) -> int:
     """`container run` for a service; return 0 or the failing exit code."""
+    anonymous = anonymous if anonymous is not None else _AnonymousPlan()
     boot_hosts = _boot_hosts_lines(service, project, nets_by_service)
     run_args, wrapped = _build_run_args(
         service,
@@ -2458,7 +2489,7 @@ def _create_service(
         boot_hosts=boot_hosts,
         config_hash=config_hash,
         image_id=image_id,
-        renew_anonymous=renew_anonymous,
+        anonymous=anonymous,
     )
     # A `service_completed_successfully` dependency runs in the foreground:
     # `container run` returns the container's own exit code (the runtime
@@ -2484,7 +2515,7 @@ def _create_service(
             warned=warned,
             config_hash=config_hash,
             image_id=image_id,
-            renew_anonymous=renew_anonymous,
+            anonymous=anonymous,
         )
         result = _run_container_capture(["run", *run_args])
     if result.returncode != 0:
@@ -2499,13 +2530,9 @@ def _print_dry_run(project: Project, services: list[Service]) -> None:
     volumes: dict[str, compose_resources.Resource] = {}
     for key in ["default", *(k for svc in services for k in _service_network_keys(svc))]:
         networks.setdefault(key, _network_resource(project, key))
-    planned = {service.name for service in services}
     for service in services:
         for key in _service_volume_keys(service, project):
             volumes.setdefault(key, _volume_resource(project, key))
-    for volume in project.resources.anonymous:
-        if volume.labels.get(compose_resources.LABEL_SERVICE, "") in planned:
-            volumes.setdefault(volume.name, volume)
 
     def lines(kind: str, items: dict[str, compose_resources.Resource]) -> None:
         for resource in items.values():
@@ -2515,6 +2542,10 @@ def _print_dry_run(project: Project, services: list[Service]) -> None:
     print(f"Dry run of project {project.name}: nothing was created.")
     lines("Network", networks)
     lines("Volume", volumes)
+    for service in services:
+        for planned in _service_mounts(service, project):
+            if planned.anonymous is not None:
+                print(f"Volume (anonymous, service {service.name}) at {planned.anonymous.target}")
     for service in services:
         name = service.container_name or f"{project.name}-{service.name}-1"
         print(f"Container {name} (service {service.name})")
@@ -2658,10 +2689,17 @@ def cmd_up(
                 warned=warned,
                 nets_by_service=nets_by_service,
                 completes=completes,
-                # A brand-new container never inherits a volume left by `down`
-                # (Docker drops it with the container); a recreated one keeps it
-                # unless the user asked for -V.
-                renew_anonymous=action == "create" or renew_anon_volumes,
+                # A new container gets new anonymous volumes and leaves any
+                # volume `down` kept untouched; a recreated one mounts the
+                # volumes of the container it replaces unless the user asked
+                # for -V. Nothing is ever deleted here (design D3).
+                anonymous=_AnonymousPlan(
+                    previous=(
+                        _volume_mounts(row)
+                        if action == "recreate" and row is not None and not renew_anon_volumes
+                        else {}
+                    )
+                ),
             )
             if rc != 0:
                 return rc
@@ -2721,17 +2759,30 @@ def _removable_names(
 
 
 def _runtime_volumes(project: Project) -> dict[str, compose_resources.Resource]:
-    """The volumes the project can own at runtime: declared ones and anonymous ones.
+    """The declared volumes the project can own at runtime.
 
-    Local-driver binds are only paths, so they are left out.
+    Local-driver binds are only paths, so they are left out. Anonymous volumes
+    are found by their labels instead (``_anonymous_volume_names``).
     """
-    volumes = {
+    return {
         key: volume
         for key, volume in project.resources.volumes.items()
         if not _is_local_bind(project, key)
     }
-    volumes.update({volume.name: volume for volume in project.resources.anonymous})
-    return volumes
+
+
+def _anonymous_volume_names(project_name: str) -> list[str]:
+    """Every volume labelled as an anonymous volume of the project (design D4).
+
+    That includes the ones no container mounts any more and the ones of services
+    that left the file; a volume of another project, or without the anonymous
+    label, is never listed.
+    """
+    return sorted(
+        name
+        for name, labels in _list_resources("volume").items()
+        if labels.get(LABEL_PROJECT) == project_name and compose_resources.LABEL_ANONYMOUS in labels
+    )
 
 
 def cmd_down(
@@ -2770,7 +2821,10 @@ def cmd_down(
         else:
             networks = _load_labeled_resources("network", project_name)
         volumes = (
-            _removable_names("volume", project_name, _runtime_volumes(project))
+            [
+                *_removable_names("volume", project_name, _runtime_volumes(project)),
+                *_anonymous_volume_names(project_name),
+            ]
             if remove_volumes and project is not None
             else []
         )
@@ -2790,7 +2844,9 @@ def cmd_down(
         if result.returncode == 0:
             print(f"Removed volume {volume}")
         else:
-            sys.stderr.write(result.stderr or result.stdout)
+            # Keep going: one volume the runtime refuses must not leave the rest behind.
+            detail = (result.stderr or result.stdout).strip()
+            sys.stderr.write(f"compose: could not remove volume {volume}: {detail}\n")
             rc = rc or result.returncode
     return rc
 

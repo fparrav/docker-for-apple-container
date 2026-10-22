@@ -63,6 +63,7 @@ class Repo:
         (root / "tests").mkdir()
         (root / "tests" / "test_x.py").write_text("x = 1\n")
         (root / "README.md").write_text("readme\n")
+        (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
         self.evidence_dir = root / "docs" / "evidence"
         self.commit("initial")
 
@@ -73,7 +74,7 @@ class Repo:
     def trees(self) -> dict:
         return {
             name: git(self.root, "rev-parse", f"HEAD:{name}").strip()
-            for name in verifier.EVIDENCE_TREES
+            for name in verifier.EVIDENCE_INPUTS
         }
 
     def write_evidence(self, *, at: datetime = NOW - timedelta(days=1), **changes) -> Path:
@@ -82,7 +83,7 @@ class Repo:
         live = {"ran": 20, "passed": 20, "failed": 0, "skipped": 0, "not_run": 0, "declared": 20}
         live.update(changes.pop("live", {}))
         record = {
-            "schema": 1,
+            "schema": 2,
             "container_version": VERSION,
             "generated_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "commit": "0" * 40,
@@ -144,8 +145,19 @@ class FinalTagTests(VerifierTestCase):
         status, _, err = self.run_main("--tag", "v1.2.3")
         self.assertEqual(status, 0, err)
 
-    def test_each_evidence_directory_binds_the_hash(self) -> None:
-        for relative in ("src/container_docker_shim/cli.py", "scripts/tool.py", "tests/test_x.py"):
+    def test_a_packaging_commit_after_the_evidence_invalidates_it(self) -> None:
+        self.repo.write_evidence()
+        self.repo.commit("evidence")
+        (self.repo.root / "pyproject.toml").write_text('[project]\nname = "x"\nrequires-python = ">=3.10"\n')
+        self.repo.commit("packaging")
+        err = self.assert_rejected(mentioning="tree hash")
+        self.assertIn(verifier.tree_hash(self.repo.trees()), err)
+        self.assertIn("pyproject.toml", err)
+
+    def test_each_evidence_input_binds_the_hash(self) -> None:
+        for relative in (
+            "src/container_docker_shim/cli.py", "scripts/tool.py", "tests/test_x.py", "pyproject.toml",
+        ):
             with self.subTest(changed=relative):
                 self.repo.write_evidence()
                 path = self.repo.root / relative
@@ -230,9 +242,21 @@ class FinalTagTests(VerifierTestCase):
         self.repo.write_evidence(tree_hash="f" * 64)
         self.assert_rejected(mentioning="its own trees")
 
-    def test_unknown_schema(self) -> None:
-        self.repo.write_evidence(schema=2)
-        self.assert_rejected(mentioning="schema")
+    def test_earlier_schema_names_both_numbers_and_says_to_run_again(self) -> None:
+        self.repo.write_evidence(schema=1)
+        err = self.assert_rejected(mentioning="schema 1")
+        self.assertIn("current schema is 2", err)
+        self.assertIn("validate-runtime.py --evidence", err)
+
+    def test_unknown_future_schema(self) -> None:
+        self.repo.write_evidence(schema=3)
+        self.assert_rejected(mentioning="schema 3")
+
+    def test_the_shape_needs_the_packaging_id(self) -> None:
+        trees = self.repo.trees()
+        del trees["pyproject.toml"]
+        self.repo.write_evidence(trees=trees)
+        self.assert_rejected(mentioning="pyproject.toml")
 
     def test_the_newest_file_is_the_one_judged(self) -> None:
         self.repo.write_evidence(at=NOW - timedelta(days=5), live={"ran": 0, "passed": 0})
@@ -301,10 +325,17 @@ class SharedContractTests(unittest.TestCase):
 
     def test_tree_hash_matches_validate_runtime(self) -> None:
         producer = _load("validate_runtime_for_hash", "validate-runtime.py")
-        trees = {"src": "a" * 40, "scripts": "b" * 40, "tests": "c" * 40}
+        trees = {"src": "a" * 40, "scripts": "b" * 40, "tests": "c" * 40, "pyproject.toml": "e" * 40}
         self.assertEqual(producer.tree_hash(trees), verifier.tree_hash(trees))
-        text = "src %s\nscripts %s\ntests %s" % ("a" * 40, "b" * 40, "c" * 40)
+        text = "src %s\nscripts %s\ntests %s\npyproject.toml %s" % ("a" * 40, "b" * 40, "c" * 40, "e" * 40)
         self.assertEqual(verifier.tree_hash(trees), hashlib.sha256(text.encode()).hexdigest())
+
+    def test_both_scripts_share_inputs_and_schema(self) -> None:
+        producer = _load("validate_runtime_for_inputs", "validate-runtime.py")
+        self.assertEqual(producer.EVIDENCE_TREES, verifier.EVIDENCE_TREES)
+        self.assertEqual(producer.EVIDENCE_FILES, verifier.EVIDENCE_FILES)
+        self.assertEqual(producer.EVIDENCE_INPUTS, verifier.EVIDENCE_INPUTS)
+        self.assertEqual(producer.EVIDENCE_SCHEMA, verifier.EVIDENCE_SCHEMA)
 
     def test_a_record_written_by_validate_runtime_is_accepted(self) -> None:
         producer = _load("validate_runtime_for_record", "validate-runtime.py")

@@ -191,19 +191,47 @@ when `Q_ENV_SECRET` is not exported.
 
 `s-anonymous-volume` has one service with a short-form anonymous volume over a
 path the image already has (`/etc/apk`) and a long-form one over a path it does
-not. Both tiers assert that the first starts with the image's content, that the
-second is empty, and that a file written to the first survives recreating the
-container (`REV` changes the environment to force it), that `up -d -V` on a
-recreate drops it and seeds the image content again, and that a full `down`
-followed by `up` gives a fresh volume without it. The live tier also asserts
-that `down -v` leaves no `_app_anon-` volume and tolerates the runtime's
-`lost+found`. Both tiers run the same sequence, so the shim and real Docker are
-held to the same lifecycle.
+not. Both tiers run the same sequence: the first volume starts with the image's
+content and the second is empty; a marker written to the first survives
+`up --force-recreate` and a configuration change (`REV`), and the container
+keeps mounting the same volume, read from `docker inspect`; `down` followed by
+`up` mounts a new volume without the marker while the previous volume still
+exists; `up -V --force-recreate` mounts a third volume and removes nothing; and
+`down -v` removes the volume of the current container. Only the live test also
+asserts that `down -v` removes the earlier volumes that `down` and `-V` left
+behind (and leaves no `_app_anon-` volume), because real Docker keeps them; the
+conformance test removes the ones it saw by exact name in its cleanup. The live
+tier tolerates the runtime's `lost+found`.
 `t-local-bind-volume` declares two top-level volumes with the local bind idiom
 (`driver_opts: {type: none, o: bind, device: ${DATA_DIR}}`, one with `o: bind,ro`)
 on a temporary host directory: a write from the read-write service appears on
 the host, the read-only service cannot write, no Apple volume exists for them
 (live), and the host directory survives `down -v`.
+
+## Waiting for conditions
+
+A live or conformance verdict never depends on a fixed delay. `tests/waiting.py`
+provides `wait_until(check, timeout, describe)`: it calls `check` until it
+returns a truthy value, and on timeout fails with `describe()`, the timeout and
+the last state it saw. The clock and the sleep are injectable, so
+`tests/test_waiting.py` runs without waiting, and it also fails if
+`test_live_fixtures.py` or `test_conformance_fixtures.py` call `time.sleep`.
+Readiness checks ask the thing that matters: the postgres image initialises its
+data directory with a temporary server that listens only on the unix socket, so
+the fixtures ask `pg_isready -h 127.0.0.1`, which only the real server answers.
+
+## The wheel check
+
+`scripts/verify_wheel.py --dist DIR [--expect-version VERSION]` installs the
+built wheel into a new virtual environment outside the checkout and exercises
+what a user gets: the `docker` console script and the package files are in the
+wheel, the package imports from `site-packages`, `docker version` (run against a
+stand-in `container` script) reports the shim version, and without a `container`
+CLI the executable exits 1 with `Apple container CLI not found`. It exits 3
+naming the first failed check. `tests/test_verify_wheel.py` covers it with a
+wheel built by hand in a temporary directory. CI runs it in the `wheel` job on
+the Python floor from `pyproject.toml` and on `3.x`; the release workflow runs
+it on the files it publishes (see [Releasing](releasing.md#what-the-release-workflow-does)).
 
 ## Conformance tier in CI
 
@@ -267,7 +295,8 @@ When both 1 and 3 apply, 1 wins.
 `docs/evidence/runtime-<version>-<UTC timestamp>.json` after a full successful
 validation of the supported release: the live tier ran every test the sources
 declare (the same `declared_tests` scan as `--require live`), all passed, and
-`src/`, `scripts/` and `tests/` match `HEAD`. Otherwise nothing is written and
+`src/`, `scripts/`, `tests/` and `pyproject.toml` match `HEAD` (schema 2 of the
+file; `pyproject.toml` is part of the hash because it decides what is packaged). Otherwise nothing is written and
 the exit status is the one in the table above (a run that finishes without
 covering every declared test exits 3). `--skip-live` cannot be combined with
 `--evidence`. `scripts/verify_release_evidence.py` checks the file at release

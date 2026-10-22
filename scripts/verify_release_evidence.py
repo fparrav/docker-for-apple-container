@@ -4,7 +4,8 @@
 A final tag (``vX.Y.Z``) needs the newest file under ``docs/evidence/`` to be
 complete, recent and bound to this exact code: the Apple ``container`` release
 it ran on equals ``SUPPORTED_CONTAINER_VERSION``, the hash of the git trees of
-``src/``, ``scripts/`` and ``tests/`` equals the one at the tagged commit, it is
+``src/``, ``scripts/`` and ``tests/`` and of ``pyproject.toml`` equals the one at
+the tagged commit, it is
 at most ``--max-age-days`` old, and every declared live test ran and passed.
 Pre-release tags (``rc``, ``a``, ``b``, ``dev``) need no evidence. Any other tag
 fails. ``scripts/validate-runtime.py --evidence`` produces the file.
@@ -37,9 +38,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_AGE_DAYS = 30
 FUTURE_TOLERANCE = timedelta(days=1)
-EVIDENCE_SCHEMA = 1
+EVIDENCE_SCHEMA = 2
 # Must match scripts/validate-runtime.py: the hash covers these, in this order.
 EVIDENCE_TREES = ("src", "scripts", "tests")
+EVIDENCE_FILES = ("pyproject.toml",)
+EVIDENCE_INPUTS = EVIDENCE_TREES + EVIDENCE_FILES
 COUNT_FIELDS = ("ran", "passed", "failed", "skipped", "not_run", "declared")
 TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -89,22 +92,22 @@ def supported_version(repo: Path) -> str:
 
 
 def tree_hash(trees: dict) -> str:
-    """One sha256 over ``<dir> <tree id>`` lines, in the order of ``EVIDENCE_TREES``."""
-    text = "\n".join(f"{name} {trees[name]}" for name in EVIDENCE_TREES)
+    """One sha256 over ``<path> <git id>`` lines, in the order of ``EVIDENCE_INPUTS``."""
+    text = "\n".join(f"{name} {trees[name]}" for name in EVIDENCE_INPUTS)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 def head_trees(repo: Path) -> dict:
-    """The git tree identifiers of the evidence directories at ``HEAD``."""
+    """The git identifiers of the evidence directories and files at ``HEAD``."""
     trees = {}
-    for name in EVIDENCE_TREES:
+    for name in EVIDENCE_INPUTS:
         result = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", f"HEAD:{name}"],
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            raise EvidenceError(f"cannot read the git tree of {name}/ at HEAD: {result.stderr.strip()}")
+            raise EvidenceError(f"cannot read the git id of {name} at HEAD: {result.stderr.strip()}")
         trees[name] = result.stdout.strip()
     return trees
 
@@ -126,13 +129,16 @@ def load_file(path: Path) -> Evidence:
         if field not in record:
             raise EvidenceError(f"{name} lacks the field {field!r}")
     if record["schema"] != EVIDENCE_SCHEMA or isinstance(record["schema"], bool):
-        raise EvidenceError(f"{name} has schema {record['schema']!r}, expected {EVIDENCE_SCHEMA}")
+        raise EvidenceError(
+            f"{name} has schema {record['schema']!r}, but the current schema is {EVIDENCE_SCHEMA}; "
+            "run `python3 scripts/validate-runtime.py --evidence` again"
+        )
     for field in ("container_version", "generated_at", "commit", "tree_hash", "result"):
         if not isinstance(record[field], str) or not record[field]:
             raise EvidenceError(f"{name}: {field!r} must be a non-empty string")
     trees = record["trees"]
-    if not isinstance(trees, dict) or any(not isinstance(trees.get(d), str) or not trees[d] for d in EVIDENCE_TREES):
-        raise EvidenceError(f"{name}: 'trees' must name {', '.join(EVIDENCE_TREES)}")
+    if not isinstance(trees, dict) or any(not isinstance(trees.get(d), str) or not trees[d] for d in EVIDENCE_INPUTS):
+        raise EvidenceError(f"{name}: 'trees' must name {', '.join(EVIDENCE_INPUTS)}")
     live = record["live"]
     if not isinstance(live, dict):
         raise EvidenceError(f"{name}: 'live' must be an object")
@@ -186,7 +192,7 @@ def verify_final(
     current = tree_hash(head_trees(repo))
     if record["tree_hash"] != current:
         raise EvidenceError(
-            f"{name} covers tree hash {record['tree_hash']}, but src/, scripts/ and tests/ "
+            f"{name} covers tree hash {record['tree_hash']}, but src/, scripts/, tests/ and pyproject.toml "
             f"at the tagged commit hash to {current}; run the validation again"
         )
     if found.generated_at > now + FUTURE_TOLERANCE:
@@ -222,7 +228,7 @@ def notes_for(tag: str, found: Evidence | None) -> str:
         f"- Apple `container` version: {record['container_version']}\n"
         f"- Generated: {record['generated_at']} (UTC)\n"
         f"- Live tests: {_counts(found.live)}\n"
-        f"- Code covered: `src/`, `scripts/` and `tests/` (hash `{record['tree_hash'][:12]}`)\n\n"
+        f"- Code covered: `src/`, `scripts/`, `tests/` and `pyproject.toml` (hash `{record['tree_hash'][:12]}`)\n\n"
         "The evidence is a maintainer's attestation tied to that code; the file is not signed.\n"
     )
 
