@@ -1616,8 +1616,8 @@
     "status": "SUPPORTED",
     "apple": null,
     "evidence": "live",
-    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_down_v_removes",
-    "note": "A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled from the image's content at the target (copy-up) by a helper container when a container of the service is created, reused only when an existing container is recreated, discarded and seeded again by up after down (only if it carries the project, service and anonymous labels), and removed by down -v; if the copy fails the volume is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down)."
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_follow_the_container_and_are_never_deleted_implicitly",
+    "note": "A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<10 hex> with a unique name, filled from the image's content at the target (copy-up) by a helper container. Recreating an existing container (a changed configuration, --force-recreate) mounts the volume that container used; a container created because none existed gets a new volume and the old one is left in place, as Docker does. Nothing is deleted implicitly: down -v removes every project-labelled anonymous volume, orphans included; if the copy fails only the volume just created is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_follow_the_container_and_are_never_deleted_implicitly)."
   },
   {
     "id": "compose volumes.bind",
@@ -1958,8 +1958,8 @@
     "status": "SUPPORTED",
     "apple": null,
     "evidence": "live",
-    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_down_v_removes",
-    "note": "-V / --renew-anon-volumes discards and seeds again the anonymous volumes of the services that up recreates; a kept or only started container and named volumes are untouched, and --dry-run changes nothing."
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_follow_the_container_and_are_never_deleted_implicitly",
+    "note": "-V / --renew-anon-volumes mounts new anonymous volumes, seeded from the image, into the services that up recreates and leaves the previous volumes in place; a kept or only started container and named volumes are untouched, and --dry-run changes nothing."
   },
   {
     "id": "compose up --no-deps",
