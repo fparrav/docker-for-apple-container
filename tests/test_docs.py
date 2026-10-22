@@ -305,6 +305,71 @@ class DocumentationConsistencyTests(unittest.TestCase):
         )
 
 
+class VolumeLifecycleDocsTests(unittest.TestCase):
+    """The README and matrix describe the anonymous volume lifecycle and ``rbind`` refusal."""
+
+    def readme(self) -> str:
+        return (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_readme_describes_fresh_anonymous_volumes_after_down(self) -> None:
+        text = " ".join(self.readme().split())
+        self.assertIn("`docker compose down` followed by `up` gives the service a fresh anonymous volume", text)
+        self.assertIn("`up -V` (`--renew-anon-volumes`)", text)
+        self.assertIn("**Breaking change:** data that used to survive", text)
+
+    def test_no_document_says_the_shim_keeps_anonymous_volumes_across_down(self) -> None:
+        for name in ("README.md", "docs/testing.md", "docs/releasing.md"):
+            text = " ".join((ROOT / name).read_text(encoding="utf-8").split())
+            self.assertNotIn("unlike Docker, which drops them", text, name)
+            self.assertNotIn("the shim keeps them", text, name)
+            self.assertNotIn("data survives recreating the container", text, name)
+
+    def test_rbind_is_listed_as_refused_not_accepted(self) -> None:
+        text = " ".join(self.readme().split())
+        self.assertIn("`o: bind` (optionally with `ro` or `rw`)", text)
+        self.assertNotIn("optionally `rbind`", text)
+        self.assertIn("`o: rbind` is refused with exit 64", text)
+        matrix = (ROOT / "tests" / "compat" / "matrix.json").read_text(encoding="utf-8")
+        self.assertNotIn("o of bind, rbind", matrix)
+        self.assertIn("o: rbind is refused", matrix)
+
+
+class ReleaseEvidenceDocsTests(unittest.TestCase):
+    """``docs/releasing.md`` documents the evidence procedure and its limits."""
+
+    def releasing(self) -> str:
+        return (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
+
+    def test_releasing_documents_the_evidence_procedure(self) -> None:
+        text = self.releasing()
+        for needle in (
+            "validate-runtime.py --evidence",
+            "docs/evidence/",
+            "verify_release_evidence.py",
+            "30 days",
+            "Pre-release tags",
+            "pre-release",
+        ):
+            self.assertIn(needle, text, needle)
+
+    def test_releasing_states_the_limits_of_the_evidence(self) -> None:
+        text = self.releasing()
+        self.assertIn("not signed", text)
+        self.assertIn("attestation", text)
+
+    def test_releasing_lists_the_recognised_tag_forms(self) -> None:
+        text = self.releasing()
+        for tag in ("vX.Y.Z", "vX.Y.Zrc1", "vX.Y.Za1", "vX.Y.Zb1", "vX.Y.Z.dev1"):
+            self.assertIn(tag, text, tag)
+        self.assertNotIn("v0.1.0-rc1` are fine", text)
+
+    def test_testing_documents_evidence_and_require(self) -> None:
+        text = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
+        self.assertIn("--evidence", text)
+        self.assertIn("--require", text)
+        self.assertIn("releasing.md#release-evidence", text)
+
+
 class ReleaseLiteralScannerTests(unittest.TestCase):
     def test_scanner_flags_stale_literal(self) -> None:
         stale, not_checked = scan_document(

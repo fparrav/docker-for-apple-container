@@ -96,8 +96,24 @@ run.
   supported release, one line per tier (`<tier> tier: ran (…)` or `<tier>
   tier: not run`), and the compatibility claims not reached in the run.
 
-The exit status is non-zero iff any test **failed**; `not run` and flagged
-claims are reported, never failing.
+The exit status is non-zero iff any test **failed** (1); `not run` and flagged
+claims are reported, never failing, unless a tier is required (below).
+
+### Requiring a tier
+
+`--require <tier>[,<tier>]` accepts the opt-in tiers `live` and `conformance`
+and makes the report fail with exit status **3** when a required tier did not
+run completely: any of its tests is `not run` or skipped, no test of the tier
+declares itself in the sources, or fewer tests passed than the sources declare.
+The expected count is not written anywhere: `declared_tests` scans
+`tests/test_*.py` for `test_*` functions decorated with `tiers.live_tier(...)`
+or `tiers.conformance_tier(...)` in modules whose module-level `TIER` is that
+tier, so adding a test needs no edit to a workflow. A failed test keeps exit
+status 1, and the report and summary are written in every case. `--require`
+does not enable the tier: set `SHIM_TIERS` as usual, otherwise every test of
+the tier is `not run` and the exit status is 3. The `conformance` job in
+`ci.yml` uses it, so a runner without a reachable Docker Engine fails instead
+of passing with zero executed tests.
 
 ### Running the report
 
@@ -115,6 +131,10 @@ python3 scripts/test_report.py --tiers unit,fake
 
 # release-note text instead of the Markdown summary
 python3 scripts/test_report.py --release-notes
+
+# fail (exit 3) unless every declared conformance test ran and passed
+SHIM_TIERS=conformance SHIM_CONFORMANCE_DOCKER=/usr/local/bin/docker \
+  python3 scripts/test_report.py --require conformance
 ```
 
 ## Safety rules for live tests
@@ -173,10 +193,12 @@ when `Q_ENV_SECRET` is not exported.
 path the image already has (`/etc/apk`) and a long-form one over a path it does
 not. Both tiers assert that the first starts with the image's content, that the
 second is empty, and that a file written to the first survives recreating the
-container (`REV` changes the environment to force it). The live tier also asserts
+container (`REV` changes the environment to force it), that `up -d -V` on a
+recreate drops it and seeds the image content again, and that a full `down`
+followed by `up` gives a fresh volume without it. The live tier also asserts
 that `down -v` leaves no `_app_anon-` volume and tolerates the runtime's
-`lost+found`. The conformance tier does not assert survival across `down` + `up`,
-because Docker drops anonymous volumes on `down` and the shim keeps them.
+`lost+found`. Both tiers run the same sequence, so the shim and real Docker are
+held to the same lifecycle.
 `t-local-bind-volume` declares two top-level volumes with the local bind idiom
 (`driver_opts: {type: none, o: bind, device: ${DATA_DIR}}`, one with `o: bind,ro`)
 on a temporary host directory: a write from the read-write service appears on
@@ -238,6 +260,18 @@ The validator's exit status names the case, and the summary always ends with a
 | `3` | incomplete: the live tier was requested but no test ran, or a `live` entry's test did not run |
 
 When both 1 and 3 apply, 1 wins.
+
+### Release evidence
+
+`scripts/validate-runtime.py --evidence` also writes
+`docs/evidence/runtime-<version>-<UTC timestamp>.json` after a full successful
+validation of the supported release: the live tier ran every test the sources
+declare (the same `declared_tests` scan as `--require live`), all passed, and
+`src/`, `scripts/` and `tests/` match `HEAD`. Otherwise nothing is written and
+the exit status is the one in the table above (a run that finishes without
+covering every declared test exits 3). `--skip-live` cannot be combined with
+`--evidence`. `scripts/verify_release_evidence.py` checks the file at release
+time; the sequence and its limits are in [Releasing](releasing.md#release-evidence).
 
 ## CI limitation
 
