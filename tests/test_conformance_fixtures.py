@@ -631,8 +631,17 @@ class ConformanceFixtureTests(unittest.TestCase):
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def assert_marker(self, harness: "FixtureHarness", *, present: bool, why: str) -> None:
+        """The marker file in the fixture-S anonymous volume is (not) there."""
+        found = harness.compose("exec", "-T", "app", "cat", "/etc/apk/marker")
+        if present:
+            self.assertEqual(found.returncode, 0, why + ": " + found.stdout + found.stderr)
+            self.assertEqual(found.stdout, "kept")
+        else:
+            self.assertNotEqual(found.returncode, 0, why + ": " + found.stdout)
+
     @tiers.conformance_tier()
-    def test_fixture_s_anonymous_volumes_copy_up_and_reuse(self) -> None:
+    def test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down(self) -> None:
         harness = FixtureHarness(self, FIXTURE_S, docker=_client(), prefix="conf")
 
         # 1. Detached up: real Docker creates the two anonymous volumes; the
@@ -664,8 +673,7 @@ class ConformanceFixtureTests(unittest.TestCase):
 
         # 5. A second up with REV=2 recreates the container; Docker reuses
         #    the anonymous volumes, so the marker and the image content
-        #    survive. No down+up survival assertion: Docker drops anonymous
-        #    volumes across a full down, while the shim keeps them by design.
+        #    survive.
         with mock.patch.dict(os.environ, {"REV": "2"}):
             result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -679,6 +687,33 @@ class ConformanceFixtureTests(unittest.TestCase):
             repositories.stdout.strip(),
             "the recreated container lost the image content already in the volume",
         )
+
+        # 6. `up -V` on a recreate (REV=3) discards the anonymous volumes and
+        #    seeds them again from the image: the marker is gone, the image
+        #    content is back. The same sequence the live tier asserts.
+        with mock.patch.dict(os.environ, {"REV": "3"}):
+            result = harness.compose("up", "-d", "-V", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=False, why="up -V kept the old anonymous volume")
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "up -V did not seed the new anonymous volume from the image",
+        )
+
+        # 7. A full `down` followed by `up` gives the service a fresh volume:
+        #    write the marker again, go through the cycle and it is gone.
+        marker = harness.compose(
+            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
+        )
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        self.assert_marker(harness, present=True, why="the marker was not written")
+        result = harness.compose("down")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=False, why="down + up kept the old anonymous volume")
 
     @tiers.conformance_tier()
     def test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them(self) -> None:

@@ -280,6 +280,8 @@ if a[:2] == ["volume", "list"]:
     d = load(); print(json.dumps(list(d["volumes"].values()))); raise SystemExit(0)
 
 if a[:2] == ["volume", "rm"]:
+    if a[-1] in os.environ.get("FAKE_VOLUME_RM_FAIL", "").split(","):
+        print("volume " + a[-1] + " is in use", file=sys.stderr); raise SystemExit(1)
     d = load(); name = a[-1]; d["volumes"].pop(name, None)
     save(d); print(name); raise SystemExit(0)
 
@@ -2027,7 +2029,7 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertIn(f"type=bind,source={device},target=/data,readonly", self.run_mounts())
 
     def test_two_services_share_the_local_bind_volume(self) -> None:
-        device = self.write_local_bind_compose("rbind", services=("a", "b"))
+        device = self.write_local_bind_compose("bind", services=("a", "b"))
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_mounts().count(f"type=bind,source={device},target=/data"), 2)
@@ -2047,6 +2049,23 @@ class ComposeE2ETests(unittest.TestCase):
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 64, result.stderr)
         self.assertIn("uid=1", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_rbind_local_bind_volume_exits_64_and_creates_nothing(self) -> None:
+        self._seed_state()
+        self.write_local_bind_compose("rbind")
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("rbind", result.stderr)
+        self.assertIn("bind", result.stderr)
+        self.assert_nothing_was_created()
+
+    def test_rbind_local_bind_volume_is_refused_in_dry_run_too(self) -> None:
+        self.write_local_bind_compose("rbind")
+        result = self.dry_up()
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("rbind", result.stderr)
+        self.assertIn("bind", result.stderr)
         self.assert_nothing_was_created()
 
     ANON_COMPOSE = """
@@ -2089,16 +2108,118 @@ class ComposeE2ETests(unittest.TestCase):
                        and c[c.index("--name") + 1] == "demo-web-1"][0]
         self.assertNotIn("-v", service_run)
 
-    def test_anonymous_volume_is_reused_and_not_filled_again_on_recreate(self) -> None:
+    def anonymous_calls(self, verb: str) -> list:
+        name = self.anonymous_name()
+        return [c for c in self.runtime_calls() if c[:2] == ["volume", verb] and c[-1] == name]
+
+    def up_with_anonymous_volume(self) -> None:
         self.write_compose(self.ANON_COMPOSE)
         (self.project / "src").mkdir()
         self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
-        self.assertEqual(self.docker("compose", "down").returncode, 0)
-        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
-        creates = [c for c in self.runtime_calls() if c[:2] == ["volume", "create"]]
-        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(self.anonymous_calls("create")), 1)
+
+    def test_anonymous_volume_is_reused_and_not_filled_again_on_recreate(self) -> None:
+        self.up_with_anonymous_volume()
+        result = self.docker("compose", "up", "-d", "--force-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.anonymous_calls("create")), 1)
+        self.assertEqual(self.anonymous_calls("rm"), [])
         self.assertEqual(len(self.seed_runs()), 1)
         self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+
+    def test_anonymous_volume_left_by_down_is_discarded_and_seeded_again(self) -> None:
+        self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.anonymous_calls("rm")), 1)
+        self.assertEqual(len(self.anonymous_calls("create")), 2)
+        self.assertEqual(len(self.seed_runs()), 2)
+        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+
+    def test_container_removed_outside_compose_gets_a_fresh_anonymous_volume(self) -> None:
+        self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("rm", "-f", "demo-web-1").returncode, 0)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.anonymous_calls("rm")), 1)
+        self.assertEqual(len(self.seed_runs()), 2)
+
+    def test_up_without_a_recreate_does_not_touch_the_anonymous_volume(self) -> None:
+        self.up_with_anonymous_volume()
+        for flags in (["-d"], ["-d", "-V"]):
+            result = self.docker("compose", "up", *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.anonymous_calls("rm"), [])
+        self.assertEqual(len(self.anonymous_calls("create")), 1)
+        self.assertEqual(len(self.seed_runs()), 1)
+
+    def test_renew_anon_volumes_discards_and_seeds_again_on_recreate(self) -> None:
+        self.up_with_anonymous_volume()
+        for round_, flag in enumerate(("-V", "--renew-anon-volumes"), start=1):
+            with self.subTest(flag=flag):
+                result = self.docker("compose", "up", "-d", "--force-recreate", flag)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.anonymous_calls("rm")), round_)
+                self.assertEqual(len(self.anonymous_calls("create")), round_ + 1)
+                self.assertEqual(len(self.seed_runs()), round_ + 1)
+                self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+
+    def test_renew_anon_volumes_keeps_named_volumes(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: node:20
+                volumes:
+                  - data:/data
+                  - /app/node_modules
+            volumes:
+              data: {}
+            """
+        )
+        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        result = self.docker("compose", "up", "-d", "--force-recreate", "-V")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        removed = [c[-1] for c in self.runtime_calls() if c[:2] == ["volume", "rm"]]
+        self.assertEqual(removed, [self.anonymous_name()])
+        self.assertIn("demo_data", self.load_state()["volumes"])
+
+    def test_renew_anon_volumes_in_dry_run_changes_nothing(self) -> None:
+        self.up_with_anonymous_volume()
+        before = len(self.runtime_calls())
+        result = self.dry_up("-V", "--force-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new = [c for c in self.runtime_calls()[before:] if c[:1] in (["run"], ["rm"], ["stop"])
+               or c[:2] in (["volume", "create"], ["volume", "rm"])]
+        self.assertEqual(new, [])
+
+    def test_residue_volume_without_the_compose_labels_stops_up(self) -> None:
+        self.write_compose(self.ANON_COMPOSE)
+        (self.project / "src").mkdir()
+        self._seed_state()
+        state = self.load_state()
+        state["volumes"][self.anonymous_name()] = {
+            "configuration": {"name": self.anonymous_name(), "labels": {}},
+            "id": self.anonymous_name(),
+        }
+        self.state.write_text(json.dumps(state))
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(self.anonymous_name(), result.stderr)
+        self.assertEqual(self.anonymous_calls("rm"), [])
+        self.assertEqual(self.load_state()["containers"], {})
+
+    def test_residue_volume_in_use_stops_up_naming_volume_and_service(self) -> None:
+        self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.env["FAKE_VOLUME_RM_FAIL"] = self.anonymous_name()
+        result = self.docker("compose", "up", "-d")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(self.anonymous_name(), result.stderr)
+        self.assertIn("web", result.stderr)
+        self.assertEqual(self.load_state()["containers"], {})
 
     def test_two_anonymous_targets_get_two_volumes(self) -> None:
         self.write_compose(
