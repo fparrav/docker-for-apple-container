@@ -11,10 +11,14 @@ binary, no subprocess, no live tier.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
+import json
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -197,6 +201,168 @@ class ExitStatusTests(unittest.TestCase):
         status, _, err = run_main([], runtime, run_live, [bad])
         self.assertEqual(status, 2)
         self.assertIn("matrix is invalid", err)
+
+
+TREES = {"src": "a" * 40, "scripts": "b" * 40, "tests": "c" * 40}
+HEAD = "d" * 40
+NOW = datetime(2026, 10, 21, 14, 3, 0, tzinfo=timezone.utc)
+LIVE_ENTRY = make_entry("run --live-flag", "live", "--live-flag", "t_live.LiveTests.test_x")
+
+
+def fake_git(dirty: tuple = ()):
+    """A ``git`` stand-in: clean unless a directory is listed in ``dirty``."""
+
+    def git(args: list) -> str:
+        if args[:2] == ["status", "--porcelain"]:
+            return " M changed.py\n" if args[-1] in dirty else ""
+        if args[0] == "rev-parse" and args[1] == "HEAD":
+            return HEAD + "\n"
+        if args[0] == "rev-parse" and args[1].startswith("HEAD:"):
+            return TREES[args[1][len("HEAD:"):]] + "\n"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    return git
+
+
+class EvidenceTests(unittest.TestCase):
+    """``--evidence`` writes the release record only after a full success (design D8)."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.out = Path(self.directory.name) / "evidence"
+
+    def evidence(self, outcomes: dict, *, version: str = "1.5.0", declared: int = None,
+                 extra: list = (), dirty: tuple = (), returncode: int = 0):
+        runtime = FakeRuntime(
+            version=f"container CLI version {version} (build: release)",
+            help_results={("run",): (0, "  --live-flag\n")},
+        )
+        run_live = make_run_live(bool(outcomes), outcomes, returncode=returncode)
+        entries = [LIVE_ENTRY]
+        argv = ["--evidence", "--evidence-dir", str(self.out), *extra]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(validator.compat_matrix, "load", return_value=entries):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = validator.main(
+                    argv,
+                    runtime=runtime,
+                    run_live=run_live,
+                    git=fake_git(dirty),
+                    declared=len(outcomes) if declared is None else declared,
+                    now=NOW,
+                )
+        return status, stdout.getvalue(), stderr.getvalue(), run_live
+
+    def files(self) -> list:
+        return sorted(self.out.glob("*.json")) if self.out.exists() else []
+
+    def test_full_success_writes_one_file_with_the_record(self):
+        status, out, _, _ = self.evidence({"t_live.LiveTests.test_x": "passed"})
+        self.assertEqual(status, 0, out)
+        (path,) = self.files()
+        self.assertEqual(path.name, "runtime-1.5.0-20261021T140300Z.json")
+        record = json.loads(path.read_text())
+        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["container_version"], "1.5.0")
+        self.assertEqual(record["generated_at"], "2026-10-21T14:03:00Z")
+        self.assertEqual(record["commit"], HEAD)
+        self.assertEqual(record["trees"], TREES)
+        self.assertEqual(record["result"], "passed")
+        self.assertEqual(
+            record["live"],
+            {"ran": 1, "passed": 1, "failed": 0, "skipped": 0, "not_run": 0, "declared": 1},
+        )
+        self.assertIn("evidence          : written to", out)
+        self.assertTrue(out.rstrip().endswith("result: success (live tier: ran)"))
+
+    def test_tree_hash_is_the_sha256_of_the_three_tree_lines(self):
+        self.evidence({"t_live.LiveTests.test_x": "passed"})
+        (path,) = self.files()
+        text = f"src {TREES['src']}\nscripts {TREES['scripts']}\ntests {TREES['tests']}"
+        self.assertEqual(
+            json.loads(path.read_text())["tree_hash"], hashlib.sha256(text.encode()).hexdigest()
+        )
+        self.assertEqual(validator.tree_hash(TREES), hashlib.sha256(text.encode()).hexdigest())
+
+    def test_counts_add_up(self):
+        outcomes = {f"t.T.test_{n}": "passed" for n in range(2)}
+        outcomes["t_live.LiveTests.test_x"] = "passed"
+        self.evidence(outcomes)
+        (path,) = self.files()
+        live = json.loads(path.read_text())["live"]
+        self.assertEqual(live["ran"], live["passed"] + live["failed"])
+        self.assertEqual(live["declared"], live["ran"])
+
+    def test_a_failed_test_writes_nothing_and_keeps_the_status(self):
+        outcomes = {"t_live.LiveTests.test_x": "passed", "t_live.LiveTests.test_y": "FAILED"}
+        status, out, _, _ = self.evidence(outcomes, returncode=1)
+        self.assertEqual(status, 1)
+        self.assertEqual(self.files(), [])
+        self.assertIn("evidence          : not written", out)
+
+    def test_a_skipped_test_writes_nothing(self):
+        outcomes = {"t_live.LiveTests.test_x": "passed", "t_live.LiveTests.test_y": "not run"}
+        status, out, _, _ = self.evidence(outcomes)
+        self.assertEqual(self.files(), [])
+        self.assertNotEqual(status, 0, out)
+
+    def test_nothing_ran_writes_nothing(self):
+        status, _, _, _ = self.evidence({}, declared=1)
+        self.assertEqual(self.files(), [])
+        self.assertEqual(status, 3)
+
+    def test_a_declared_test_that_never_reported_writes_nothing(self):
+        status, out, _, _ = self.evidence({"t_live.LiveTests.test_x": "passed"}, declared=2)
+        self.assertEqual(status, 3)
+        self.assertEqual(self.files(), [])
+        self.assertIn("not_run 1", out)
+        self.assertTrue(out.rstrip().endswith("result: incomplete (live tier did not run every declared test)"))
+
+    def test_skip_live_with_evidence_is_a_usage_error(self):
+        status, _, err, run_live = self.evidence(
+            {"t_live.LiveTests.test_x": "passed"}, extra=["--skip-live"]
+        )
+        self.assertEqual(status, 2)
+        self.assertIn("--skip-live", err)
+        self.assertEqual(self.files(), [])
+        self.assertEqual(run_live.calls, [])
+
+    def test_a_dirty_directory_refuses_before_running_anything(self):
+        for name in ("src", "scripts", "tests"):
+            with self.subTest(directory=name):
+                status, _, err, run_live = self.evidence(
+                    {"t_live.LiveTests.test_x": "passed"}, dirty=(name,)
+                )
+                self.assertEqual(status, 2)
+                self.assertIn(name, err)
+                self.assertEqual(self.files(), [])
+                self.assertEqual(run_live.calls, [])
+
+    def test_only_the_dirty_directory_is_named(self):
+        _, _, err, _ = self.evidence({"t_live.LiveTests.test_x": "passed"}, dirty=("scripts",))
+        self.assertIn("scripts", err)
+        self.assertNotIn("src", err)
+
+    def test_a_runtime_other_than_the_supported_one_refuses(self):
+        status, _, err, run_live = self.evidence({"t_live.LiveTests.test_x": "passed"}, version="9.9.9")
+        self.assertEqual(status, 2)
+        self.assertIn("9.9.9", err)
+        self.assertIn(validator.SUPPORTED_CONTAINER_VERSION, err)
+        self.assertEqual(self.files(), [])
+        self.assertEqual(run_live.calls, [])
+
+    def test_without_the_flag_nothing_is_written(self):
+        entries = [LIVE_ENTRY]
+        runtime = FakeRuntime(help_results={("run",): (0, "  --live-flag\n")})
+        run_live = make_run_live(True, {"t_live.LiveTests.test_x": "passed"})
+        with mock.patch.object(validator.compat_matrix, "load", return_value=entries):
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = validator.main(
+                    ["--evidence-dir", str(self.out)], runtime=runtime, run_live=run_live
+                )
+        self.assertEqual(status, 0)
+        self.assertEqual(self.files(), [])
 
 
 class CompoundApplePartsTests(unittest.TestCase):

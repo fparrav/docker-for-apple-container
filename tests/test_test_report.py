@@ -12,6 +12,8 @@ process.
 from __future__ import annotations
 
 import sys
+import tempfile
+import textwrap
 import types
 import unittest
 from unittest.mock import patch
@@ -300,6 +302,181 @@ class TestReleaseNotes(unittest.TestCase):
         report = self._report(records, {"unit", "fake"})
         notes = test_report.render_release_notes(report, "1.5.0")
         self.assertIn("1.5.0", notes)
+
+
+# -- declared_tests: the static count behind --require ------------------------
+
+
+class TestDeclaredTests(unittest.TestCase):
+    def _scan(self, tier, **modules):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, source in modules.items():
+                (root / (name + ".py")).write_text(textwrap.dedent(source), encoding="utf-8")
+            return test_report.declared_tests(tier, root)
+
+    def test_counts_decorated_test_functions_per_tier(self):
+        live = """
+            TIER = "live"
+            import tiers
+
+            @tiers.live_tier()
+            def test_a(): pass
+
+            def test_b(): pass
+
+            @tiers.live_tier(run=None)
+            def helper(): pass
+            """
+        conformance = """
+            TIER = "conformance"
+            from tiers import conformance_tier
+
+            @conformance_tier()
+            def test_c(): pass
+            """
+        self.assertEqual(
+            self._scan("live", test_one=live, test_two=conformance), ["test_one.test_a"]
+        )
+        self.assertEqual(
+            self._scan("conformance", test_one=live, test_two=conformance),
+            ["test_two.test_c"],
+        )
+
+    def test_class_methods_are_found(self):
+        source = """
+            TIER = "live"
+            import tiers
+
+            class Suite:
+                @tiers.live_tier()
+                def test_m(self): pass
+            """
+        self.assertEqual(self._scan("live", test_cls=source), ["test_cls.Suite.test_m"])
+
+    def test_module_of_another_tier_is_ignored(self):
+        source = """
+            TIER = "unit"
+            import tiers
+
+            @tiers.live_tier()
+            def test_throwaway(): pass
+            """
+        self.assertEqual(self._scan("live", test_unit=source), [])
+
+    def test_unparseable_module_is_skipped(self):
+        good = """
+            TIER = "live"
+            import tiers
+
+            @tiers.live_tier()
+            def test_ok(): pass
+            """
+        self.assertEqual(
+            self._scan("live", test_bad="def (:\n", test_good=good), ["test_good.test_ok"]
+        )
+
+    def test_invalid_tier_raises(self):
+        for tier in ("unit", "fake", "other"):
+            with self.subTest(tier=tier):
+                with self.assertRaises(ValueError):
+                    test_report.declared_tests(tier)
+
+    def test_the_repository_declares_tests_for_both_opt_in_tiers(self):
+        self.assertGreater(len(test_report.declared_tests("live")), 0)
+        self.assertGreater(len(test_report.declared_tests("conformance")), 0)
+
+
+# -- --require: a tier that must run completely -----------------------------
+
+
+def _rec(tier, name, outcome, reason=None):
+    record = {"id": "m." + name, "tier": tier, "outcome": outcome}
+    if reason is not None:
+        record["reason"] = reason
+    return record
+
+
+def _declared(count):
+    return lambda tier: ["m.t%d" % i for i in range(count)]
+
+
+class TestUnmetRequirements(unittest.TestCase):
+    def test_complete_tier_has_no_problem(self):
+        records = [_rec("conformance", "a", "passed"), _rec("conformance", "b", "passed")]
+        self.assertEqual(test_report.unmet_requirements(records, ["conformance"], _declared(2)), [])
+
+    def test_not_run_tests_are_listed_with_their_reason(self):
+        records = [_rec("conformance", "a", "not run", "tier not enabled")]
+        problems = test_report.unmet_requirements(records, ["conformance"], _declared(1))
+        self.assertTrue(any("m.a is not run (tier not enabled)" in p for p in problems))
+
+    def test_skipped_test_is_named(self):
+        records = [_rec("live", "a", "passed"), _rec("live", "b", "skipped", "no image")]
+        problems = test_report.unmet_requirements(records, ["live"], _declared(2))
+        self.assertTrue(any("m.b is skipped (no image)" in p for p in problems))
+
+    def test_fewer_passed_than_declared_gives_both_counts(self):
+        records = [_rec("conformance", "a", "passed")]
+        problems = test_report.unmet_requirements(records, ["conformance"], _declared(3))
+        self.assertIn("conformance: 3 declared in the sources, 1 passed", problems)
+
+    def test_tier_without_declared_tests_is_unmet(self):
+        problems = test_report.unmet_requirements([], ["live"], _declared(0))
+        self.assertTrue(any("no test declares this tier" in p for p in problems))
+
+    def test_other_tiers_do_not_count(self):
+        records = [_rec("unit", "a", "passed"), _rec("live", "b", "passed")]
+        problems = test_report.unmet_requirements(records, ["conformance"], _declared(1))
+        self.assertIn("conformance: 1 declared in the sources, 0 passed", problems)
+
+    def test_long_lists_are_summarised(self):
+        records = [_rec("live", "t%d" % i, "not run", "off") for i in range(8)]
+        problems = test_report.unmet_requirements(records, ["live"], _declared(8))
+        self.assertIn("live: and 3 more not passed", problems)
+
+
+class TestRequireFlag(unittest.TestCase):
+    def _main(self, modules, declared, extra=()):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            argv = ["--report", str(report), "--tiers", "conformance", *extra]
+            with patch.object(test_report, "discover_test_modules", return_value=modules), \
+                    patch.object(test_report, "declared_tests", declared), \
+                    patch.dict("os.environ", {}, clear=False), \
+                    patch("sys.stdout"), patch("sys.stderr"):
+                status = test_report.main(argv)
+            return status, report.exists()
+
+    def test_unmet_requirement_exits_3_and_still_writes_the_report(self):
+        module = _make_module("syn_req_skip", "conformance", [("test_a", "skip", "no engine")])
+        status, written = self._main({module.__name__: module}, _declared(1), ["--require", "conformance"])
+        self.assertEqual((status, written), (3, True))
+
+    def test_met_requirement_exits_0(self):
+        module = _make_module("syn_req_ok", "conformance", [("test_a", "pass", None)])
+        status, _ = self._main({module.__name__: module}, _declared(1), ["--require", "conformance"])
+        self.assertEqual(status, 0)
+
+    def test_without_the_flag_a_skip_still_exits_0(self):
+        module = _make_module("syn_req_off", "conformance", [("test_a", "skip", "no engine")])
+        status, _ = self._main({module.__name__: module}, _declared(1))
+        self.assertEqual(status, 0)
+
+    def test_a_failure_keeps_exit_1(self):
+        module = _make_module("syn_req_fail", "conformance", [("test_a", "fail", "boom")])
+        status, _ = self._main({module.__name__: module}, _declared(1), ["--require", "conformance"])
+        self.assertEqual(status, 1)
+
+    def test_a_tier_that_is_not_enabled_is_unmet(self):
+        module = _make_module("syn_req_disabled", "live", [("test_a", "pass", None)])
+        status, _ = self._main({module.__name__: module}, _declared(1), ["--require", "live"])
+        self.assertEqual(status, 3)
+
+    def test_unit_cannot_be_required(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit) as raised:
+            test_report.main(["--require", "unit"])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

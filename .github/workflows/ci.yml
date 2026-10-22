@@ -50,7 +50,10 @@ jobs:
       - name: Conformance test report
         # SHIM_CONFORMANCE_DOCKER must point at the runner's real Docker
         # client: on a Mac with this project installed, `docker` is the shim.
-        run: SHIM_TIERS=conformance SHIM_CONFORMANCE_DOCKER=$(which docker) python3 scripts/test_report.py
+        # --require makes the job fail (exit 3) when any conformance test is
+        # not run, skipped or missing, so a runner without Docker cannot pass
+        # with zero executed tests.
+        run: SHIM_TIERS=conformance SHIM_CONFORMANCE_DOCKER=$(which docker) python3 scripts/test_report.py --require conformance
       - name: Record Docker and Compose versions in the report
         if: always()
         run: |

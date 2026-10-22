@@ -1009,6 +1009,7 @@ def _classify_and_translate_volume(
     ensured_volumes: set[str],
     service: str = "",
     image: str = "",
+    renew_anonymous: bool = False,
 ) -> list[str]:
     """Translate one compose volume entry into `container run` args.
 
@@ -1020,7 +1021,14 @@ def _classify_and_translate_volume(
         planned = _entry_mount(entry, project, service)
     except MountSpecError as exc:
         raise ShimError(f"compose: {exc}", 64)
-    return _emit_planned(planned, project, ensured_volumes, service=service, image=image)
+    return _emit_planned(
+        planned,
+        project,
+        ensured_volumes,
+        service=service,
+        image=image,
+        renew_anonymous=renew_anonymous,
+    )
 
 
 def _emit_planned(
@@ -1030,16 +1038,20 @@ def _emit_planned(
     *,
     service: str = "",
     image: str = "",
+    renew_anonymous: bool = False,
 ) -> list[str]:
     """The only effect of mount translation: create the volume on demand.
 
     A named volume is created empty; an anonymous one is created and filled
-    with the image's content at its target (Docker's copy-up).
+    with the image's content at its target (Docker's copy-up). With
+    ``renew_anonymous`` an existing anonymous volume is discarded first.
     """
     if planned.anonymous is not None:
         volume = planned.anonymous
         if volume.name not in ensured_volumes:
-            _ensure_anonymous_volume(volume, planned.mount.target, service, image)
+            _ensure_anonymous_volume(
+                volume, planned.mount.target, service, image, renew=renew_anonymous
+            )
             ensured_volumes.add(volume.name)
         return emit_mount(planned.mount)
     key, resource = planned.volume_key, planned.mount.source
@@ -1097,6 +1109,7 @@ def _build_run_args(
     boot_hosts: list[str] | None = None,
     config_hash: str | None = None,
     image_id: str | None = None,
+    renew_anonymous: bool = False,
 ) -> tuple[list[str], bool]:
     """Translate a service into `container run` args.
 
@@ -1186,7 +1199,14 @@ def _build_run_args(
         raise _mount_error(service, exc)
     for planned in planned_mounts:
         args.extend(
-            _emit_planned(planned, project, ensured_volumes, service=service.name, image=image)
+            _emit_planned(
+                planned,
+                project,
+                ensured_volumes,
+                service=service.name,
+                image=image,
+                renew_anonymous=renew_anonymous,
+            )
         )
 
     # Compose entrypoint follows the same string-splitting rules as command.
@@ -1954,16 +1974,52 @@ _SEED_DEST = "/shim-dest"
 _SEED_SCRIPT = 'if [ -d "$1" ]; then cp -a "$1"/. ' + _SEED_DEST + '/; fi'
 
 
-def _ensure_anonymous_volume(
-    volume: compose_resources.Resource, target: str, service: str, image: str
-) -> None:
-    """Create the anonymous volume once and fill it from ``image`` (design D5).
+def _discard_anonymous_volume(volume: compose_resources.Resource, service: str) -> None:
+    """Remove an existing anonymous volume of this project and service (design D2).
 
-    An existing volume is reused as it is: its data is never overwritten. When
-    the image's content cannot be copied the new volume is removed and the
-    command fails before the service starts.
+    Only a volume that carries the project, service and anonymous labels is
+    removed; one that merely has the deterministic name stops the command, and
+    so does a volume the runtime refuses to remove because something uses it.
     """
-    if _run_container_capture(["volume", "inspect", volume.name]).returncode == 0:
+    observed = _list_resources("volume").get(volume.name)
+    if observed is None:
+        return
+    if any(observed.get(name) != value for name, value in volume.labels.items()):
+        raise ShimError(
+            f"compose: service {service!r}: volume {volume.name} exists without the "
+            "labels Compose puts on its anonymous volumes; it was not removed. "
+            "Remove or rename it, then run up again",
+            1,
+        )
+    removed = _run_container_capture(["volume", "rm", volume.name])
+    if removed.returncode != 0:
+        detail = (removed.stderr or removed.stdout).strip()
+        raise ShimError(
+            f"compose: service {service!r}: could not remove the previous anonymous "
+            f"volume {volume.name} ({detail}); it may still be in use",
+            1,
+        )
+
+
+def _ensure_anonymous_volume(
+    volume: compose_resources.Resource,
+    target: str,
+    service: str,
+    image: str,
+    *,
+    renew: bool = False,
+) -> None:
+    """Create the anonymous volume and fill it from ``image`` (design D1, D5).
+
+    Without ``renew`` an existing volume is reused as it is: the container of
+    this service is being recreated and its data is never overwritten. With
+    ``renew`` (a new container, or ``up -V``) the existing volume is discarded
+    first. When the image's content cannot be copied the new volume is removed
+    and the command fails before the service starts.
+    """
+    if renew:
+        _discard_anonymous_volume(volume, service)
+    elif _run_container_capture(["volume", "inspect", volume.name]).returncode == 0:
         return
     label_args: list[str] = []
     for name, value in volume.labels.items():
@@ -2389,6 +2445,7 @@ def _create_service(
     warned: set[str],
     nets_by_service: dict[str, list[NetworkAttachment]],
     completes: bool,
+    renew_anonymous: bool = False,
 ) -> int:
     """`container run` for a service; return 0 or the failing exit code."""
     boot_hosts = _boot_hosts_lines(service, project, nets_by_service)
@@ -2401,6 +2458,7 @@ def _create_service(
         boot_hosts=boot_hosts,
         config_hash=config_hash,
         image_id=image_id,
+        renew_anonymous=renew_anonymous,
     )
     # A `service_completed_successfully` dependency runs in the foreground:
     # `container run` returns the container's own exit code (the runtime
@@ -2426,6 +2484,7 @@ def _create_service(
             warned=warned,
             config_hash=config_hash,
             image_id=image_id,
+            renew_anonymous=renew_anonymous,
         )
         result = _run_container_capture(["run", *run_args])
     if result.returncode != 0:
@@ -2479,6 +2538,7 @@ def cmd_up(
     remove_orphans: bool = False,
     no_deps: bool = False,
     dry_run: bool = False,
+    renew_anon_volumes: bool = False,
 ) -> int:
     # The plan is the single source of truth for what this `up` acts on: the
     # set that is validated and checked is the set that is created.
@@ -2598,6 +2658,10 @@ def cmd_up(
                 warned=warned,
                 nets_by_service=nets_by_service,
                 completes=completes,
+                # A brand-new container never inherits a volume left by `down`
+                # (Docker drops it with the container); a recreated one keeps it
+                # unless the user asked for -V.
+                renew_anonymous=action == "create" or renew_anon_volumes,
             )
             if rc != 0:
                 return rc
@@ -3434,6 +3498,7 @@ def _dispatch(
             bools={
                 "-d", "--detach", "--build", "--no-build", "--wait",
                 "--force-recreate", "--no-recreate", "--remove-orphans", "--no-deps",
+                "-V", "--renew-anon-volumes",
             },
         )
         if opts.flag("--force-recreate") and opts.flag("--no-recreate"):
@@ -3445,6 +3510,7 @@ def _dispatch(
             no_recreate=opts.flag("--no-recreate"),
             remove_orphans=opts.flag("--remove-orphans"),
             no_deps=opts.flag("--no-deps"),
+            renew_anon_volumes=opts.flag("-V") or opts.flag("--renew-anon-volumes"),
             detach=opts.flag("-d") or opts.flag("--detach"),
             build=opts.flag("--build"),
             no_build=opts.flag("--no-build"),

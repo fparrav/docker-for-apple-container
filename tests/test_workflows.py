@@ -11,6 +11,9 @@ file as text:
 - ``contents: write`` is granted only by the ``release`` job of
   ``release.yml``,
 - ``ci.yml`` uses no self-hosted runner,
+- the conformance job of ``ci.yml`` passes ``--require conformance`` (the
+  report step fails, exit 3, when any conformance test is not run, skipped,
+  or missing) and hard-codes no number of tests,
 - ``runtime.yml`` is not triggered by ``pull_request``,
 - no workflow references a package index (no ``pypi`` substring).
 
@@ -144,6 +147,37 @@ def check_no_pull_request_trigger(text: str) -> list[str]:
     return []
 
 
+def job_text(text: str, job: str) -> str:
+    """The text of one job under the top-level ``jobs:`` block.
+
+    From the ``  <job>:`` line (2-space indent) up to the next 2-space-indent
+    key (or a 0-space top-level key) or the end of the file.
+    """
+    lines = text.splitlines()
+    in_jobs = False
+    start = None
+    for index, line in enumerate(lines):
+        if not in_jobs:
+            if re.match(r"^jobs:\s*(#.*)?$", line):
+                in_jobs = True
+            continue
+        if re.match(rf"^  {re.escape(job)}:\s*(#.*)?$", line):
+            start = index
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 2:
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
 def check_no_self_hosted(text: str) -> list[str]:
     """Violations of the rule that the workflow uses no self-hosted runner."""
     return [
@@ -160,6 +194,62 @@ def check_no_pypi(text: str) -> list[str]:
         for number, line in enumerate(text.splitlines(), 1)
         if "pypi" in line.lower()
     ]
+
+
+def check_conformance_require(text: str) -> list[str]:
+    """Violations of the rule that the conformance job requires its tests.
+
+    The report step must pass ``--require conformance`` (exit 3 when any
+    conformance test is not run, skipped, or missing) and keep
+    ``if: always()`` on the later report-recording step, and the workflow
+    must not hard-code a number of tests (no ``--expect``/``--count`` flag,
+    no digit count next to the word "tests").
+    """
+    violations: list[str] = []
+    job = job_text(text, "conformance")
+    if "--require conformance" not in job:
+        violations.append(
+            "conformance job does not pass `--require conformance` to the report"
+        )
+    if "if: always()" not in job:
+        violations.append(
+            "conformance job is missing `if: always()` on the report-recording step"
+        )
+    for number, line in enumerate(text.splitlines(), 1):
+        if re.search(r"--(expect|count)\b", line) or re.search(
+            r"\b\d+\s+tests\b", line
+        ):
+            violations.append(f"line {number}: hard-codes a number of tests")
+    return violations
+
+
+def check_evidence_gate(text: str) -> list[str]:
+    """Violations of the release evidence rules (design D9) in ``release.yml``.
+
+    The verifier runs in ``checks`` with the tag passed through ``env`` (never
+    inline in the shell line), ``checks`` keeps ``contents: read``, and the
+    ``release`` job derives the channel, cites the evidence in the notes and
+    hands ``prerelease`` to the release action.
+    """
+    violations: list[str] = []
+    checks = job_text(text, "checks")
+    release = job_text(text, "release")
+    if "verify_release_evidence.py --tag" not in checks:
+        violations.append("checks job does not run the release evidence verifier")
+    if "TAG: ${{ github.ref_name }}" not in checks:
+        violations.append("checks job does not pass the tag through env")
+    if "contents: read" not in checks or "contents: write" in checks:
+        violations.append("checks job does not keep contents: read")
+    for number, line in enumerate(text.splitlines(), 1):
+        if "verify_release_evidence.py" in line and "${{" in line:
+            violations.append(f"line {number}: interpolates an expression into the shell line")
+    if "--print-channel" not in release:
+        violations.append("release job does not compute the channel")
+    if "--notes" not in release:
+        violations.append("release job does not cite the evidence in the notes")
+    if "prerelease: ${{ steps.channel.outputs.prerelease }}" not in release:
+        violations.append("release job does not pass prerelease to the release action")
+    return violations
 
 
 class WorkflowFileTests(unittest.TestCase):
@@ -245,6 +335,121 @@ class SyntheticWorkflowTests(unittest.TestCase):
         self.assertTrue(violations)
         self.assertTrue(
             any("actions/checkout@main" in violation for violation in violations)
+        )
+
+
+class EvidenceGateTests(unittest.TestCase):
+    """``release.yml`` gates final tags on live evidence (design D9)."""
+
+    def release_text(self) -> str:
+        return (WORKFLOWS_DIR / "release.yml").read_text(encoding="utf-8")
+
+    def test_release_workflow_satisfies_the_gate_rules(self) -> None:
+        self.assertEqual(check_evidence_gate(self.release_text()), [])
+
+    def test_evidence_step_is_in_checks_not_in_release(self) -> None:
+        text = self.release_text()
+        self.assertIn("Release evidence (final tags)", job_text(text, "checks"))
+        self.assertNotIn("Release evidence (final tags)", job_text(text, "release"))
+
+    def test_checks_keeps_read_only_permissions(self) -> None:
+        checks = job_text(self.release_text(), "checks")
+        self.assertIn("contents: read", checks)
+        self.assertNotIn("contents: write", checks)
+
+    def test_no_job_uses_a_self_hosted_runner(self) -> None:
+        self.assertEqual(check_no_self_hosted(self.release_text()), [])
+
+    def test_the_tag_is_never_interpolated_into_a_shell_line(self) -> None:
+        for number, line in enumerate(self.release_text().splitlines(), 1):
+            if "verify_release_evidence.py" in line and not line.lstrip().startswith("#"):
+                self.assertNotIn("${{", line, f"line {number}")
+                self.assertIn('"$TAG"', line)
+
+    def test_release_job_permissions_and_pins_are_unchanged(self) -> None:
+        text = self.release_text()
+        self.assertEqual(check_top_level_permissions(text), [])
+        self.assertEqual(check_uses_pinned(text), [])
+        self.assertEqual(len(contents_write_grants(text)), 1)
+
+    def test_synthetic_workflow_without_the_gate_fails(self) -> None:
+        text = (
+            "name: Synthetic\n"
+            "on:\n"
+            "  push:\n"
+            "jobs:\n"
+            "  checks:\n"
+            "    permissions:\n"
+            "      contents: read\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+            "  release:\n"
+            "    permissions:\n"
+            "      contents: write\n"
+            "    steps:\n"
+            "      - run: echo ok\n"
+        )
+        violations = check_evidence_gate(text)
+        self.assertGreaterEqual(len(violations), 4)
+
+    def test_tag_interpolated_inline_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            'python3 scripts/verify_release_evidence.py --tag "$TAG"\n',
+            "python3 scripts/verify_release_evidence.py --tag ${{ github.ref_name }}\n",
+            1,
+        )
+        self.assertTrue(
+            any("interpolates" in violation for violation in check_evidence_gate(text))
+        )
+
+
+class ConformanceRequireTests(unittest.TestCase):
+    """The conformance job of ``ci.yml`` requires every test to run (design D9).
+
+    ``--require conformance`` makes the report step fail (exit 3) when any
+    conformance test is not run, skipped, or missing, so a runner without
+    Docker cannot pass with zero executed tests.
+    """
+
+    def ci_text(self) -> str:
+        return (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
+
+    def test_conformance_job_passes_require_conformance(self) -> None:
+        job = job_text(self.ci_text(), "conformance")
+        self.assertIn("--require conformance", job)
+
+    def test_conformance_job_keeps_if_always(self) -> None:
+        job = job_text(self.ci_text(), "conformance")
+        self.assertIn("if: always()", job)
+
+    def test_workflow_hard_codes_no_test_count(self) -> None:
+        text = self.ci_text()
+        job = job_text(text, "conformance")
+        self.assertIsNone(re.search(r"--(expect|count)\b", text))
+        self.assertIsNone(re.search(r"--(expect|count)\b", job))
+        self.assertEqual(check_conformance_require(text), [])
+
+    def test_synthetic_workflow_without_the_flag_fails(self) -> None:
+        text = (
+            "name: Synthetic\n"
+            "on:\n"
+            "  push:\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  conformance:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Conformance test report\n"
+            "        run: python3 scripts/test_report.py\n"
+            "      - name: Record versions\n"
+            "        if: always()\n"
+            "        run: echo ok\n"
+        )
+        violations = check_conformance_require(text)
+        self.assertTrue(violations)
+        self.assertTrue(
+            any("--require conformance" in violation for violation in violations)
         )
 
 

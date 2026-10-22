@@ -1509,7 +1509,7 @@
     "apple": null,
     "evidence": "live",
     "test": "test_live_fixtures.LiveFixtureTests.test_fixture_t_local_bind_volume_writes_reach_host_and_down_v_keeps_them",
-    "note": "Only the local bind idiom (driver local or unset; type none; o of bind, rbind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable."
+    "note": "Only the local bind idiom (driver local or unset; type none; o of bind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable; o: rbind is refused with a message pointing to bind because its recursive effect cannot be verified on virtiofs."
   },
   {
     "id": "compose top-level volumes.external",
@@ -1616,8 +1616,8 @@
     "status": "SUPPORTED",
     "apple": null,
     "evidence": "live",
-    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_and_down_v_removes",
-    "note": "A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled once from the image's content at the target (copy-up) by a helper container, reused on recreation and removed by down -v; if the copy fails the volume is removed and up exits 1."
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_down_v_removes",
+    "note": "A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled from the image's content at the target (copy-up) by a helper container when a container of the service is created, reused only when an existing container is recreated, discarded and seeded again by up after down (only if it carries the project, service and anonymous labels), and removed by down -v; if the copy fails the volume is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down)."
   },
   {
     "id": "compose volumes.bind",
@@ -1951,6 +1951,15 @@
     "evidence": "live",
     "test": "test_live_compose.LiveComposeTests.test_api_reaches_postgres_and_data_survives_down_and_up",
     "note": "No background monitoring or restarts; every key is validated first, and keys with no Apple equivalent are refused (REFUSED) or reported (NOT APPLIED)."
+  },
+  {
+    "id": "compose up --renew-anon-volumes",
+    "kind": "option",
+    "status": "SUPPORTED",
+    "apple": null,
+    "evidence": "live",
+    "test": "test_live_fixtures.LiveFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_down_v_removes",
+    "note": "-V / --renew-anon-volumes discards and seeds again the anonymous volumes of the services that up recreates; a kept or only started container and named volumes are untouched, and --dry-run changes nothing."
   },
   {
     "id": "compose up --no-deps",

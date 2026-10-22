@@ -352,7 +352,9 @@ when available, then fall back to stable service-name order from labels.
   together with the services that depend on it, printing what is recreated and
   why. `--force-recreate` recreates everything, `--no-recreate` never recreates
   an existing container (it still creates missing ones); the two are mutually
-  exclusive. Containers of services no longer in the file are reported as
+  exclusive. `-V` (`--renew-anon-volumes`) also discards the anonymous volumes
+  of the services being recreated (see *Anonymous volumes* below). Containers of
+  services no longer in the file are reported as
   orphans and removed only with `--remove-orphans`. All images are resolved
   before any container is touched, and a failing service is named in the error
   while the services that already started keep running; fixing the file and
@@ -450,17 +452,29 @@ at the target into the new volume, as Docker does. This needs `/bin/sh` and
 `cp` in the image; if the copy fails, the volume is removed and `up` exits 1
 naming the service, image and target, instead of starting the service with an
 empty directory. An existing volume is never filled again, so data survives
-recreating the container, and `down -v` removes the project's anonymous volumes
-(a plain `down` keeps them, unlike Docker, which drops them). Apple volumes carry
-a `lost+found` directory at their root, also in a volume that was filled from the
-image. Named volumes get no copy-up (existing behavior).
+recreating an existing container of the service, as in Docker. A new container
+never inherits one: `docker compose down` followed by `up` gives the service a
+fresh anonymous volume seeded from the image again (a plain `down` leaves the
+volume behind, and the next `up` that creates the container discards it; only a
+volume labelled for that project and service is removed, and an unlabelled one
+with the same name stops `up`). **Breaking change:** data that used to survive
+`down` + `up` in an anonymous volume no longer does; use a named volume for data
+that must persist. `up -V` (`--renew-anon-volumes`) discards and seeds again the
+anonymous volumes of the services it recreates; it does nothing to a container
+that is kept or only started, and never touches named volumes. `down -v` removes
+the project's anonymous volumes. Apple volumes carry a `lost+found` directory at
+their root, also in a volume that was filled from the image. Named volumes get no
+copy-up (existing behavior).
 
 **Local-driver bind volumes.** A top-level volume with `driver: local` (or none)
-and `driver_opts` `type: none`, `o: bind` (optionally `rbind`, `ro`, `rw`) and an
+and `driver_opts` `type: none`, `o: bind` (optionally with `ro` or `rw`) and an
 absolute `device` is mounted as a bind mount of that path; no Apple volume is
 created, and `down -v` never touches the host directory. Any other `driver_opts`
 (for example `type: nfs`, a relative `device`, or an extra `o` token) is refused
-naming the option.
+naming the option. `o: rbind` is refused with exit 64 and a message pointing to
+`bind`: the recursive flag has no effect that can be verified on Apple's or
+Docker Desktop's virtiofs mounts, so the shim does not claim it. **Breaking
+change:** a volume that used `rbind` must use `bind`.
 
 **Network options.** `com.docker.network.bridge.name` only names a Linux bridge,
 so it prints `NOT APPLIED:`; every other network `driver_opts` key is refused.
@@ -838,7 +852,7 @@ API). Known differences are called out in the `note` column.
 | compose top-level services | SUPPORTED | - | fake | Each entry becomes a service, started in topological (dependency) order. |
 | compose top-level volumes | PARTIAL | - | live | Parsed and shown by `config`; named volumes are created on demand from service references. |
 | compose top-level volumes.driver | SUPPORTED | - | unit | Honoured when creating the resource. |
-| compose top-level volumes.driver_opts | PARTIAL | - | live | Only the local bind idiom (driver local or unset; type none; o of bind, rbind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable. |
+| compose top-level volumes.driver_opts | PARTIAL | - | live | Only the local bind idiom (driver local or unset; type none; o of bind, ro, rw; absolute device) is translated to a bind mount of the device path, with no Apple volume. Any other driver_opts is refused with exit 64 naming the option, not waivable; o: rbind is refused with a message pointing to bind because its recursive effect cannot be verified on virtiofs. |
 | compose top-level volumes.external | SUPPORTED | - | live | Mounted by its own name (`name:` or the key); never created, relabelled or removed. `up` exits 1 naming the volume and service when it does not exist; a leftover `<project>_<key>` copy from earlier versions only gets a notice. |
 | compose top-level volumes.labels | SUPPORTED | - | unit | Honoured when creating the resource. |
 | compose top-level volumes.name | SUPPORTED | - | fake | Used verbatim as the runtime volume name, without the project prefix. |
@@ -850,7 +864,7 @@ API). Known differences are called out in the `note` column.
 | compose uts | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line) unless named in CONTAINER_DOCKER_SHIM_ALLOW_UNENFORCED: Apple container 1.5.0 has no equivalent. |
 | compose volumes | PARTIAL | -v | live | Host paths become --mount binds (ro becomes readonly, other mode flags dropped); bare names become project-scoped named volumes on -v. |
 | compose volumes.Z | UNSUPPORTED | - | unit | Refused with exit 64 (REFUSED line), not waivable: SELinux relabeling has no Apple container equivalent and macOS has no SELinux; remove the option. |
-| compose volumes.anonymous | SUPPORTED | - | live | A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled once from the image's content at the target (copy-up) by a helper container, reused on recreation and removed by down -v; if the copy fails the volume is removed and up exits 1. |
+| compose volumes.anonymous | SUPPORTED | - | live | A volume entry without a source becomes a project-labelled volume <project>_<service>_anon-<hash of target>, filled from the image's content at the target (copy-up) by a helper container when a container of the service is created, reused only when an existing container is recreated, discarded and seeded again by up after down (only if it carries the project, service and anonymous labels), and removed by down -v; if the copy fails the volume is removed and up exits 1. The same marker/recreate/up -V/down+up sequence runs against Docker in the conformance tier (test_conformance_fixtures.ConformanceFixtureTests.test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_fresh_after_down). |
 | compose volumes.bind | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.cached | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
 | compose volumes.consistency | SUPPORTED | - | unit | Accepted in short and long volume syntax. |
@@ -910,6 +924,7 @@ API). Known differences are called out in the `note` column.
 | build --ulimit | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no build ulimit flag. |
 | build -c | UNSUPPORTED | - | fake | Docker -c sets CPU weight shares (a relative fraction of CPU time); Apple container --cpus specifies an integer count of CPUs. Refused with exit 64 and a message naming both meanings. D1 option semantics: build -c; see tests/option_semantics.py. |
 | compose up --no-deps | SUPPORTED | - | fake | Creates only the named services and prints a notice listing the skipped dependencies. |
+| compose up --renew-anon-volumes | SUPPORTED | - | live | -V / --renew-anon-volumes discards and seeds again the anonymous volumes of the services that up recreates; a kept or only started container and named volumes are untouched, and --dry-run changes nothing. |
 | run --add-host | UNSUPPORTED | - | fake | Refused with exit 64; Apple container 1.5.0 documents no add-host flag. |
 | run --arch | SUPPORTED | --arch | fake | Apple-only extension (not a Docker run option); forwarded to Apple container 1.5.0 --arch. D1 option semantics: run --arch; see tests/option_semantics.py. |
 | run --cap-add | SUPPORTED | --cap-add | fake | Forwarded verbatim; the runtime normalizes names to CAP_*. D1 option semantics: run --cap-add; see tests/option_semantics.py. |

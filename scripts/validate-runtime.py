@@ -15,15 +15,26 @@ The output is a per-entry evidence table plus a summary. A tier that did not
 run is reported as "not run", never as passed. The script never edits the
 supported-version constant: advancing it stays a deliberate, separate change.
 
+Release evidence
+    ``--evidence`` also writes ``docs/evidence/runtime-<version>-<UTC>.json``
+    when the validation fully succeeded: every live test the sources declare
+    ran and passed, on the supported ``container`` release, from a clean tree.
+    The file records the runtime version, a hash of the git trees of ``src/``,
+    ``scripts/`` and ``tests/`` at ``HEAD``, the UTC time and the live counts;
+    ``scripts/verify_release_evidence.py`` checks it at release time. Nothing is
+    written for a failed, partial or ``--skip-live`` run.
+
 Usage:
     scripts/validate-runtime.py [--container PATH] [--skip-live] [--output FILE]
+                                [--evidence [--evidence-dir DIR]]
 
 Exit status:
     0  every requested check ran and held (or --skip-live with no problem)
     1  a check failed (a missing Apple flag, a failed live test, a runner error)
     2  usage error or invalid matrix
     3  incomplete: the live tier was requested but no test ran, or a live
-       entry's test did not run
+       entry's test did not run, or (with --evidence) the live tier did not run
+       every test the sources declare
 
 When 1 and 3 both apply, 1 wins. The summary always ends with a ``result:``
 line stating which case applies.
@@ -31,21 +42,31 @@ line stating which case applies.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat_matrix  # noqa: E402
+import test_report  # noqa: E402
 from container_docker_shim.cli import SUPPORTED_CONTAINER_VERSION  # noqa: E402
 
 HELP_TIMEOUT = 20
 LIVE_TIMEOUT = 3600
+
+EVIDENCE_DIR = ROOT / "docs" / "evidence"
+EVIDENCE_SCHEMA = 1
+# The directories whose git trees bind the evidence to the code it tested.
+EVIDENCE_TREES = ("src", "scripts", "tests")
 
 # Matrix id prefix -> the Apple command whose --help documents its flags.
 OPTION_COMMANDS = {"run": ["run"], "build": ["build"]}
@@ -180,12 +201,101 @@ def _verdict(skip_live: bool, live_ran: bool, not_run: list, problems: int) -> t
     return 0, f"result: success ({detail})"
 
 
-def main(argv: list = None, *, runtime: "Runtime" = None, run_live=None) -> int:
+def _git(args: list) -> str:
+    """Stdout of ``git <args>`` in the repository; raises on a non-zero exit."""
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True
+    )
+    return result.stdout
+
+
+def tree_hash(trees: dict) -> str:
+    """One sha256 over the tree identifiers, in the order of ``EVIDENCE_TREES``.
+
+    The verifier recomputes the same value from the tagged commit, so the two
+    must agree on this exact text (design D8).
+    """
+    text = "\n".join(f"{name} {trees[name]}" for name in EVIDENCE_TREES)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def dirty_trees(git) -> list:
+    """The evidence directories with tracked changes or untracked files."""
+    return [name for name in EVIDENCE_TREES if git(["status", "--porcelain", "--", name]).strip()]
+
+
+def live_counts(outcomes: dict, declared: int) -> dict:
+    """The record of one live run.
+
+    ``ran`` counts the tests that executed to a verdict; a skipped test is
+    ``skipped`` and a declared test that never reported is ``not_run``.
+    """
+    passed = sum(1 for value in outcomes.values() if value == "passed")
+    failed = sum(1 for value in outcomes.values() if value == "FAILED")
+    skipped = sum(1 for value in outcomes.values() if value == "not run")
+    return {
+        "ran": passed + failed,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "not_run": max(declared - len(outcomes), 0),
+        "declared": declared,
+    }
+
+
+def evidence_complete(live: dict) -> bool:
+    """True only when every declared live test ran and passed."""
+    return (
+        live["declared"] > 0
+        and live["ran"] == live["passed"] == live["declared"]
+        and live["failed"] == live["skipped"] == live["not_run"] == 0
+    )
+
+
+def write_evidence(directory: Path, version: str, live: dict, git, now: datetime) -> Path:
+    """Write the evidence file for ``HEAD`` and return its path."""
+    trees = {name: git(["rev-parse", f"HEAD:{name}"]).strip() for name in EVIDENCE_TREES}
+    record = {
+        "schema": EVIDENCE_SCHEMA,
+        "container_version": version,
+        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commit": git(["rev-parse", "HEAD"]).strip(),
+        "trees": trees,
+        "tree_hash": tree_hash(trees),
+        "live": live,
+        "result": "passed",
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"runtime-{version}-{now.strftime('%Y%m%dT%H%M%SZ')}.json"
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def main(
+    argv: list = None,
+    *,
+    runtime: "Runtime" = None,
+    run_live=None,
+    git=None,
+    declared: int = None,
+    now: datetime = None,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--container", default=os.environ.get("CONTAINER_DOCKER_SHIM_CONTAINER") or "container")
     parser.add_argument("--skip-live", action="store_true", help="only run the read-only matrix check")
     parser.add_argument("--output", help="also write the summary to this file")
+    parser.add_argument(
+        "--evidence",
+        action="store_true",
+        help="after a full successful live run, write the release evidence file",
+    )
+    parser.add_argument(
+        "--evidence-dir", default=str(EVIDENCE_DIR), help="where --evidence writes (default docs/evidence)"
+    )
     args = parser.parse_args(argv)
+    if args.evidence and args.skip_live:
+        print("--evidence needs the live tier: it cannot be combined with --skip-live", file=sys.stderr)
+        return 2
 
     if runtime is None:
         runtime = Runtime(args.container)
@@ -197,6 +307,25 @@ def main(argv: list = None, *, runtime: "Runtime" = None, run_live=None) -> int:
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"cannot run {args.container}: {exc}", file=sys.stderr)
         return 2
+    if args.evidence:
+        found = re.search(r"\d+\.\d+\.\d+", version or "")
+        if not found or found.group(0) != SUPPORTED_CONTAINER_VERSION:
+            print(
+                f"--evidence needs the supported container release {SUPPORTED_CONTAINER_VERSION}, "
+                f"found {version or 'unavailable'}",
+                file=sys.stderr,
+            )
+            return 2
+        git = git or _git
+        dirty = dirty_trees(git)
+        if dirty:
+            print(
+                "--evidence hashes HEAD, but these directories differ from it: "
+                + ", ".join(dirty)
+                + "; commit or discard the changes first",
+                file=sys.stderr,
+            )
+            return 2
     lines = [
         f"candidate runtime : {version or 'unavailable'}",
         f"supported version : {SUPPORTED_CONTAINER_VERSION} (this script never changes it)",
@@ -243,6 +372,27 @@ def main(argv: list = None, *, runtime: "Runtime" = None, run_live=None) -> int:
     lines += rows
     lines += ["", f"entries: {len(entries)}; problems: {problems}"]
     status, footer = _verdict(args.skip_live, live_ran, not_run, problems)
+    if args.evidence and status == 0:
+        live = live_counts(
+            outcomes,
+            len(test_report.declared_tests("live")) if declared is None else declared,
+        )
+        counts = ", ".join(f"{key} {value}" for key, value in live.items())
+        if evidence_complete(live):
+            path = write_evidence(
+                Path(args.evidence_dir),
+                SUPPORTED_CONTAINER_VERSION,
+                live,
+                git,
+                now or datetime.now(timezone.utc),
+            )
+            lines.append(f"evidence          : written to {path} ({counts})")
+        else:
+            status = 3
+            footer = "result: incomplete (live tier did not run every declared test)"
+            lines.append(f"evidence          : not written ({counts})")
+    elif args.evidence:
+        lines.append("evidence          : not written (validation did not succeed)")
     lines.append(footer)
     text = "\n".join(lines)
     print(text)

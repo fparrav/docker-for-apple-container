@@ -820,8 +820,17 @@ class LiveFixtureTests(unittest.TestCase):
         control = harness.compose("exec", "-T", "writer", "touch", "/rw/y")
         self.assertEqual(control.returncode, 0, f"write to /rw/y failed: {control.stdout + control.stderr}")
 
+    def assert_marker(self, harness: "FixtureHarness", *, present: bool, why: str) -> None:
+        """The marker file in the fixture-S anonymous volume is (not) there."""
+        found = harness.compose("exec", "-T", "app", "cat", "/etc/apk/marker")
+        if present:
+            self.assertEqual(found.returncode, 0, why + ": " + found.stdout + found.stderr)
+            self.assertEqual(found.stdout, "kept")
+        else:
+            self.assertNotEqual(found.returncode, 0, why + ": " + found.stdout)
+
     @tiers.live_tier()
-    def test_fixture_s_anonymous_volumes_copy_up_reuse_and_down_v_removes(self) -> None:
+    def test_fixture_s_anonymous_volumes_copy_up_reuse_renew_and_down_v_removes(self) -> None:
         self.require_images("alpine:3.20")
         harness = FixtureHarness(self, FIXTURE_S)
         project = harness.project
@@ -874,7 +883,35 @@ class LiveFixtureTests(unittest.TestCase):
             "the recreated container lost the image content already in the volume",
         )
 
-        # 6. `down -v` removes the project's anonymous volumes: no volume
+        # 6. `up -V` on a recreate (REV=3) discards the anonymous volumes and
+        #    seeds them again from the image: the marker is gone, the image
+        #    content is back.
+        with mock.patch.dict(os.environ, {"REV": "3"}):
+            result = harness.compose("up", "-d", "-V", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=False, why="up -V kept the old anonymous volume")
+        repositories = harness.compose("exec", "-T", "app", "cat", "/etc/apk/repositories")
+        self.assertEqual(repositories.returncode, 0, repositories.stdout + repositories.stderr)
+        self.assertTrue(
+            repositories.stdout.strip(),
+            "up -V did not seed the new anonymous volume from the image",
+        )
+
+        # 7. A full `down` followed by `up` gives the service a fresh volume,
+        #    as Docker does: write the marker again, go through the cycle and
+        #    it is gone.
+        marker = harness.compose(
+            "exec", "-T", "app", "sh", "-c", "printf kept > /etc/apk/marker"
+        )
+        self.assertEqual(marker.returncode, 0, marker.stdout + marker.stderr)
+        self.assert_marker(harness, present=True, why="the marker was not written")
+        result = harness.compose("down")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_marker(harness, present=False, why="down + up kept the old anonymous volume")
+
+        # 8. `down -v` removes the project's anonymous volumes: no volume
         #    whose name starts with the project and contains `_app_anon-`
         #    remains.
         result = harness.compose("down", "-v")

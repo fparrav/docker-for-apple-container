@@ -22,11 +22,20 @@ is no manual dispatch, no pull request path, and no schedule.
 The tag must be a valid PEP 440 version: the package version is derived from
 the tag by `hatch-vcs` (`[tool.hatch.version] source = "vcs"` in
 `pyproject.toml`). `v0.1.0` builds; a label such as `v0.0.1-spike` fails the
-build, because `-spike` is not a valid PEP 440 pre-release label (the valid
-pre-release labels are `a`, `b`, `c`, `rc`, `alpha`, `beta`, `pre`,
-`preview`, and `dev`; `v0.1.0rc1` and `v0.1.0-rc1` are fine). A tag that does
-not parse stops the workflow in the build step; delete it and re-tag if you
-made a mistake.
+build, because `-spike` is not a valid PEP 440 pre-release label. A tag that
+does not parse stops the workflow in the build step; delete it and re-tag if
+you made a mistake.
+
+The release workflow accepts two kinds of tag and nothing else:
+
+- **Final**: `vX.Y.Z`. It needs live evidence (see
+  [Release evidence](#release-evidence)) and is published as a normal release.
+- **Pre-release**: `vX.Y.Zrc1`, `vX.Y.Za1`, `vX.Y.Zb1` or `vX.Y.Z.dev1`. No
+  evidence is required, and the release is published as a GitHub pre-release
+  whose notes say that live evidence was not required.
+
+Any other tag (`v0.1.0-rc1`, `v0.1.0.post1`, `v0.1.0-spike`) fails the
+evidence check in the `checks` job before anything is built.
 
 An untagged commit builds a development version
 (`0.1.dev<distance>+<node>`), never a release version, so a build without a
@@ -40,13 +49,16 @@ runners:
 1. `checks` (hosted checks, `contents: read`): the test report for the `unit`
    and `fake` tiers (`scripts/test_report.py --tiers unit,fake`), the
    compatibility matrix schema and coverage tests, the README compatibility
-   block check, and a byte-compile of the sources.
+   block check, a byte-compile of the sources, and the release evidence
+   verifier (`scripts/verify_release_evidence.py --tag "$TAG"`, with the tag
+   passed through the environment).
 2. `release` (`needs: checks`, `contents: write` — the only job with write
    permission): checks out with full history so `hatch-vcs` can derive the
    version from the tag, builds the sdist and wheel (`python -m build`),
-   generates the release notes, and creates the GitHub Release with
-   `softprops/action-gh-release`, attaching everything in `dist/` and using
-   the generated notes as the body.
+   generates the release notes, appends the live evidence section, and
+   creates the GitHub Release with `softprops/action-gh-release`, attaching
+   everything in `dist/`, using the notes as the body and marking pre-release
+   tags as pre-releases.
 
 The release job runs only after the checks pass. It uses GitHub's
 job-scoped `GITHUB_TOKEN` with `contents: write` to create the release; it
@@ -71,16 +83,58 @@ order:
   a "Compatibility claims not reached in this run" section listing each
   flagged entry with its claimed and reached level.
 
-Because the release workflow runs only the `unit` and `fake` tiers, the notes
-of every release state that the `live` and `conformance` tiers did not run:
-a release never claims Apple runtime or Docker Engine evidence that the
-release build did not produce. Runtime evidence comes from the manual runs
-described in [Running the runtime workflow](#running-the-runtime-workflow)
-and from developer machines.
+Because the release workflow runs only the `unit` and `fake` tiers, the test
+lines of every release state that the `live` and `conformance` tiers did not
+run: a release never claims Apple runtime or Docker Engine evidence that the
+release build did not produce. The live runtime evidence is stated in its own
+section, appended after those lines: for a final tag it names the evidence file,
+the Apple `container` version, the UTC date and the live counts; for a
+pre-release it says that live evidence was not required.
 
 If a release has user-visible breaking changes (the first release renames the
 distribution), add a short "Breaking changes" section to the release body on
 GitHub after the workflow creates it.
+
+## Release evidence
+
+Hosted runners cannot run the `live` tier, so a final release is gated on a
+file that a maintainer produces on a macOS 26 machine and commits. The
+sequence for a final release `vX.Y.Z`:
+
+1. Start from a clean tree: `git status --porcelain -- src scripts tests` must
+   print nothing, because the evidence is bound to `HEAD`.
+2. With the supported Apple `container` release installed and its apiserver
+   running (`container system start`), run
+   `python3 scripts/validate-runtime.py --evidence`. It writes
+   `docs/evidence/runtime-<version>-<UTC timestamp>.json` only when every live
+   test that the sources declare ran and passed. A failed, partial or
+   `--skip-live` run writes nothing (`--evidence` with `--skip-live` is a
+   usage error).
+3. Commit the file (only documentation, workflows and evidence may change after
+   it) and push.
+4. Tag `vX.Y.Z` and push the tag. The `checks` job runs
+   `scripts/verify_release_evidence.py` and fails unless the newest file in
+   `docs/evidence/`:
+   - records result `passed` with counts that add up and every declared live
+     test passed (no failed, skipped or not-run test);
+   - names the Apple `container` version in `SUPPORTED_CONTAINER_VERSION`;
+   - has the same tree hash as the tagged commit — the sha256 of the git tree
+     identifiers of `src/`, `scripts/` and `tests/`, so a change to any of the
+     three after the run invalidates it, while README, `docs/`, workflow and
+     evidence commits do not;
+   - is at most 30 days old (`--max-age-days` changes the limit) and not dated
+     in the future.
+
+Pre-release tags (`rc`, `a`, `b`, `dev`) skip all of this and are published as
+GitHub pre-releases, which is how to test the pipeline without evidence. Until a
+first evidence file exists, only pre-releases can be published.
+
+What the evidence does and does not prove: it records that a maintainer ran the
+live tier on the supported runtime against this exact code.
+**The file is not signed**, and anyone with write access to the repository can
+create one, so it is an attestation tied to the code tree, not independent
+proof. It also says nothing about Docker Engine conformance, which CI checks
+separately.
 
 ## Installing a release
 
