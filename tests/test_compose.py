@@ -69,6 +69,24 @@ def take(a, i):
     return a[i + 1], i + 2
 
 
+def mount_entry(spec):
+    # A `--mount` value as the runtime reports it under configuration.mounts.
+    fields = {}
+    for part in spec.split(","):
+        k, _, v = part.partition("=")
+        fields[k] = v
+    kind = fields.get("type", "bind")
+    source = fields.get("source", fields.get("src", ""))
+    target = fields.get("target", fields.get("destination", fields.get("dst", "")))
+    if kind == "volume":
+        mount_type = {"volume": {"name": source}}
+    elif kind == "tmpfs":
+        mount_type = {"tmpfs": {}}
+    else:
+        mount_type = {"virtiofs": {}}
+    return {"type": mount_type, "source": source, "destination": target, "options": []}
+
+
 a = sys.argv[1:]
 
 if os.environ.get("FAKE_CONTAINER_CALLS"):
@@ -84,6 +102,7 @@ if a[:1] == ["run"]:
     d = load()
     name = None
     labels = {}
+    mounts = []
     networks = []
     dns = []
     dns_search = []
@@ -110,6 +129,7 @@ if a[:1] == ["run"]:
             if key == "--name": name = v
             elif key == "--label":
                 k, _, val = v.partition("="); labels[k] = val
+            elif key == "--mount": mounts.append(mount_entry(v))
             elif key == "--network": networks.append(v)
             elif key == "--dns": dns.append(v)
             elif key == "--dns-search": dns_search.append(v)
@@ -119,7 +139,9 @@ if a[:1] == ["run"]:
         image = arg; cmd = a[i+1:]; break
     if not name:
         name = "fake-%d" % len(d["containers"])
-    if name in d.get("fail_run", []):
+    if name in d.get("fail_run", []) or (
+        os.environ.get("FAKE_SEED_FAIL") and name.endswith("-seed")
+    ):
         # Scripted launch failure: nothing is created.
         d["action_log"].append(["run-failed", name])
         save(d)
@@ -141,7 +163,7 @@ if a[:1] == ["run"]:
         "labels": labels, "networks": networks, "dns": dns,
         "dns_search": dns_search, "dns_opt": dns_opt,
         "entrypoint": entry, "cmd": cmd, "run_argv": a,
-        "configuration": {"id": name, "labels": labels,
+        "configuration": {"id": name, "labels": labels, "mounts": mounts,
                           "image": {"reference": image or ""}},
         "status": {"state": "running", "networks": status_networks},
     }
@@ -2077,8 +2099,34 @@ class ComposeE2ETests(unittest.TestCase):
               - /app/node_modules
         """
 
-    def anonymous_name(self, target: str = "/app/node_modules", service: str = "web") -> str:
-        return compose_resources.anonymous_volume("demo", service, target).name
+    ANON_LABEL = "com.docker.compose.anonymous"
+
+    def anonymous_volumes(self, target: str | None = None) -> dict:
+        """Name -> labels of the anonymous volumes in the fake runtime."""
+        found = {}
+        for name, volume in self.load_state()["volumes"].items():
+            labels = volume["configuration"]["labels"]
+            if self.ANON_LABEL in labels and (target is None or labels[self.ANON_LABEL] == target):
+                found[name] = labels
+        return found
+
+    def container_volumes(self, container: str = "demo-web-1") -> dict:
+        """Destination -> volume name of the container, read from its mounts."""
+        mounts = self.load_state()["containers"][container]["configuration"]["mounts"]
+        return {
+            mount["destination"]: mount["type"]["volume"]["name"]
+            for mount in mounts
+            if "volume" in mount["type"]
+        }
+
+    def volume_removals(self) -> list:
+        return [c for c in self.runtime_calls() if c[:2] == ["volume", "rm"]]
+
+    def volume_creations(self) -> list:
+        return [
+            c for c in self.runtime_calls()
+            if c[:2] == ["volume", "create"] and any(a.startswith(self.ANON_LABEL + "=") for a in c)
+        ]
 
     def seed_runs(self) -> list:
         """The copy-up helper runs the fake received."""
@@ -2087,84 +2135,165 @@ class ComposeE2ETests(unittest.TestCase):
             if c[:1] == ["run"] and "--entrypoint" in c and c[c.index("--entrypoint") + 1] == "/bin/sh"
         ]
 
-    def test_anonymous_volume_is_a_labelled_volume_filled_from_the_image(self) -> None:
+    def up_with_anonymous_volume(self) -> str:
+        """`up -d` the project and return the anonymous volume this call created."""
+        before = set(self.anonymous_volumes()) if self.state.exists() else set()
         self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
+        (self.project / "src").mkdir(exist_ok=True)
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
-        name = self.anonymous_name()
+        (created,) = set(self.anonymous_volumes()) - before
+        return created
+
+    def test_anonymous_volume_is_a_labelled_volume_filled_from_the_image(self) -> None:
+        name = self.up_with_anonymous_volume()
+        self.assertEqual(len(self.volume_creations()), 1)
+        self.assertRegex(name, r"^demo_web_anon-[0-9a-f]{10}$")
         labels = self.load_state()["volumes"][name]["configuration"]["labels"]
         self.assertEqual(labels["com.docker.compose.project"], "demo")
         self.assertEqual(labels["com.docker.compose.service"], "web")
-        self.assertEqual(labels["com.docker.compose.anonymous"], "/app/node_modules")
+        self.assertEqual(labels[self.ANON_LABEL], "/app/node_modules")
         self.assertIn(f"type=volume,source={name},target=/app/node_modules", self.run_mounts())
         (seed,) = self.seed_runs()
         self.assertIn("--rm", seed)
         self.assertIn("node:20", seed)
         self.assertEqual(seed[-3:], [compose._SEED_SCRIPT, "sh", "/app/node_modules"])
-        # The helper is gone and no `-v /path` reached the service container.
+        # The helper is gone, the service mounts the volume and no `-v /path` reached it.
         self.assertEqual(sorted(self.load_state()["containers"]), ["demo-web-1"])
+        self.assertEqual(self.container_volumes(), {"/app/node_modules": name})
         service_run = [c for c in self.runtime_calls() if c[:1] == ["run"] and "--name" in c
                        and c[c.index("--name") + 1] == "demo-web-1"][0]
         self.assertNotIn("-v", service_run)
+        self.assertEqual(self.volume_removals(), [])
 
-    def anonymous_calls(self, verb: str) -> list:
-        name = self.anonymous_name()
-        return [c for c in self.runtime_calls() if c[:2] == ["volume", verb] and c[-1] == name]
-
-    def up_with_anonymous_volume(self) -> None:
-        self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
-        self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
-        self.assertEqual(len(self.anonymous_calls("create")), 1)
-
-    def test_anonymous_volume_is_reused_and_not_filled_again_on_recreate(self) -> None:
-        self.up_with_anonymous_volume()
+    def test_recreate_mounts_the_volume_of_the_existing_container(self) -> None:
+        name = self.up_with_anonymous_volume()
         result = self.docker("compose", "up", "-d", "--force-recreate")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.anonymous_calls("create")), 1)
-        self.assertEqual(self.anonymous_calls("rm"), [])
+        self.assertEqual(self.container_volumes(), {"/app/node_modules": name})
+        self.assertEqual(list(self.anonymous_volumes()), [name])
+        self.assertEqual(len(self.volume_creations()), 1)
         self.assertEqual(len(self.seed_runs()), 1)
-        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+        self.assertEqual(self.volume_removals(), [])
 
-    def test_anonymous_volume_left_by_down_is_discarded_and_seeded_again(self) -> None:
-        self.up_with_anonymous_volume()
-        self.assertEqual(self.docker("compose", "down").returncode, 0)
-        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+    def test_recreate_finds_the_volume_from_the_mounts_not_from_its_name(self) -> None:
+        name = self.up_with_anonymous_volume()
+        legacy = "demo_web_anon-0123456789"  # an earlier naming scheme, no labels
+        state = self.load_state()
+        volume = state["volumes"].pop(name)
+        volume["configuration"] = {"name": legacy, "labels": {}}
+        volume["id"] = legacy
+        state["volumes"][legacy] = volume
+        for mount in state["containers"]["demo-web-1"]["configuration"]["mounts"]:
+            if mount["type"].get("volume", {}).get("name") == name:
+                mount["type"]["volume"]["name"] = legacy
+        self.state.write_text(json.dumps(state))
+        result = self.docker("compose", "up", "-d", "--force-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.container_volumes(), {"/app/node_modules": legacy})
+        self.assertEqual(sorted(self.load_state()["volumes"]), [legacy])
+        self.assertEqual(len(self.volume_creations()), 1)
+        self.assertEqual(self.volume_removals(), [])
+
+    def test_recreate_creates_a_new_volume_when_the_old_one_is_gone(self) -> None:
+        name = self.up_with_anonymous_volume()
+        state = self.load_state()
+        state["volumes"].pop(name)
+        self.state.write_text(json.dumps(state))
+        result = self.docker("compose", "up", "-d", "--force-recreate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (current,) = self.container_volumes().values()
+        self.assertNotEqual(current, name)
+        self.assertIn(current, self.load_state()["volumes"])
+        self.assertEqual(len(self.seed_runs()), 2)
+        self.assertEqual(self.volume_removals(), [])
+
+    def test_recreate_with_a_new_target_creates_only_that_volume(self) -> None:
+        name = self.up_with_anonymous_volume()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: node:20
+                volumes:
+                  - ./src:/app
+                  - /app/node_modules
+                  - /var/cache
+            """
+        )
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.anonymous_calls("rm")), 1)
-        self.assertEqual(len(self.anonymous_calls("create")), 2)
+        mounted = self.container_volumes()
+        self.assertEqual(mounted["/app/node_modules"], name)
+        self.assertNotEqual(mounted["/var/cache"], name)
+        self.assertEqual(len(self.anonymous_volumes()), 2)
         self.assertEqual(len(self.seed_runs()), 2)
-        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+        self.assertEqual(self.volume_removals(), [])
 
-    def test_container_removed_outside_compose_gets_a_fresh_anonymous_volume(self) -> None:
-        self.up_with_anonymous_volume()
+    def test_down_then_up_creates_a_new_volume_and_keeps_the_old_one(self) -> None:
+        first = self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.assertIn(first, self.load_state()["volumes"])
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        volumes = self.anonymous_volumes()
+        self.assertEqual(len(volumes), 2)
+        self.assertIn(first, volumes)
+        self.assertEqual(volumes[first][self.ANON_LABEL], "/app/node_modules")
+        (current,) = self.container_volumes().values()
+        self.assertNotEqual(current, first)
+        self.assertEqual(len(self.volume_creations()), 2)
+        self.assertEqual(len(self.seed_runs()), 2)
+        self.assertEqual(self.volume_removals(), [])
+
+    def test_container_removed_outside_compose_gets_a_fresh_volume(self) -> None:
+        first = self.up_with_anonymous_volume()
         self.assertEqual(self.docker("rm", "-f", "demo-web-1").returncode, 0)
         result = self.docker("compose", "up", "-d")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.anonymous_calls("rm")), 1)
+        (current,) = self.container_volumes().values()
+        self.assertNotEqual(current, first)
+        self.assertIn(first, self.load_state()["volumes"])
         self.assertEqual(len(self.seed_runs()), 2)
+        self.assertEqual(self.volume_removals(), [])
 
-    def test_up_without_a_recreate_does_not_touch_the_anonymous_volume(self) -> None:
-        self.up_with_anonymous_volume()
+    def test_a_volume_in_use_elsewhere_does_not_stop_up(self) -> None:
+        first = self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.env["FAKE_VOLUME_RM_FAIL"] = first  # any removal of it would fail
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(first, self.load_state()["volumes"])
+        self.assertEqual(self.volume_removals(), [])
+
+    def test_up_without_a_recreate_does_not_touch_the_volume(self) -> None:
+        name = self.up_with_anonymous_volume()
         for flags in (["-d"], ["-d", "-V"]):
             result = self.docker("compose", "up", *flags)
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.anonymous_calls("rm"), [])
-        self.assertEqual(len(self.anonymous_calls("create")), 1)
+        # A stopped container is started, not recreated, even with -V.
+        self.assertEqual(self.docker("stop", "demo-web-1").returncode, 0)
+        result = self.docker("compose", "up", "-d", "-V")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.anonymous_volumes()), [name])
+        self.assertEqual(self.container_volumes(), {"/app/node_modules": name})
+        self.assertEqual(len(self.volume_creations()), 1)
         self.assertEqual(len(self.seed_runs()), 1)
+        self.assertEqual(self.volume_removals(), [])
 
-    def test_renew_anon_volumes_discards_and_seeds_again_on_recreate(self) -> None:
-        self.up_with_anonymous_volume()
+    def test_renew_anon_volumes_mounts_new_volumes_and_removes_nothing(self) -> None:
+        first = self.up_with_anonymous_volume()
+        seen = [first]
         for round_, flag in enumerate(("-V", "--renew-anon-volumes"), start=1):
             with self.subTest(flag=flag):
                 result = self.docker("compose", "up", "-d", "--force-recreate", flag)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(len(self.anonymous_calls("rm")), round_)
-                self.assertEqual(len(self.anonymous_calls("create")), round_ + 1)
+                (current,) = self.container_volumes().values()
+                self.assertNotIn(current, seen)
+                seen.append(current)
+                self.assertEqual(sorted(self.anonymous_volumes()), sorted(seen))
                 self.assertEqual(len(self.seed_runs()), round_ + 1)
-                self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
+                self.assertEqual(self.volume_removals(), [])
 
     def test_renew_anon_volumes_keeps_named_volumes(self) -> None:
         self.write_compose(
@@ -2182,9 +2311,10 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
         result = self.docker("compose", "up", "-d", "--force-recreate", "-V")
         self.assertEqual(result.returncode, 0, result.stderr)
-        removed = [c[-1] for c in self.runtime_calls() if c[:2] == ["volume", "rm"]]
-        self.assertEqual(removed, [self.anonymous_name()])
+        self.assertEqual(self.container_volumes()["/data"], "demo_data")
         self.assertIn("demo_data", self.load_state()["volumes"])
+        self.assertEqual(len(self.anonymous_volumes()), 2)
+        self.assertEqual(self.volume_removals(), [])
 
     def test_renew_anon_volumes_in_dry_run_changes_nothing(self) -> None:
         self.up_with_anonymous_volume()
@@ -2194,32 +2324,6 @@ class ComposeE2ETests(unittest.TestCase):
         new = [c for c in self.runtime_calls()[before:] if c[:1] in (["run"], ["rm"], ["stop"])
                or c[:2] in (["volume", "create"], ["volume", "rm"])]
         self.assertEqual(new, [])
-
-    def test_residue_volume_without_the_compose_labels_stops_up(self) -> None:
-        self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
-        self._seed_state()
-        state = self.load_state()
-        state["volumes"][self.anonymous_name()] = {
-            "configuration": {"name": self.anonymous_name(), "labels": {}},
-            "id": self.anonymous_name(),
-        }
-        self.state.write_text(json.dumps(state))
-        result = self.docker("compose", "up", "-d")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(self.anonymous_name(), result.stderr)
-        self.assertEqual(self.anonymous_calls("rm"), [])
-        self.assertEqual(self.load_state()["containers"], {})
-
-    def test_residue_volume_in_use_stops_up_naming_volume_and_service(self) -> None:
-        self.up_with_anonymous_volume()
-        self.assertEqual(self.docker("compose", "down").returncode, 0)
-        self.env["FAKE_VOLUME_RM_FAIL"] = self.anonymous_name()
-        result = self.docker("compose", "up", "-d")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(self.anonymous_name(), result.stderr)
-        self.assertIn("web", result.stderr)
-        self.assertEqual(self.load_state()["containers"], {})
 
     def test_two_anonymous_targets_get_two_volumes(self) -> None:
         self.write_compose(
@@ -2233,59 +2337,69 @@ class ComposeE2ETests(unittest.TestCase):
             """
         )
         self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
-        volumes = self.load_state()["volumes"]
-        self.assertEqual(
-            sorted(volumes),
-            sorted([self.anonymous_name("/app/node_modules"), self.anonymous_name("/var/cache")]),
-        )
+        mounted = self.container_volumes()
+        self.assertEqual(sorted(mounted), ["/app/node_modules", "/var/cache"])
+        self.assertEqual(len(set(mounted.values())), 2)
+        for target, name in mounted.items():
+            self.assertEqual(list(self.anonymous_volumes(target)), [name])
         self.assertEqual(len(self.seed_runs()), 2)
 
-    def test_failed_copy_up_removes_the_volume_and_does_not_start_the_service(self) -> None:
-        self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
-        self.script_run_failure(f"{self.anonymous_name()}-seed")
+    def test_failed_copy_up_removes_only_the_new_volume(self) -> None:
+        old = self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.env["FAKE_SEED_FAIL"] = "1"
         result = self.docker("compose", "up", "-d")
         self.assertNotEqual(result.returncode, 0)
         for text in ("web", "node:20", "/app/node_modules"):
             self.assertIn(text, result.stderr)
         state = self.load_state()
-        self.assertNotIn(self.anonymous_name(), state["volumes"])
-        self.assertNotIn(["run", "demo-web-1"], state["action_log"])
+        self.assertEqual(list(self.anonymous_volumes()), [old])
+        removed = self.volume_removals()
+        self.assertEqual(len(removed), 1)
+        self.assertNotEqual(removed[0][-1], old)
+        self.assertEqual(state["containers"], {})
 
-    def test_down_v_removes_only_the_projects_anonymous_volumes(self) -> None:
-        self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
+    def test_down_v_removes_every_labelled_anonymous_volume_of_the_project(self) -> None:
+        orphans = []
+        for _ in range(2):
+            orphans.append(self.up_with_anonymous_volume())
+            self.assertEqual(self.docker("compose", "down").returncode, 0)
         self.assertEqual(self.docker("compose", "up", "-d").returncode, 0)
+        (current,) = self.container_volumes().values()
         state = self.load_state()
-        state["volumes"]["other_anon"] = {
-            "configuration": {"name": "other_anon", "labels": {"com.docker.compose.project": "other"}},
-            "id": "other_anon",
+        foreign = {
+            "gone_service": {
+                "com.docker.compose.project": "demo",
+                "com.docker.compose.service": "gone",
+                self.ANON_LABEL: "/data",
+            },
+            "other_anon": {"com.docker.compose.project": "other", self.ANON_LABEL: "/x"},
+            "unlabelled": {},
+            "named_in_demo": {"com.docker.compose.project": "demo"},
         }
-        state["volumes"]["unlabelled"] = {"configuration": {"name": "unlabelled", "labels": {}}, "id": "unlabelled"}
+        for name, labels in foreign.items():
+            state["volumes"][name] = {"configuration": {"name": name, "labels": labels}, "id": name}
         self.state.write_text(json.dumps(state))
         self.assertEqual(self.docker("compose", "down").returncode, 0)
-        self.assertIn(self.anonymous_name(), self.load_state()["volumes"])
-        self.assertEqual(self.docker("compose", "down", "-v").returncode, 0)
-        volumes = self.load_state()["volumes"]
-        self.assertNotIn(self.anonymous_name(), volumes)
-        self.assertIn("other_anon", volumes)
-        self.assertIn("unlabelled", volumes)
+        self.assertEqual(self.volume_removals(), [])
+        result = self.docker("compose", "down", "-v")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        remaining = sorted(self.load_state()["volumes"])
+        self.assertEqual(remaining, ["named_in_demo", "other_anon", "unlabelled"])
+        for name in (*orphans, current, "gone_service"):
+            self.assertIn(f"Removed volume {name}", result.stdout)
 
-    def test_anonymous_volume_name_owned_by_another_project_is_refused(self) -> None:
-        self.write_compose(self.ANON_COMPOSE)
-        (self.project / "src").mkdir()
-        self._seed_state()
-        state = self.load_state()
-        name = self.anonymous_name()
-        state["volumes"][name] = {
-            "configuration": {"name": name, "labels": {"com.docker.compose.project": "other"}},
-            "id": name,
-        }
-        self.state.write_text(json.dumps(state))
-        result = self.docker("compose", "up", "-d")
+    def test_down_v_keeps_removing_after_a_refusal_and_exits_1(self) -> None:
+        first = self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        second = self.up_with_anonymous_volume()
+        self.assertEqual(self.docker("compose", "down").returncode, 0)
+        self.env["FAKE_VOLUME_RM_FAIL"] = first
+        result = self.docker("compose", "down", "-v")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("belongs to project", result.stderr)
-        self.assertEqual(self.seed_runs(), [])
+        self.assertIn(first, result.stderr)
+        self.assertEqual(list(self.anonymous_volumes()), [first])
+        self.assertIn(f"Removed volume {second}", result.stdout)
 
     def test_anonymous_volume_with_subpath_is_refused_before_anything_is_created(self) -> None:
         self._seed_state()
@@ -2311,8 +2425,9 @@ class ComposeE2ETests(unittest.TestCase):
         short = compose._entry_mount("/cache", proj, "web")
         long = compose._entry_mount({"type": "volume", "target": "/cache"}, proj, "web")
         self.assertEqual(short, long)
-        self.assertEqual(short.anonymous.labels["com.docker.compose.service"], "web")
-        self.assertEqual(short.mount.source, short.anonymous.name)
+        # Planning is pure: the volume is only named when the container is created.
+        self.assertEqual(short.anonymous, compose._AnonymousVolume("web", "/cache"))
+        self.assertEqual(short.mount.source, "")
 
     def test_volume_driver_opts_exit_64_without_creating_a_volume(self) -> None:
         self._seed_state()
@@ -4303,7 +4418,7 @@ class ComposeE2ETests(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertIn("Network demo_default", lines)
         self.assertIn("Volume demo_data", lines)
-        self.assertIn(f"Volume {self.anonymous_name('/cache')}", lines)
+        self.assertIn("Volume (anonymous, service web) at /cache", lines)
         containers = [line for line in lines if line.startswith("Container ")]
         self.assertEqual(
             [line.split()[1] for line in containers],
@@ -5336,6 +5451,50 @@ class DependsRequiredParsingTests(unittest.TestCase):
 
     def test_no_depends_on(self) -> None:
         self.assertEqual(self.parse(None), {})
+
+
+class AnonymousVolumeNamingTests(unittest.TestCase):
+    """A new anonymous volume never takes the name of an existing volume (design D1)."""
+
+    def run_with(self, existing: set, tokens: list):
+        from unittest import mock
+
+        calls: list = []
+
+        def runtime(args: list) -> subprocess.CompletedProcess:
+            calls.append(args)
+            if args[:2] == ["volume", "inspect"]:
+                return subprocess.CompletedProcess(args, 0 if args[-1] in existing else 1, "", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        volume = compose._AnonymousVolume("web", "/data")
+        with mock.patch.object(compose, "_run_container_capture", side_effect=runtime), \
+                mock.patch.object(compose_resources.secrets, "token_hex", side_effect=tokens):
+            try:
+                name = compose._create_anonymous_volume(volume, "demo", "node:20")
+            except compose.ShimError as exc:
+                return exc, calls
+        return name, calls
+
+    def test_a_free_name_is_created_and_seeded(self) -> None:
+        name, calls = self.run_with(set(), ["aaaaaaaaaa"])
+        self.assertEqual(name, "demo_web_anon-aaaaaaaaaa")
+        self.assertEqual([c[:2] for c in calls if c[:2] == ["volume", "create"]], [["volume", "create"]])
+        self.assertEqual([c for c in calls if c[:2] == ["volume", "rm"]], [])
+
+    def test_a_taken_name_is_skipped_and_the_existing_volume_is_left_alone(self) -> None:
+        name, calls = self.run_with({"demo_web_anon-aaaaaaaaaa"}, ["aaaaaaaaaa", "bbbbbbbbbb"])
+        self.assertEqual(name, "demo_web_anon-bbbbbbbbbb")
+        touched = [c[-1] for c in calls if c[:2] in (["volume", "create"], ["volume", "rm"])]
+        self.assertEqual(touched, ["demo_web_anon-bbbbbbbbbb"])
+
+    def test_three_taken_names_fail_without_creating_anything(self) -> None:
+        taken = {f"demo_web_anon-{c * 10}" for c in "abc"}
+        error, calls = self.run_with(taken, ["a" * 10, "b" * 10, "c" * 10])
+        self.assertIsInstance(error, compose.ShimError)
+        self.assertEqual(error.code, 1)
+        self.assertIn("/data", str(error))
+        self.assertEqual([c for c in calls if c[:2] != ["volume", "inspect"]], [])
 
 
 if __name__ == "__main__":
