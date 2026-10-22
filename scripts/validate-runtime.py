@@ -64,9 +64,13 @@ HELP_TIMEOUT = 20
 LIVE_TIMEOUT = 3600
 
 EVIDENCE_DIR = ROOT / "docs" / "evidence"
-EVIDENCE_SCHEMA = 1
-# The directories whose git trees bind the evidence to the code it tested.
+EVIDENCE_SCHEMA = 2
+# The directories whose git trees bind the evidence to the code it tested, and
+# the files that bind it to the packaging configuration (design D6). The hash
+# covers them in this order; scripts/verify_release_evidence.py must agree.
 EVIDENCE_TREES = ("src", "scripts", "tests")
+EVIDENCE_FILES = ("pyproject.toml",)
+EVIDENCE_INPUTS = EVIDENCE_TREES + EVIDENCE_FILES
 
 # Matrix id prefix -> the Apple command whose --help documents its flags.
 OPTION_COMMANDS = {"run": ["run"], "build": ["build"]}
@@ -210,18 +214,18 @@ def _git(args: list) -> str:
 
 
 def tree_hash(trees: dict) -> str:
-    """One sha256 over the tree identifiers, in the order of ``EVIDENCE_TREES``.
+    """One sha256 over the tree and file identifiers, in the order of ``EVIDENCE_INPUTS``.
 
     The verifier recomputes the same value from the tagged commit, so the two
     must agree on this exact text (design D8).
     """
-    text = "\n".join(f"{name} {trees[name]}" for name in EVIDENCE_TREES)
+    text = "\n".join(f"{name} {trees[name]}" for name in EVIDENCE_INPUTS)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 def dirty_trees(git) -> list:
-    """The evidence directories with tracked changes or untracked files."""
-    return [name for name in EVIDENCE_TREES if git(["status", "--porcelain", "--", name]).strip()]
+    """The evidence inputs (directories and files) with tracked changes or untracked files."""
+    return [name for name in EVIDENCE_INPUTS if git(["status", "--porcelain", "--", name]).strip()]
 
 
 def live_counts(outcomes: dict, declared: int) -> dict:
@@ -254,7 +258,7 @@ def evidence_complete(live: dict) -> bool:
 
 def write_evidence(directory: Path, version: str, live: dict, git, now: datetime) -> Path:
     """Write the evidence file for ``HEAD`` and return its path."""
-    trees = {name: git(["rev-parse", f"HEAD:{name}"]).strip() for name in EVIDENCE_TREES}
+    trees = {name: git(["rev-parse", f"HEAD:{name}"]).strip() for name in EVIDENCE_INPUTS}
     record = {
         "schema": EVIDENCE_SCHEMA,
         "container_version": version,
@@ -320,7 +324,7 @@ def main(
         dirty = dirty_trees(git)
         if dirty:
             print(
-                "--evidence hashes HEAD, but these directories differ from it: "
+                "--evidence hashes HEAD, but these paths differ from it: "
                 + ", ".join(dirty)
                 + "; commit or discard the changes first",
                 file=sys.stderr,

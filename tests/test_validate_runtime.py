@@ -203,7 +203,7 @@ class ExitStatusTests(unittest.TestCase):
         self.assertIn("matrix is invalid", err)
 
 
-TREES = {"src": "a" * 40, "scripts": "b" * 40, "tests": "c" * 40}
+TREES = {"src": "a" * 40, "scripts": "b" * 40, "tests": "c" * 40, "pyproject.toml": "e" * 40}
 HEAD = "d" * 40
 NOW = datetime(2026, 10, 21, 14, 3, 0, tzinfo=timezone.utc)
 LIVE_ENTRY = make_entry("run --live-flag", "live", "--live-flag", "t_live.LiveTests.test_x")
@@ -263,7 +263,7 @@ class EvidenceTests(unittest.TestCase):
         (path,) = self.files()
         self.assertEqual(path.name, "runtime-1.5.0-20261021T140300Z.json")
         record = json.loads(path.read_text())
-        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["schema"], 2)
         self.assertEqual(record["container_version"], "1.5.0")
         self.assertEqual(record["generated_at"], "2026-10-21T14:03:00Z")
         self.assertEqual(record["commit"], HEAD)
@@ -276,10 +276,13 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("evidence          : written to", out)
         self.assertTrue(out.rstrip().endswith("result: success (live tier: ran)"))
 
-    def test_tree_hash_is_the_sha256_of_the_three_tree_lines(self):
+    def test_tree_hash_is_the_sha256_of_the_four_input_lines(self):
         self.evidence({"t_live.LiveTests.test_x": "passed"})
         (path,) = self.files()
-        text = f"src {TREES['src']}\nscripts {TREES['scripts']}\ntests {TREES['tests']}"
+        text = (
+            f"src {TREES['src']}\nscripts {TREES['scripts']}\ntests {TREES['tests']}"
+            f"\npyproject.toml {TREES['pyproject.toml']}"
+        )
         self.assertEqual(
             json.loads(path.read_text())["tree_hash"], hashlib.sha256(text.encode()).hexdigest()
         )
@@ -325,6 +328,32 @@ class EvidenceTests(unittest.TestCase):
         )
         self.assertEqual(status, 2)
         self.assertIn("--skip-live", err)
+        self.assertEqual(self.files(), [])
+        self.assertEqual(run_live.calls, [])
+
+    def test_changing_only_the_packaging_file_changes_the_hash(self):
+        changed = dict(TREES, **{"pyproject.toml": "f" * 40})
+        self.assertNotEqual(validator.tree_hash(TREES), validator.tree_hash(changed))
+        for name in ("src", "scripts", "tests"):
+            self.assertNotEqual(validator.tree_hash(TREES), validator.tree_hash(dict(TREES, **{name: "f" * 40})))
+
+    def test_documentation_and_license_are_not_inputs(self):
+        self.assertEqual(validator.EVIDENCE_INPUTS, ("src", "scripts", "tests", "pyproject.toml"))
+        self.assertNotIn("README.md", validator.EVIDENCE_INPUTS)
+        self.assertNotIn("LICENSE", validator.EVIDENCE_INPUTS)
+
+    def test_the_record_names_the_four_ids(self):
+        self.evidence({"t_live.LiveTests.test_x": "passed"})
+        (path,) = self.files()
+        self.assertEqual(
+            sorted(json.loads(path.read_text())["trees"]), ["pyproject.toml", "scripts", "src", "tests"]
+        )
+
+    def test_a_dirty_pyproject_refuses_naming_it(self):
+        status, _, err, run_live = self.evidence({"t_live.LiveTests.test_x": "passed"}, dirty=("pyproject.toml",))
+        self.assertEqual(status, 2)
+        self.assertIn("pyproject.toml", err)
+        self.assertNotIn("src", err)
         self.assertEqual(self.files(), [])
         self.assertEqual(run_live.calls, [])
 
