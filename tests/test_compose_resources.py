@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import sys
 import unittest
 from pathlib import Path
@@ -159,38 +158,39 @@ ANONYMOUS_SERVICES = {
 }
 
 
-def _anon_name(project, service, target):
-    return f"{project}_{service}_anon-{hashlib.sha256(target.encode()).hexdigest()[:10]}"
+class NewAnonymousVolumeTests(unittest.TestCase):
+    def test_two_default_calls_give_different_names(self):
+        first = compose_resources.new_anonymous_volume("demo", "api", "/app/node_modules")
+        second = compose_resources.new_anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertNotEqual(first.name, second.name)
 
+    def test_default_name_is_random_ten_hex(self):
+        resource = compose_resources.new_anonymous_volume("demo", "api", "/app/node_modules")
+        self.assertRegex(resource.name, r"^demo_api_anon-[0-9a-f]{10}$")
 
-class AnonymousVolumeTests(unittest.TestCase):
-    def test_same_inputs_give_the_same_name(self):
-        first = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
-        second = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
-        self.assertEqual(first, second)
-
-    def test_different_target_service_or_project_give_different_names(self):
-        base = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
-        self.assertNotEqual(
-            base.name, compose_resources.anonymous_volume("demo", "api", "/app/site-packages").name
+    def test_explicit_token_is_used_verbatim(self):
+        resource = compose_resources.new_anonymous_volume(
+            "demo", "api", "/app/node_modules", token="abc1234567"
         )
-        self.assertNotEqual(
-            base.name, compose_resources.anonymous_volume("demo", "worker", "/app/node_modules").name
-        )
-        self.assertNotEqual(
-            base.name, compose_resources.anonymous_volume("prod", "api", "/app/node_modules").name
-        )
+        self.assertEqual(resource.name, "demo_api_anon-abc1234567")
 
-    def test_name_is_the_hashed_target(self):
-        resource = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
-        self.assertEqual(resource.name, _anon_name("demo", "api", "/app/node_modules"))
-
-    def test_name_is_a_valid_runtime_name_for_dotted_and_dashed_services(self):
-        resource = compose_resources.anonymous_volume("demo", "api.v1-2", "/cache")
-        self.assertRegex(resource.name, r"^[A-Za-z0-9_.-]+$")
+    def test_same_token_with_different_targets_gives_the_same_name(self):
+        first = compose_resources.new_anonymous_volume(
+            "demo", "api", "/app/node_modules", token="abc1234567"
+        )
+        second = compose_resources.new_anonymous_volume(
+            "demo", "api", "/app/site-packages", token="abc1234567"
+        )
+        self.assertEqual(first.name, second.name)
 
     def test_labels_carry_project_service_and_target(self):
-        resource = compose_resources.anonymous_volume("demo", "api", "/app/node_modules")
+        resource = compose_resources.new_anonymous_volume(
+            "demo", "api", "/app/node_modules", token="abc1234567"
+        )
+        self.assertEqual(
+            resource.labels,
+            compose_resources.anonymous_labels("demo", "api", "/app/node_modules"),
+        )
         self.assertEqual(
             resource.labels,
             {
@@ -203,46 +203,24 @@ class AnonymousVolumeTests(unittest.TestCase):
         self.assertFalse(resource.external)
         self.assertTrue(resource.managed)
 
+    def test_name_is_a_valid_runtime_name_for_dotted_and_dashed_services(self):
+        resource = compose_resources.new_anonymous_volume("demo", "api.v1-2", "/cache")
+        self.assertRegex(resource.name, r"^[A-Za-z0-9_.-]+$")
+
 
 class ResolveAnonymousTests(unittest.TestCase):
-    def test_resolve_lists_anonymous_volumes_in_service_then_entry_order(self):
+    def test_resolve_does_not_name_anonymous_volumes(self):
         result = compose_resources.resolve(FakeProject("demo", services=ANONYMOUS_SERVICES))
-        self.assertEqual(
-            [r.name for r in result.anonymous],
-            [
-                _anon_name("demo", "api", "/app/node_modules"),
-                _anon_name("demo", "api", "/cache"),
-                _anon_name("demo", "worker", "/app/node_modules"),
-                _anon_name("demo", "worker", "/scratch"),
-            ],
-        )
-        self.assertEqual(
-            [r.key for r in result.anonymous],
-            ["/app/node_modules", "/cache", "/app/node_modules", "/scratch"],
-        )
+        self.assertFalse(hasattr(result, "anonymous"))
+        self.assertEqual(result.volumes, {})
 
     def test_project_without_services_attribute_resolves_as_before(self):
         project = FakeProject("demo", networks={"back": {}}, volumes={"data": {}})
         del project.services
         result = compose_resources.resolve(project)
-        self.assertEqual(result.anonymous, ())
         self.assertEqual(result.networks["back"].name, "demo_back")
         self.assertEqual(result.volumes["data"].name, "demo_data")
         self.assertEqual(result.networks["default"].name, "demo_default")
-
-    def test_missing_or_empty_services_yield_no_anonymous(self):
-        for services in (None, {}):
-            with self.subTest(services=services):
-                result = compose_resources.resolve(
-                    FakeProject("demo", volumes={"data": {}}, services=services)
-                )
-                self.assertEqual(result.anonymous, ())
-                self.assertEqual(result.volumes["data"].name, "demo_data")
-
-    def test_duplicate_entries_collapse_to_one(self):
-        services = {"api": {"volumes": ["/cache", "/cache", "/cache"]}}
-        result = compose_resources.resolve(FakeProject("demo", services=services))
-        self.assertEqual([r.name for r in result.anonymous], [_anon_name("demo", "api", "/cache")])
 
 
 class RemovableTests(unittest.TestCase):
@@ -295,18 +273,6 @@ class RemovableTests(unittest.TestCase):
         result = compose_resources.resolve(FakeProject("demo", volumes={"data": {}}))
         kept = compose_resources.removable(result.volumes.values(), {}, "demo")
         self.assertEqual(kept, [])
-
-    def test_removable_keeps_only_own_labelled_anonymous_volumes(self):
-        result = compose_resources.resolve(FakeProject("demo", services=ANONYMOUS_SERVICES))
-        api_modules = _anon_name("demo", "api", "/app/node_modules")
-        api_cache = _anon_name("demo", "api", "/cache")
-        labelled = {
-            api_modules: "demo",   # managed, ours          -> kept
-            api_cache: "other",    # managed, other project -> excluded
-            # the worker volumes are unlabelled            -> excluded
-        }
-        kept = compose_resources.removable(result.anonymous, labelled, "demo")
-        self.assertEqual([r.name for r in kept], [api_modules])
 
 
 if __name__ == "__main__":
