@@ -92,9 +92,10 @@ Conventions for every task:
 
 ## 6. Verification and first evidence
 
-- [ ] 6.1 Full verification before closing the change @worker:orchestrator
+- [x] 6.1 Full verification before closing the change @worker:orchestrator
   - Priority: P0. Depends: all of groups 1 to 5.
   - Done: `python3 -m unittest discover -s tests`, `python3 scripts/test_report.py --tiers unit,fake`, `python3 -m compileall -q src scripts tests`, `openspec validate harden-volume-renewal-and-release-evidence --strict` all pass; `SHIM_TIERS=conformance SHIM_CONFORMANCE_DOCKER=/usr/local/bin/docker python3 scripts/test_report.py --require conformance` exits 0; no leftover object in Apple `container` or Docker.
+  - Result at 40846fb: `unittest discover` 1246 tests OK (skipped 62), also under Python 3.9.6; `test_report.py --tiers unit,fake` unit 706/fake 478 passed; `compileall` and `git diff --check` clean; `openspec validate --strict` valid; README compat block in sync; conformance on Docker 29.9.2 with `--require conformance` exit 0 (20 passed); `verify_wheel.py` on a wheel built from HEAD passes; no leftovers in Apple container (only `buildkit` and `hermes-data`) or Docker.
 - [ ] 6.2 Produce and commit the first evidence file (design D10) @needs-human
   - Priority: P0. Files: `docs/evidence/runtime-1.5.0-<timestamp>.json` (new). Depends: 6.1 and the user having committed and merged the code, so the working tree is clean.
   - Why a person: it needs the maintainer's macOS 26 machine, the committed code and the decision to commit the file; pushing needs the VPN off.
