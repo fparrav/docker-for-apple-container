@@ -22,22 +22,20 @@ def _bind_opts(**overrides) -> dict:
 class LocalBindAcceptTests(unittest.TestCase):
     def test_bind_idiom_is_accepted(self):
         cases = [
-            # (o, expected read_only, expected recursive)
-            ("bind", False, False),
-            ("bind,ro", True, False),
-            ("rbind", False, True),
-            ("rbind,ro", True, True),
-            ("bind,rw", False, False),
+            # (o, expected read_only)
+            ("bind", False),
+            ("bind,ro", True),
+            ("bind,rw", False),
         ]
-        for o, read_only, recursive in cases:
+        for o, read_only in cases:
             with self.subTest(o=o):
                 result = compose_resource_compat.local_bind(
                     {"driver_opts": dict(_bind_opts(o=o))}
                 )
                 self.assertIsInstance(result, compose_resource_compat.LocalBind)
                 self.assertEqual(
-                    (result.device, result.read_only, result.recursive),
-                    ("/a", read_only, recursive),
+                    (result.device, result.read_only),
+                    ("/a", read_only),
                 )
 
     def test_key_order_in_driver_opts_does_not_matter(self):
@@ -85,7 +83,13 @@ class LocalBindRefusalTests(unittest.TestCase):
             with self.subTest(o=o):
                 self._refused({"driver_opts": _bind_opts(o=o)}, token)
 
-    def test_o_without_bind_or_rbind_is_refused(self):
+    def test_rbind_is_refused_and_points_to_bind(self):
+        for o in ("rbind", "rbind,ro"):
+            with self.subTest(o=o):
+                message = self._refused({"driver_opts": _bind_opts(o=o)}, "rbind")
+                self.assertIn("use 'bind'", message)
+
+    def test_o_without_bind_is_refused(self):
         for o in ("ro", "rw", ""):
             with self.subTest(o=o):
                 self._refused({"driver_opts": _bind_opts(o=o)}, "o")

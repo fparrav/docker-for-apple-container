@@ -373,12 +373,24 @@ class LocalBindVolumeTests(unittest.TestCase):
         report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
         self.assertEqual((report.refusals, report.notices), ([], []))
 
-    def test_read_only_and_recursive_tokens_are_accepted(self):
-        for o in ("bind,ro", "rbind"):
+    def test_read_only_and_read_write_tokens_are_accepted(self):
+        for o in ("bind,ro", "bind,rw"):
             with self.subTest(o=o):
                 project = self.project({"type": "none", "o": o, "device": "/abs"})
                 report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
                 self.assertEqual((report.refusals, report.notices), ([], []))
+
+    def test_recursive_token_is_refused_naming_the_volume_and_tokens(self):
+        for o in ("rbind", "rbind,ro"):
+            with self.subTest(o=o):
+                project = self.project({"type": "none", "o": o, "device": "/abs"})
+                report = run({"w": {"image": "x", "volumes": ["data:/d"]}}, project)
+                self.assertEqual(keys(report.refusals), [("w", "volumes.driver_opts")])
+                message = report.refusals[0].message
+                self.assertIn("volume data", message)
+                self.assertIn("rbind", message)
+                self.assertIn("bind", message)
+                self.assertEqual(report.notices, [])
 
     def test_empty_driver_opts_stay_silent(self):
         project = {"volumes": {"data": {"driver_opts": {}}}}

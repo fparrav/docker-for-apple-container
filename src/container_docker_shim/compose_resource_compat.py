@@ -20,12 +20,11 @@ class LocalBind:
     """A top-level volume that Docker expresses as a bind mount of a host path.
 
     ``device`` is the host path to mount; ``read_only`` comes from ``ro`` in
-    ``o``; ``recursive`` from ``rbind``.
+    ``o``.
     """
 
     device: str
     read_only: bool
-    recursive: bool
 
 
 @dataclass(frozen=True)
@@ -52,11 +51,13 @@ NOT_A_BIND = _NotABind()
 
 # The only ``o`` tokens the local bind idiom accepts, and the only keys
 # ``driver_opts`` may carry; anything else is a Problem, never a guess.
+# ``rbind`` is refused with a dedicated message pointing at ``bind``
+# (design D5), so it is not part of the accepted set.
 _O_BIND = "bind"
 _O_RBIND = "rbind"
 _O_RO = "ro"
 _O_RW = "rw"
-_O_TOKENS = frozenset({_O_BIND, _O_RBIND, _O_RO, _O_RW})
+_O_TOKENS = frozenset({_O_BIND, _O_RO, _O_RW})
 _DRIVER_OPT_KEYS = frozenset({"type", "o", "device"})
 
 # The one network option Apple container cannot apply: it only names a Linux
@@ -72,8 +73,7 @@ def local_bind(volume_spec: Any) -> LocalBind | Problem | _NotABind:
 
     * a :class:`LocalBind` for the idiom: ``driver`` absent or ``local``,
       ``driver_opts`` with ``type: none``, ``o`` made only of ``bind``,
-      ``rbind``, ``ro`` and ``rw`` (at least one of ``bind``/``rbind``) and
-      an absolute ``device``;
+      ``ro`` and ``rw`` with ``bind`` present and an absolute ``device``;
     * a :class:`Problem` naming the offending option for anything else that
       declares ``driver_opts`` or a non-local driver;
     * :data:`NOT_A_BIND` for a volume without ``driver_opts`` and no special
@@ -111,16 +111,20 @@ def local_bind(volume_spec: Any) -> LocalBind | Problem | _NotABind:
             f"driver_opts o must be a comma-separated string, got {type(o).__name__}"
         )
     tokens = [token.strip() for token in o.split(",") if token.strip()]
+    if _O_RBIND in tokens:
+        return Problem(
+            f"driver_opts o token {_O_RBIND!r} is not supported; use {_O_BIND!r}"
+        )
     for token in tokens:
         if token not in _O_TOKENS:
             return Problem(
                 f"driver_opts o token {token!r} is not supported; only bind, "
-                "rbind, ro and rw are accepted"
+                "ro and rw are accepted"
             )
     if _O_RO in tokens and _O_RW in tokens:
         return Problem("driver_opts o cannot contain both ro and rw")
-    if _O_BIND not in tokens and _O_RBIND not in tokens:
-        return Problem(f"driver_opts o {o!r} must contain 'bind' or 'rbind'")
+    if _O_BIND not in tokens:
+        return Problem(f"driver_opts o {o!r} must contain 'bind'")
     device = opts.get("device")
     if device is None:
         return Problem("driver_opts device is required for the local bind idiom")
@@ -135,7 +139,6 @@ def local_bind(volume_spec: Any) -> LocalBind | Problem | _NotABind:
     return LocalBind(
         device=device,
         read_only=_O_RO in tokens,
-        recursive=_O_RBIND in tokens,
     )
 
 
