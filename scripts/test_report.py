@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib
 import json
 import os
@@ -199,6 +200,66 @@ def discover_test_modules(tests_dir: Path = TESTS_DIR) -> dict:
     for path in sorted(tests_dir.glob("test_*.py")):
         modules[path.stem] = importlib.import_module(path.stem)
     return modules
+
+
+# The decorator that gates each opt-in tier (tests/tiers.py).
+TIER_DECORATORS = {"live": "live_tier", "conformance": "conformance_tier"}
+
+
+def _module_declares_tier(tree: ast.Module, tier: str) -> bool:
+    """True if the module assigns ``TIER = "<tier>"`` at module level."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "TIER" for target in node.targets
+        ):
+            return isinstance(node.value, ast.Constant) and node.value.value == tier
+    return False
+
+
+def _is_tier_decorator(node: ast.expr, name: str) -> bool:
+    """True for ``@tiers.<name>(...)`` and ``@<name>(...)``."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr == name
+    return isinstance(func, ast.Name) and func.id == name
+
+
+def declared_tests(tier: str, tests_dir: Path = TESTS_DIR) -> list:
+    """Ids of the ``test_*`` functions that declare ``tier`` in the sources.
+
+    A static scan (nothing is imported), so it does not depend on the unittest
+    loader: it counts the ``test_*`` functions decorated with the tier's gate in
+    modules whose module-level ``TIER`` is ``tier``. A file that does not parse
+    is skipped. Used to check that a required tier ran everything it declares.
+    """
+    decorator = TIER_DECORATORS.get(tier)
+    if decorator is None:
+        raise ValueError(
+            "tier must be one of %s, got %r" % (", ".join(sorted(TIER_DECORATORS)), tier)
+        )
+    found = []
+    for path in sorted(tests_dir.glob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        if not _module_declares_tier(tree, tier):
+            continue
+
+        def visit(body, prefix):
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    visit(node.body, prefix + node.name + ".")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name.startswith("test_") and any(
+                        _is_tier_decorator(d, decorator) for d in node.decorator_list
+                    ):
+                        found.append(prefix + node.name)
+
+        visit(tree.body, path.stem + ".")
+    return sorted(found)
 
 
 def _iter_cases(suite) -> "iter":
@@ -478,6 +539,45 @@ def compute_exit_status(test_records) -> int:
     return 1 if any(rec["outcome"] == FAILED for rec in test_records) else 0
 
 
+# Exit status when a tier named by --require did not run completely.
+EXIT_REQUIRED_TIER_INCOMPLETE = 3
+
+# How many offending tests an unmet requirement lists before summarising.
+_MAX_LISTED = 5
+
+
+def unmet_requirements(test_records, required, declared=None) -> list:
+    """Why each required tier did not run completely (empty when all did).
+
+    A tier is complete only if it declares at least one test in the sources,
+    every one of its records passed (nothing ``not run``, skipped or failed), and
+    at least as many passed as the sources declare. ``declared`` maps a tier to
+    its declared test ids and defaults to :func:`declared_tests`.
+    """
+    declared = declared or declared_tests
+    problems = []
+    for tier in required:
+        records = [rec for rec in test_records if rec.get("tier") == tier]
+        ids = declared(tier)
+        passed = sum(1 for rec in records if rec["outcome"] == PASSED)
+        if not ids:
+            problems.append("%s: no test declares this tier in the sources" % tier)
+        offenders = [rec for rec in records if rec["outcome"] != PASSED]
+        for rec in offenders[:_MAX_LISTED]:
+            problems.append(
+                "%s: %s is %s (%s)" % (tier, rec["id"], rec["outcome"], rec.get("reason", "no reason"))
+            )
+        if len(offenders) > _MAX_LISTED:
+            problems.append(
+                "%s: and %d more not passed" % (tier, len(offenders) - _MAX_LISTED)
+            )
+        if ids and passed < len(ids):
+            problems.append(
+                "%s: %d declared in the sources, %d passed" % (tier, len(ids), passed)
+            )
+    return problems
+
+
 # -- entry point -------------------------------------------------------------
 
 
@@ -544,7 +644,22 @@ def main(argv=None) -> int:
         action="store_true",
         help="print release notes instead of the Markdown summary",
     )
+    parser.add_argument(
+        "--require",
+        default="",
+        help=(
+            "comma-separated opt-in tiers (%s) that must run completely: exit %d "
+            "if any of their tests is not run, skipped or missing"
+            % (", ".join(OPT_IN_TIERS), EXIT_REQUIRED_TIER_INCOMPLETE)
+        ),
+    )
     args = parser.parse_args(argv)
+    required = sorted(parse_tiers(args.require))
+    unknown = [tier for tier in required if tier not in OPT_IN_TIERS]
+    if unknown:
+        parser.error(
+            "--require accepts only %s, got %s" % (", ".join(OPT_IN_TIERS), ", ".join(unknown))
+        )
 
     try:
         matrix = _load_matrix()
@@ -578,7 +693,14 @@ def main(argv=None) -> int:
         for record in records:
             if record["outcome"] == FAILED:
                 print(f"- {record['id']}: {record.get('reason', 'failed')}", file=sys.stderr)
-    return exit_status
+        return exit_status
+    problems = unmet_requirements(records, required)
+    if problems:
+        print("required tier did not run completely:", file=sys.stderr)
+        for problem in problems:
+            print(f"- {problem}", file=sys.stderr)
+        return EXIT_REQUIRED_TIER_INCOMPLETE
+    return 0
 
 
 if __name__ == "__main__":
