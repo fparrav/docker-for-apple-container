@@ -15,6 +15,9 @@ file as text:
   report step fails, exit 3, when any conformance test is not run, skipped,
   or missing) and hard-codes no number of tests,
 - ``runtime.yml`` is not triggered by ``pull_request``,
+- ``ci.yml`` builds and exercises the wheel in a ``wheel`` job on the Python
+  floor and ``3.x``, and ``release.yml`` builds once in ``package``, tests those
+  files in ``smoke`` and publishes them from ``release`` without building again,
 - no workflow references a package index (no ``pypi`` substring).
 
 Every checker takes the workflow *text*, so the pin checker is also run
@@ -252,6 +255,78 @@ def check_evidence_gate(text: str) -> list[str]:
     return violations
 
 
+def python_floor() -> str:
+    """The lowest Python minor version ``pyproject.toml`` declares (``>=3.9`` -> ``3.9``)."""
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^requires-python\s*=\s*"[^"]*?>=\s*(\d+\.\d+)', text, re.MULTILINE)
+    if match is None:
+        raise AssertionError("pyproject.toml declares no requires-python floor")
+    return match.group(1)
+
+
+def matrix_pythons(job: str) -> list[str]:
+    """The quoted versions of the job's ``python:`` matrix entry."""
+    match = re.search(r"^\s*python:\s*\[([^\]]*)\]", job, re.MULTILINE)
+    if match is None:
+        return []
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def check_wheel_job(text: str, job: str, floor: str) -> list[str]:
+    """Violations of the rules for a job that builds and exercises the wheel (design D8)."""
+    body = job_text(text, job)
+    if not body:
+        return [f"no `{job}` job"]
+    violations: list[str] = []
+    if "contents: write" in body:
+        violations.append(f"{job} grants contents: write")
+    if "self-hosted" in body:
+        violations.append(f"{job} uses a self-hosted runner")
+    if sorted(matrix_pythons(body)) != sorted([floor, "3.x"]):
+        violations.append(f"{job} does not run on the floor {floor} and 3.x")
+    if "python-version: ${{ matrix.python }}" not in body:
+        violations.append(f"{job} does not select Python from the matrix")
+    if "scripts/verify_wheel.py --dist dist" not in body:
+        violations.append(f"{job} does not run verify_wheel.py on dist")
+    return violations
+
+
+def check_release_packaging(text: str, floor: str) -> list[str]:
+    """Violations of the rule that the tested files are the published files (design D8)."""
+    violations: list[str] = []
+    package = job_text(text, "package")
+    smoke = job_text(text, "smoke")
+    release = job_text(text, "release")
+    for name, body in (("package", package), ("smoke", smoke), ("release", release)):
+        if not body:
+            violations.append(f"no `{name}` job")
+    if violations:
+        return violations
+    if "-m build" not in package or "upload-artifact@" not in package:
+        violations.append("package does not build and upload dist/")
+    if "fetch-depth: 0" not in package:
+        violations.append("package does not check out the full history")
+    if "download-artifact@" not in smoke or "verify_wheel.py --dist dist --expect-version" not in smoke:
+        violations.append("smoke does not verify the downloaded wheel against the tag version")
+    if sorted(matrix_pythons(smoke)) != sorted([floor, "3.x"]):
+        violations.append(f"smoke does not run on the floor {floor} and 3.x")
+    if not re.search(r"^\s*needs:\s*\[?[^\n]*\bsmoke\b", release, re.MULTILINE):
+        violations.append("release does not depend on smoke")
+    if not re.search(r"^\s*needs:\s*\[?[^\n]*\bchecks\b", release, re.MULTILINE):
+        violations.append("release does not depend on checks")
+    if "download-artifact@" not in release:
+        violations.append("release does not download the tested files")
+    if "-m build" in release or "pip install --upgrade build" in release:
+        violations.append("release builds the files again")
+    for name, body in (("package", package), ("smoke", smoke)):
+        if "contents: write" in body:
+            violations.append(f"{name} grants contents: write")
+    for number, line in _code_lines(text):
+        if "github.ref_name" in line and not re.match(r"^\s*(TAG:|tag_name:)", line):
+            violations.append(f"line {number}: the tag is used outside env or tag_name")
+    return violations
+
+
 class WorkflowFileTests(unittest.TestCase):
     """The committed workflows satisfy every trust-boundary rule."""
 
@@ -401,6 +476,68 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertTrue(
             any("interpolates" in violation for violation in check_evidence_gate(text))
         )
+
+
+class WheelPackagingTests(unittest.TestCase):
+    """CI builds the wheel and release publishes the files it tested (design D8)."""
+
+    def ci_text(self) -> str:
+        return (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
+
+    def release_text(self) -> str:
+        return (WORKFLOWS_DIR / "release.yml").read_text(encoding="utf-8")
+
+    def test_the_floor_comes_from_pyproject(self) -> None:
+        self.assertRegex(python_floor(), r"^\d+\.\d+$")
+
+    def test_ci_wheel_job_satisfies_the_rules(self) -> None:
+        self.assertEqual(check_wheel_job(self.ci_text(), "wheel", python_floor()), [])
+
+    def test_ci_wheel_job_builds_with_full_history_and_checks_out_read_only(self) -> None:
+        job = job_text(self.ci_text(), "wheel")
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("python3 -m build", job)
+        self.assertNotIn("permissions:", job)  # inherits the read-only top level
+
+    def test_release_workflow_tests_the_files_it_publishes(self) -> None:
+        self.assertEqual(check_release_packaging(self.release_text(), python_floor()), [])
+
+    def test_release_job_keeps_the_only_contents_write(self) -> None:
+        text = self.release_text()
+        self.assertEqual(contents_write_grants(text), ["release"])
+        self.assertEqual(check_evidence_gate(text), [])
+
+    def test_smoke_passes_the_tag_through_env(self) -> None:
+        smoke = job_text(self.release_text(), "smoke")
+        self.assertIn("TAG: ${{ github.ref_name }}", smoke)
+        self.assertIn('--expect-version "${TAG#v}"', smoke)
+
+    def test_a_release_job_that_builds_again_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            "      - name: Download the tested files\n",
+            "      - name: Build\n        run: python3 -m build\n      - name: Download the tested files\n",
+            1,
+        )
+        self.assertIn("release builds the files again", check_release_packaging(text, python_floor()))
+
+    def test_a_release_without_smoke_is_flagged(self) -> None:
+        text = self.release_text().replace("needs: [checks, smoke]", "needs: [checks]", 1)
+        self.assertIn("release does not depend on smoke", check_release_packaging(text, python_floor()))
+
+    def test_the_tag_in_a_shell_line_is_flagged(self) -> None:
+        text = self.release_text().replace('"${TAG#v}"', "${{ github.ref_name }}", 1)
+        violations = check_release_packaging(text, python_floor())
+        self.assertTrue(any("outside env" in violation for violation in violations))
+
+    def test_a_missing_python_floor_is_flagged(self) -> None:
+        text = self.ci_text().replace('python: ["3.9", "3.x"]', 'python: ["3.x"]', 1)
+        self.assertTrue(check_wheel_job(text, "wheel", python_floor()))
+
+    def test_a_write_permission_in_the_wheel_job_is_flagged(self) -> None:
+        text = self.ci_text().replace(
+            "  wheel:\n", "  wheel:\n    permissions:\n      contents: write\n", 1
+        )
+        self.assertIn("wheel grants contents: write", check_wheel_job(text, "wheel", python_floor()))
 
 
 class ConformanceRequireTests(unittest.TestCase):
