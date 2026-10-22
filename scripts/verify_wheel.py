@@ -17,6 +17,10 @@ Exit status:
     2  usage error
     3  a check failed; one line on stderr names it
 
+The output also carries an ``ok environment: Python <version> on <platform>``
+line: the interpreter version and the platform that ran the checks, so a log
+shows what was verified.
+
 Only the standard library is used. The virtual environment is built in a
 temporary directory and removed afterwards, and the subprocesses run with an
 environment built from scratch, so variables such as
@@ -27,6 +31,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -56,14 +61,14 @@ class CheckError(Exception):
 
 
 def find_wheel(dist: Path) -> Path:
-    """The single wheel in ``dist``."""
+    """The single wheel in ``dist``, resolved to an absolute path."""
     wheels = sorted(dist.glob("*.whl")) if dist.is_dir() else []
     if not wheels:
         raise CheckError(f"no wheel found in {dist}")
     if len(wheels) > 1:
         names = ", ".join(path.name for path in wheels)
         raise CheckError(f"expected one wheel in {dist}, found {len(wheels)}: {names}")
-    return wheels[0]
+    return wheels[0].resolve()
 
 
 def check_contents(wheel: Path) -> None:
@@ -126,7 +131,7 @@ def install(wheel: Path, env_dir: Path, work: Path) -> None:
         env=clean_env(str(venv_bin(env_dir)), work),
     )
     if result.returncode != 0:
-        raise CheckError(f"pip could not install {wheel.name}: {(result.stderr or result.stdout).strip()[-400:]}")
+        raise CheckError(f"pip could not install {wheel}: {(result.stderr or result.stdout).strip()[-400:]}")
 
 
 def check_import_location(env_dir: Path, work: Path) -> None:
@@ -193,6 +198,7 @@ def verify(dist: Path, expected_version: str | None) -> list:
     lines.append(f"ok wheel {wheel.name}")
     check_contents(wheel)
     lines.append("ok contents: package files and the docker console script")
+    lines.append(f"ok environment: Python {platform.python_version()} on {platform.platform()}")
     work = Path(tempfile.mkdtemp(prefix="verify-wheel-"))
     try:
         env_dir = work / "venv"
