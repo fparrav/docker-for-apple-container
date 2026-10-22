@@ -228,10 +228,15 @@ what a user gets: the `docker` console script and the package files are in the
 wheel, the package imports from `site-packages`, `docker version` (run against a
 stand-in `container` script) reports the shim version, and without a `container`
 CLI the executable exits 1 with `Apple container CLI not found`. It exits 3
-naming the first failed check. `tests/test_verify_wheel.py` covers it with a
-wheel built by hand in a temporary directory. CI runs it in the `wheel` job on
-the Python floor from `pyproject.toml` and on `3.x`; the release workflow runs
-it on the files it publishes (see [Releasing](releasing.md#what-the-release-workflow-does)).
+naming the first failed check. It also prints the interpreter and platform it
+ran on (`ok environment: ...`). `--dist` may be a relative or an absolute path;
+CI runs it as `--dist dist`, and `tests/test_verify_wheel.py` covers both forms
+with a wheel built by hand in a temporary directory. CI runs it in the `wheel`
+job on the Python floor from `pyproject.toml` (`3.9` on `ubuntu-24.04`) and on
+`3.x` (`ubuntu-latest`); the release workflow runs it on the files it publishes
+(see [Releasing](releasing.md#the-wheel-check-legs)). It is a packaging check,
+not live evidence; a change to `scripts/` or `tests/` invalidates the recorded
+live evidence (see [Releasing](releasing.md#release-evidence)).
 
 ## Conformance tier in CI
 

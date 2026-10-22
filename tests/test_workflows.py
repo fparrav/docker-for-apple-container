@@ -264,16 +264,57 @@ def python_floor() -> str:
     return match.group(1)
 
 
-def matrix_pythons(job: str) -> list[str]:
-    """The quoted versions of the job's ``python:`` matrix entry."""
-    match = re.search(r"^\s*python:\s*\[([^\]]*)\]", job, re.MULTILINE)
-    if match is None:
-        return []
-    return re.findall(r'"([^"]+)"', match.group(1))
+def matrix_legs(job: str) -> list[dict[str, str]]:
+    """The ``include:`` legs of the job's matrix as ``{"python": ..., "os": ...}``."""
+    legs: list[dict[str, str]] = []
+    for _, line in _code_lines(job):
+        stripped = line.strip()
+        match = re.match(r'^-\s*python:\s*"([^"]+)"', stripped)
+        if match is not None:
+            legs.append({"python": match.group(1), "os": ""})
+            continue
+        match = re.match(r"^os:\s*(\S+)", stripped)
+        if match is not None and legs:
+            legs[-1]["os"] = match.group(1)
+    return legs
+
+
+def run_lines(job: str) -> list[str]:
+    """The lines of every ``run:`` step (inline command and block scalar body)."""
+    collected: list[str] = []
+    run_indent: int | None = None
+    for _, line in _code_lines(job):
+        indent = len(line) - len(line.lstrip())
+        if run_indent is not None and indent > run_indent:
+            collected.append(line)
+            continue
+        run_indent = None
+        if re.match(r"^\s*-?\s*run:", line):
+            collected.append(line)
+            run_indent = indent
+    return collected
+
+
+def check_wheel_matrix(body: str, job: str, floor: str) -> list[str]:
+    """Violations of the matrix rules shared by the CI and release wheel jobs (design D3)."""
+    violations: list[str] = []
+    legs = matrix_legs(body)
+    if sorted(leg["python"] for leg in legs) != sorted([floor, "3.x"]):
+        violations.append(f"{job} does not run on the floor {floor} and 3.x")
+    for leg in legs:
+        if leg["python"] == floor and (not leg["os"] or leg["os"].endswith("-latest")):
+            violations.append(f"{job} floor leg is not pinned to a versioned image")
+        if leg["python"] == "3.x" and leg["os"] != "ubuntu-latest":
+            violations.append(f"{job} 3.x leg does not run on ubuntu-latest")
+    if not re.search(r"^\s*runs-on:\s*\$\{\{ matrix\.os \}\}\s*$", body, re.MULTILINE):
+        violations.append(f"{job} does not select the runner from the matrix")
+    if any("matrix.os" in line or "matrix.python" in line for line in run_lines(body)):
+        violations.append(f"{job} interpolates the matrix into a run line")
+    return violations
 
 
 def check_wheel_job(text: str, job: str, floor: str) -> list[str]:
-    """Violations of the rules for a job that builds and exercises the wheel (design D8)."""
+    """Violations of the rules for a job that builds and exercises the wheel (design D3, D8)."""
     body = job_text(text, job)
     if not body:
         return [f"no `{job}` job"]
@@ -282,8 +323,7 @@ def check_wheel_job(text: str, job: str, floor: str) -> list[str]:
         violations.append(f"{job} grants contents: write")
     if "self-hosted" in body:
         violations.append(f"{job} uses a self-hosted runner")
-    if sorted(matrix_pythons(body)) != sorted([floor, "3.x"]):
-        violations.append(f"{job} does not run on the floor {floor} and 3.x")
+    violations.extend(check_wheel_matrix(body, job, floor))
     if "python-version: ${{ matrix.python }}" not in body:
         violations.append(f"{job} does not select Python from the matrix")
     if "scripts/verify_wheel.py --dist dist" not in body:
@@ -291,8 +331,39 @@ def check_wheel_job(text: str, job: str, floor: str) -> list[str]:
     return violations
 
 
+def check_legs_match(ci_text: str, release_text: str) -> list[str]:
+    """Violations of the rule that the smoke legs equal the wheel legs (design D4).
+
+    The two matrices are copies (Actions has no shared includes), so this
+    compares the ``include:`` legs of the ``wheel`` job of ``ci.yml`` with
+    those of the ``smoke`` job of ``release.yml`` and reports any drift.
+    """
+    wheel = matrix_legs(job_text(ci_text, "wheel"))
+    smoke = matrix_legs(job_text(release_text, "smoke"))
+    if wheel == smoke:
+        return []
+    return [f"smoke legs {smoke} differ from the wheel legs {wheel}"]
+
+
+def artifact_names(job: str, action: str) -> list[str]:
+    """The ``name:`` each ``actions/<action>`` step of the job passes in its ``with:`` block."""
+    names: list[str] = []
+    in_step = False
+    for _, line in _code_lines(job):
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            in_step = False
+        if f"uses: actions/{action}@" in stripped:
+            in_step = True
+            continue
+        match = re.match(r"^name:\s*(\S+)", stripped)
+        if in_step and match is not None:
+            names.append(match.group(1))
+    return names
+
+
 def check_release_packaging(text: str, floor: str) -> list[str]:
-    """Violations of the rule that the tested files are the published files (design D8)."""
+    """Violations of the rule that the tested files are the published files (design D5, D8)."""
     violations: list[str] = []
     package = job_text(text, "package")
     smoke = job_text(text, "smoke")
@@ -308,8 +379,7 @@ def check_release_packaging(text: str, floor: str) -> list[str]:
         violations.append("package does not check out the full history")
     if "download-artifact@" not in smoke or "verify_wheel.py --dist dist --expect-version" not in smoke:
         violations.append("smoke does not verify the downloaded wheel against the tag version")
-    if sorted(matrix_pythons(smoke)) != sorted([floor, "3.x"]):
-        violations.append(f"smoke does not run on the floor {floor} and 3.x")
+    violations.extend(check_wheel_matrix(smoke, "smoke", floor))
     if not re.search(r"^\s*needs:\s*\[?[^\n]*\bsmoke\b", release, re.MULTILINE):
         violations.append("release does not depend on smoke")
     if not re.search(r"^\s*needs:\s*\[?[^\n]*\bchecks\b", release, re.MULTILINE):
@@ -321,6 +391,19 @@ def check_release_packaging(text: str, floor: str) -> list[str]:
     for name, body in (("package", package), ("smoke", smoke)):
         if "contents: write" in body:
             violations.append(f"{name} grants contents: write")
+    uploaded = artifact_names(package, "upload-artifact")
+    if len(uploaded) != 1:
+        violations.append("package does not upload exactly one named artifact")
+    for name, body in (("smoke", smoke), ("release", release)):
+        if artifact_names(body, "download-artifact") != uploaded:
+            violations.append(f"{name} does not download the artifact that package uploads")
+    if not re.search(r"^\s*needs:\s*\[?[^\n]*\bpackage\b", smoke, re.MULTILINE):
+        violations.append("smoke does not depend on package")
+    for name, body in (("smoke", smoke), ("release", release)):
+        if any("continue-on-error" in line for _, line in _code_lines(body)):
+            violations.append(f"{name} sets continue-on-error")
+        if any(re.match(r"^\s*(-\s+)?if:", line) for _, line in _code_lines(body)):
+            violations.append(f"{name} has an `if:` condition")
     for number, line in _code_lines(text):
         if "github.ref_name" in line and not re.match(r"^\s*(TAG:|tag_name:)", line):
             violations.append(f"line {number}: the tag is used outside env or tag_name")
@@ -524,14 +607,122 @@ class WheelPackagingTests(unittest.TestCase):
         text = self.release_text().replace("needs: [checks, smoke]", "needs: [checks]", 1)
         self.assertIn("release does not depend on smoke", check_release_packaging(text, python_floor()))
 
+    def test_a_renamed_artifact_in_one_job_is_flagged(self) -> None:
+        text = self.release_text()
+        download = "      - name: Download the tested files\n        uses: actions/download-artifact@"
+        head, tail = text.split(download, 1)
+        renamed = head + download + tail.replace("name: dist", "name: other", 1)
+        self.assertIn(
+            "release does not download the artifact that package uploads",
+            check_release_packaging(renamed, python_floor()),
+        )
+        renamed = text.replace("          name: dist\n          path: dist/", "          name: other\n          path: dist/", 1)
+        violations = check_release_packaging(renamed, python_floor())
+        self.assertIn("smoke does not download the artifact that package uploads", violations)
+        self.assertIn("release does not download the artifact that package uploads", violations)
+
+    def test_a_smoke_without_needs_package_is_flagged(self) -> None:
+        text = self.release_text().replace("    needs: package\n", "", 1)
+        self.assertIn("smoke does not depend on package", check_release_packaging(text, python_floor()))
+
+    def test_continue_on_error_in_smoke_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            "    needs: package\n", "    needs: package\n    continue-on-error: true\n", 1
+        )
+        self.assertIn("smoke sets continue-on-error", check_release_packaging(text, python_floor()))
+
+    def test_continue_on_error_in_release_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            "    needs: [checks, smoke]\n", "    needs: [checks, smoke]\n    continue-on-error: true\n", 1
+        )
+        self.assertIn("release sets continue-on-error", check_release_packaging(text, python_floor()))
+
+    def test_an_if_condition_on_release_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            "    needs: [checks, smoke]\n", "    needs: [checks, smoke]\n    if: always()\n", 1
+        )
+        self.assertIn("release has an `if:` condition", check_release_packaging(text, python_floor()))
+
+    def test_an_if_condition_on_smoke_is_flagged(self) -> None:
+        text = self.release_text().replace(
+            "    needs: package\n", "    needs: package\n    if: false\n", 1
+        )
+        self.assertIn("smoke has an `if:` condition", check_release_packaging(text, python_floor()))
+
     def test_the_tag_in_a_shell_line_is_flagged(self) -> None:
         text = self.release_text().replace('"${TAG#v}"', "${{ github.ref_name }}", 1)
         violations = check_release_packaging(text, python_floor())
         self.assertTrue(any("outside env" in violation for violation in violations))
 
+    def test_the_wheel_matrix_has_the_two_pinned_legs(self) -> None:
+        legs = matrix_legs(job_text(self.ci_text(), "wheel"))
+        self.assertEqual(
+            legs,
+            [
+                {"python": python_floor(), "os": "ubuntu-24.04"},
+                {"python": "3.x", "os": "ubuntu-latest"},
+            ],
+        )
+
+    def test_the_smoke_legs_equal_the_wheel_legs(self) -> None:
+        self.assertEqual(check_legs_match(self.ci_text(), self.release_text()), [])
+
+    def test_smoke_legs_differing_from_the_wheel_legs_are_flagged(self) -> None:
+        text = self.release_text().replace("os: ubuntu-24.04", "os: ubuntu-22.04", 1)
+        violations = check_legs_match(self.ci_text(), text)
+        self.assertTrue(violations)
+
+    def test_a_smoke_floor_leg_on_a_latest_image_is_flagged(self) -> None:
+        text = self.release_text().replace("os: ubuntu-24.04", "os: ubuntu-latest", 1)
+        self.assertIn(
+            "smoke floor leg is not pinned to a versioned image",
+            check_release_packaging(text, python_floor()),
+        )
+
     def test_a_missing_python_floor_is_flagged(self) -> None:
-        text = self.ci_text().replace('python: ["3.9", "3.x"]', 'python: ["3.x"]', 1)
-        self.assertTrue(check_wheel_job(text, "wheel", python_floor()))
+        text = self.ci_text().replace(
+            '          - python: "3.9"\n            os: ubuntu-24.04\n', "", 1
+        )
+        self.assertIn(
+            f"wheel does not run on the floor {python_floor()} and 3.x",
+            check_wheel_job(text, "wheel", python_floor()),
+        )
+
+    def test_a_floor_leg_on_a_latest_image_is_flagged(self) -> None:
+        text = self.ci_text().replace("os: ubuntu-24.04", "os: ubuntu-latest", 1)
+        self.assertIn(
+            "wheel floor leg is not pinned to a versioned image",
+            check_wheel_job(text, "wheel", python_floor()),
+        )
+
+    def test_a_literal_runs_on_is_flagged(self) -> None:
+        job = job_text(self.ci_text(), "wheel")
+        text = self.ci_text().replace(
+            "runs-on: ${{ matrix.os }}", "runs-on: ubuntu-latest", 1
+        )
+        self.assertIn("runs-on: ${{ matrix.os }}", job)
+        self.assertIn(
+            "wheel does not select the runner from the matrix",
+            check_wheel_job(text, "wheel", python_floor()),
+        )
+
+    def test_a_3x_leg_on_a_versioned_image_is_flagged(self) -> None:
+        text = self.ci_text().replace("os: ubuntu-latest", "os: ubuntu-24.04", 1)
+        self.assertIn(
+            "wheel 3.x leg does not run on ubuntu-latest",
+            check_wheel_job(text, "wheel", python_floor()),
+        )
+
+    def test_the_matrix_in_a_run_line_is_flagged(self) -> None:
+        text = self.ci_text().replace(
+            "run: python3 scripts/verify_wheel.py --dist dist",
+            "run: python3 scripts/verify_wheel.py --dist dist --os ${{ matrix.os }}",
+            1,
+        )
+        self.assertIn(
+            "wheel interpolates the matrix into a run line",
+            check_wheel_job(text, "wheel", python_floor()),
+        )
 
     def test_a_write_permission_in_the_wheel_job_is_flagged(self) -> None:
         text = self.ci_text().replace(

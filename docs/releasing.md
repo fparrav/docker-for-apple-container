@@ -43,8 +43,9 @@ tag cannot be mistaken for a release.
 
 ## What the release workflow does
 
-`.github/workflows/release.yml` has four jobs, all on hosted `ubuntu-latest`
-runners:
+`.github/workflows/release.yml` has four jobs, all on hosted runners.
+`checks`, `package` and `release` run on `ubuntu-latest`; `smoke` runs on the
+two legs described in [The wheel check legs](#the-wheel-check-legs):
 
 1. `checks` (hosted checks, `contents: read`): the test report for the `unit`
    and `fake` tiers (`scripts/test_report.py --tiers unit,fake`), the
@@ -70,9 +71,43 @@ runners:
    that are published.
 
 Pull requests and pushes to `main` run the same wheel check in the `wheel` job
-of `ci.yml`, without the version expectation. The package supports the Python
-floor `requires-python = ">=3.9"`; the unit suite and `verify_wheel.py` were run
-under Python 3.9.6 when this check was added and passed.
+of `ci.yml` (`--dist dist`, without the version expectation), on the same two
+legs. The package supports the Python floor `requires-python = ">=3.9"`; the
+unit suite and `verify_wheel.py` were run under Python 3.9.6 when this check was
+added and passed.
+
+### The wheel check legs
+
+The `wheel` job of `ci.yml` and the `smoke` job of `release.yml` use the same
+matrix, kept equal by `tests/test_workflows.py`:
+
+| Python | Runner          | Why                                                          |
+| ------ | --------------- | ------------------------------------------------------------ |
+| `3.9`  | `ubuntu-24.04`  | The floor from `pyproject.toml`; pinned to a versioned image. |
+| `3.x`  | `ubuntu-latest` | The newest release, on the image that moves with GitHub.      |
+
+The floor leg is pinned because `ubuntu-24.04` is the last hosted image whose
+`actions/python-versions` manifest still ships CPython 3.9; on `ubuntu-latest`
+`setup-python` cannot install 3.9. Both legs block: a failed `smoke` leg stops
+the release, and neither leg is `continue-on-error`. `verify_wheel.py` prints
+`ok environment: Python <version> on <platform>` right after the wheel and
+contents lines, so a log shows which interpreter and image ran the check.
+
+If GitHub retires `ubuntu-24.04`, or `actions/python-versions` stops listing 3.9
+for it, the 3.9 leg fails at `Set up Python`. The response:
+
+1. Check the manifest: `curl -s
+   https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json`
+   and filter the `3.9.*` entries for their `platform_version`.
+2. Move the floor leg, in both workflows, to the oldest image that still lists
+   the interpreter.
+3. If none does, raise `requires-python` to the lowest supported minor in a
+   dedicated change that updates `pyproject.toml`, both matrices, these
+   documents and the specs. That change invalidates the live evidence, because
+   `pyproject.toml` is one of its inputs.
+
+The floor leg is never removed or made non-blocking silently; the workflow tests
+fail if it is.
 
 The release job runs only after the checks and the smoke test pass. It uses GitHub's
 job-scoped `GITHUB_TOKEN` with `contents: write` to create the release; it
@@ -140,6 +175,15 @@ sequence for a final release `vX.Y.Z`:
      `validate-runtime.py --evidence` again;
    - is at most 30 days old (`--max-age-days` changes the limit) and not dated
      in the future.
+
+A change to `scripts/` or `tests/` (the wheel check itself included) moves that
+hash, so the newest file stops matching and `validate-runtime.py --evidence`
+must run again on the clean, merged tree before a final tag. The previous file
+is not edited or deleted: the verifier takes the newest file, so the new one
+supersedes it and the old one stays as history. The wheel check and the other
+packaging checks are not live evidence: they run on hosted runners, never write
+into `docs/evidence/`, and a green `wheel` or `smoke` job does not replace the
+live run.
 
 Pre-release tags (`rc`, `a`, `b`, `dev`) skip all of this and are published as
 GitHub pre-releases, which is how to test the pipeline without evidence. Until a

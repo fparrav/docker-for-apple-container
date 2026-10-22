@@ -401,6 +401,64 @@ class ReleaseEvidenceDocsTests(unittest.TestCase):
         self.assertIn("`pyproject.toml`", text)
 
 
+def workflow_floor_legs(name: str) -> list:
+    """The ``(python, os)`` pairs of ``.github/workflows/<name>`` whose python is not ``3.x``."""
+    text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    legs = re.findall(r'-\s*python:\s*"([^"]+)"\s*\n\s*os:\s*(\S+)', text)
+    return [leg for leg in legs if leg[0] != "3.x"]
+
+
+class WheelLegsDocsTests(unittest.TestCase):
+    """The documented wheel check legs and evidence consequence match the workflows."""
+
+    def normalised(self, name: str) -> str:
+        return " ".join((ROOT / "docs" / name).read_text(encoding="utf-8").split())
+
+    def test_documented_floor_leg_equals_the_workflows(self) -> None:
+        legs = workflow_floor_legs("ci.yml")
+        self.assertEqual(len(legs), 1, legs)
+        self.assertEqual(workflow_floor_legs("release.yml"), legs)
+        python, runner = legs[0]
+        text = self.normalised("releasing.md")
+        self.assertIn(f"| `{python}` | `{runner}` |", text)
+        self.assertIn("| `3.x` | `ubuntu-latest` |", text)
+        self.assertIn(f"`{runner}` is the last hosted image", text)
+
+    def test_documents_say_scripts_and_tests_invalidate_the_evidence(self) -> None:
+        expected = {
+            "releasing.md": "`validate-runtime.py --evidence` must run again",
+            "testing.md": "invalidates the recorded live evidence",
+        }
+        for name, consequence in expected.items():
+            with self.subTest(document=name):
+                text = self.normalised(name)
+                self.assertIn("change to `scripts/` or `tests/`", text)
+                self.assertIn(consequence, text)
+
+    def test_releasing_documents_the_pin_maintenance_and_environment_line(self) -> None:
+        text = self.normalised("releasing.md")
+        for needle in (
+            "versions-manifest.json",
+            "platform_version",
+            "ok environment: Python <version> on <platform>",
+            "The previous file is not edited or deleted",
+        ):
+            self.assertIn(needle, text, needle)
+
+    def test_no_document_calls_the_wheel_check_live_evidence(self) -> None:
+        releasing = self.normalised("releasing.md")
+        testing = self.normalised("testing.md")
+        self.assertIn("are not live evidence", releasing)
+        self.assertIn("not live evidence", testing)
+        for text in (releasing, testing):
+            self.assertNotRegex(text, r"wheel check (?:is|counts as|provides) live evidence")
+
+    def test_testing_documents_the_dist_forms(self) -> None:
+        text = self.normalised("testing.md")
+        self.assertIn("`--dist` may be a relative or an absolute path", text)
+        self.assertIn("CI runs it as `--dist dist`", text)
+
+
 class ReleaseLiteralScannerTests(unittest.TestCase):
     def test_scanner_flags_stale_literal(self) -> None:
         stale, not_checked = scan_document(

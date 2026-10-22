@@ -13,6 +13,8 @@ import contextlib
 import importlib.util
 import io
 import os
+import platform
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -84,7 +86,8 @@ class FindWheelTests(unittest.TestCase):
     def test_one_wheel_is_returned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             wheel = write_wheel(Path(tmp))
-            self.assertEqual(verifier.find_wheel(Path(tmp)), wheel)
+            # resolve both sides: the temporary directory may sit behind a symlink (macOS /var)
+            self.assertEqual(verifier.find_wheel(Path(tmp)), wheel.resolve())
 
     def test_no_wheel_and_a_missing_directory_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,9 +188,19 @@ class InstalledWheelTests(unittest.TestCase):
             before = {p for p in Path(tempfile.gettempdir()).glob("verify-wheel-*")}
             lines = verifier.verify(Path(dist), "1.2.3")
             after = {p for p in Path(tempfile.gettempdir()).glob("verify-wheel-*")}
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 7)
         self.assertTrue(all(line.startswith("ok ") for line in lines))
         self.assertEqual(after - before, set())
+
+    def test_the_environment_line_names_the_interpreter_and_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as dist:
+            write_wheel(Path(dist))
+            lines = verifier.verify(Path(dist), "1.2.3")
+        self.assertEqual(len(lines), 7)
+        environment = lines[2]
+        self.assertTrue(environment.startswith("ok environment:"))
+        self.assertIn(platform.python_version(), environment)
+        self.assertIn(platform.platform(), environment)
 
 
 class MainTests(unittest.TestCase):
@@ -219,6 +232,173 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 verifier.main([])
         self.assertEqual(raised.exception.code, 2)
+
+
+class SourceTextTests(unittest.TestCase):
+    """The verifier is a packaging check; its source must stay out of the live evidence."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (ROOT / "scripts" / "verify_wheel.py").read_text(encoding="utf-8")
+
+    def test_it_never_touches_the_evidence_directory(self) -> None:
+        self.assertNotIn("docs/evidence", self.source)
+
+    def test_it_does_not_import_the_evidence_verifier(self) -> None:
+        self.assertNotIn("verify_release_evidence", self.source)
+
+
+@contextlib.contextmanager
+def working_directory(path: Path):
+    """Change the current directory for the block and restore it afterwards."""
+    previous = os.getcwd()
+    os.chdir(str(path))
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def verify_wheel_dirs() -> set:
+    return set(Path(tempfile.gettempdir()).glob("verify-wheel-*"))
+
+
+class RelativeDistTests(unittest.TestCase):
+    """``--dist`` may be relative or absolute; every path the checks use is absolute."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # realpath: the temporary directory may sit behind a symlink (macOS /var)
+        self.base = Path(os.path.realpath(self._tmp.name))
+
+    def make_dist(self, name: str = "dist") -> Path:
+        dist = self.base / name
+        dist.mkdir()
+        write_wheel(dist)
+        return dist
+
+    def run_main(self, argv: list) -> tuple:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = verifier.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def assert_seven_ok_lines(self, lines: list) -> None:
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(all(line.startswith("ok ") for line in lines))
+
+    def test_find_wheel_returns_an_absolute_path_for_a_relative_dist(self) -> None:
+        dist = self.make_dist()
+        absolute = verifier.find_wheel(dist)
+        with working_directory(self.base):
+            relative = verifier.find_wheel(Path("dist"))
+        self.assertTrue(relative.is_absolute())
+        self.assertEqual(relative, absolute)
+        self.assertEqual(absolute, dist / absolute.name)
+
+    def test_verify_passes_with_a_relative_dist_from_its_parent(self) -> None:
+        self.make_dist()
+        with working_directory(self.base):
+            lines = verifier.verify(Path("dist"), "1.2.3")
+        self.assert_seven_ok_lines(lines)
+
+    def test_verify_passes_when_the_directory_name_has_spaces(self) -> None:
+        self.make_dist("my dist dir")
+        with working_directory(self.base):
+            lines = verifier.verify(Path("my dist dir"), "1.2.3")
+        self.assert_seven_ok_lines(lines)
+
+    def test_verify_passes_with_a_relative_dist_from_another_directory(self) -> None:
+        dist = self.make_dist()
+        other = self.base / "other"
+        other.mkdir()
+        relative = os.path.relpath(str(dist), str(other))
+        self.assertTrue(relative.startswith(".."))
+        with working_directory(other):
+            lines = verifier.verify(Path(relative), "1.2.3")
+        self.assert_seven_ok_lines(lines)
+
+    def test_main_returns_0_with_a_relative_dist(self) -> None:
+        self.make_dist()
+        with working_directory(self.base):
+            status, out, err = self.run_main(["--dist", "dist", "--expect-version", "1.2.3"])
+        self.assertEqual(status, 0, err)
+        self.assertEqual(err, "")
+        self.assertEqual(out.count("ok "), 7)
+
+    def test_a_missing_wheel_and_a_missing_directory_name_the_directory_as_given(self) -> None:
+        (self.base / "empty").mkdir()
+        with working_directory(self.base):
+            for given in ("empty", "missing"):
+                with self.subTest(dist=given):
+                    status, out, err = self.run_main(["--dist", given])
+                    self.assertEqual(status, 3)
+                    self.assertEqual(out, "")
+                    self.assertEqual(err.count("\n"), 1)
+                    self.assertIn(f"no wheel found in {given}", err)
+
+    def test_two_wheels_exit_3_naming_both_without_installing(self) -> None:
+        dist = self.base / "dist"
+        dist.mkdir()
+        write_wheel(dist, version="1.2.3")
+        write_wheel(dist, version="1.2.4")
+        with working_directory(self.base):
+            with mock.patch.object(verifier, "install") as install:
+                status, _, err = self.run_main(["--dist", "dist"])
+        self.assertEqual(status, 3)
+        self.assertEqual(err.count("\n"), 1)
+        self.assertIn("1.2.3", err)
+        self.assertIn("1.2.4", err)
+        install.assert_not_called()
+
+    def test_a_failed_install_names_the_absolute_wheel_and_leaves_no_directory(self) -> None:
+        dist = self.make_dist()
+        wheel = verifier.find_wheel(dist)
+        failed = subprocess_result(1, stderr="no matching distribution")
+        before = verify_wheel_dirs()
+        with working_directory(self.base):
+            with mock.patch.object(verifier, "run", return_value=failed):
+                status, out, err = self.run_main(["--dist", "dist"])
+        self.assertEqual(status, 3)
+        self.assertEqual(err.count("\n"), 1)
+        self.assertIn(str(wheel), err)
+        self.assertIn("no matching distribution", err)
+        self.assertEqual(verify_wheel_dirs() - before, set())
+
+    def test_a_failed_later_check_leaves_no_directory(self) -> None:
+        dist = self.make_dist()
+        before = verify_wheel_dirs()
+        boom = verifier.CheckError("runtime check exploded")
+        with mock.patch.object(verifier, "check_runtime_absent", side_effect=boom):
+            with self.assertRaisesRegex(verifier.CheckError, "runtime check exploded"):
+                verifier.verify(dist, "1.2.3")
+        self.assertEqual(verify_wheel_dirs() - before, set())
+
+    def test_pip_gets_no_index_no_deps_and_the_absolute_wheel(self) -> None:
+        dist = self.make_dist()
+        expected = dist / "docker_for_apple_container_fork-1.2.3-py3-none-any.whl"
+        with working_directory(self.base):
+            wheel = verifier.find_wheel(Path("dist"))
+        calls = []
+
+        def fake_run(argv, *, cwd, env):
+            calls.append(list(argv))
+            return subprocess_result(0)
+
+        env_dir = self.base / "venv"
+        with mock.patch.object(verifier, "run", side_effect=fake_run):
+            verifier.install(wheel, env_dir, self.base)
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertIn("--no-index", argv)
+        self.assertIn("--no-deps", argv)
+        self.assertEqual(argv[-1], str(expected))
+        self.assertTrue(os.path.isabs(argv[-1]))
+
+
+def subprocess_result(returncode: int, stdout: str = "", stderr: str = ""):
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
 
 
 if __name__ == "__main__":

@@ -39,12 +39,19 @@ jobs:
 
   wheel:
     name: Wheel (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # The floor from pyproject.toml (requires-python) and the newest release.
-        python: ["3.9", "3.x"]
+        include:
+          # The floor from pyproject.toml (requires-python). Pinned to
+          # ubuntu-24.04 because it is the last hosted image whose
+          # actions/python-versions manifest still ships CPython 3.9.
+          - python: "3.9"
+            os: ubuntu-24.04
+          # The newest release, on the image that moves with GitHub.
+          - python: "3.x"
+            os: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
