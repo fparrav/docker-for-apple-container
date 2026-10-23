@@ -144,12 +144,45 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(result.ordered, ["api"])
         self.assertEqual(result.networks, ["edge"])
 
-    def test_empty_mapping_contributes_nothing(self):
+    def test_empty_list_and_mapping_imply_default(self):
+        for empty in ([], {}):
+            with self.subTest(empty=empty):
+                proj = project_specs(api={"networks": empty})
+                self.assertEqual(compose_plan.plan(proj).networks, ["default"])
+
+    def test_empty_form_next_to_explicit_network_adds_default(self):
+        for empty in ([], {}):
+            with self.subTest(empty=empty):
+                proj = project_specs(
+                    api={"networks": empty},
+                    web={"networks": ["edge"]},
+                )
+                self.assertEqual(compose_plan.plan(proj).networks, ["default", "edge"])
+
+    def test_empty_form_outside_the_selection_adds_nothing(self):
         proj = project_specs(
-            api={"networks": {}},
-            web={"networks": ["edge"]},
+            api={"networks": ["edge"]},
+            web={"networks": {}},
         )
-        self.assertEqual(compose_plan.plan(proj).networks, ["edge"])
+        self.assertEqual(compose_plan.plan(proj, ["api"]).networks, ["edge"])
+
+    def test_empty_form_with_no_deps_only_counts_named_services(self):
+        proj = project_specs(
+            api={"depends_on": ["db"], "networks": ["edge"]},
+            db={"networks": []},
+        )
+        self.assertEqual(compose_plan.plan(proj, ["api"], no_deps=True).networks, ["edge"])
+        self.assertEqual(compose_plan.plan(proj, ["api"]).networks, ["default", "edge"])
+
+    def test_nonempty_forms_are_unchanged(self):
+        for declared, expected in (
+            (["edge"], ["edge"]),
+            ({"back": {}}, ["back"]),
+            (["default", "back"], ["default", "back"]),
+        ):
+            with self.subTest(declared=declared):
+                proj = project_specs(api={"networks": declared})
+                self.assertEqual(compose_plan.plan(proj).networks, expected)
 
 
 class InvalidGraphTests(unittest.TestCase):
