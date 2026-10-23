@@ -299,13 +299,14 @@ def check_wheel_matrix(body: str, job: str, floor: str) -> list[str]:
     """Violations of the matrix rules shared by the CI and release wheel jobs (design D3)."""
     violations: list[str] = []
     legs = matrix_legs(body)
-    if sorted(leg["python"] for leg in legs) != sorted([floor, "3.x"]):
+    newest = [leg for leg in legs if leg["python"] == "3.x"]
+    if len(legs) != 3 or len(newest) != 2 or sum(leg["python"] == floor for leg in legs) != 1:
         violations.append(f"{job} does not run on the floor {floor} and 3.x")
     for leg in legs:
         if leg["python"] == floor and (not leg["os"] or leg["os"].endswith("-latest")):
             violations.append(f"{job} floor leg is not pinned to a versioned image")
-        if leg["python"] == "3.x" and leg["os"] != "ubuntu-latest":
-            violations.append(f"{job} 3.x leg does not run on ubuntu-latest")
+    if sorted(leg["os"] for leg in newest) != ["macos-latest", "ubuntu-latest"]:
+        violations.append(f"{job} 3.x legs do not run on ubuntu-latest and macos-latest")
     if not re.search(r"^\s*runs-on:\s*\$\{\{ matrix\.os \}\}\s*$", body, re.MULTILINE):
         violations.append(f"{job} does not select the runner from the matrix")
     if any("matrix.os" in line or "matrix.python" in line for line in run_lines(body)):
@@ -654,15 +655,42 @@ class WheelPackagingTests(unittest.TestCase):
         violations = check_release_packaging(text, python_floor())
         self.assertTrue(any("outside env" in violation for violation in violations))
 
-    def test_the_wheel_matrix_has_the_two_pinned_legs(self) -> None:
+    def test_the_wheel_matrix_has_the_linux_and_macos_legs(self) -> None:
         legs = matrix_legs(job_text(self.ci_text(), "wheel"))
         self.assertEqual(
             legs,
             [
                 {"python": python_floor(), "os": "ubuntu-24.04"},
                 {"python": "3.x", "os": "ubuntu-latest"},
+                {"python": "3.x", "os": "macos-latest"},
             ],
         )
+
+    def test_the_release_smoke_matrix_has_the_macos_leg(self) -> None:
+        legs = matrix_legs(job_text(self.release_text(), "smoke"))
+        self.assertIn({"python": "3.x", "os": "macos-latest"}, legs)
+        self.assertEqual(check_release_packaging(self.release_text(), python_floor()), [])
+
+    def test_a_missing_macos_leg_is_flagged_in_both_jobs(self) -> None:
+        leg = '          - python: "3.x"\n            os: macos-latest\n'
+        for text, job, check in (
+            (self.ci_text(), "wheel", lambda t: check_wheel_job(t, "wheel", python_floor())),
+            (self.release_text(), "smoke", lambda t: check_release_packaging(t, python_floor())),
+        ):
+            with self.subTest(job=job):
+                self.assertIn(leg, text)
+                self.assertIn(
+                    f"{job} 3.x legs do not run on ubuntu-latest and macos-latest",
+                    check(text.replace(leg, "", 1)),
+                )
+
+    def test_the_macos_leg_runs_no_live_tier_and_is_not_skipped(self) -> None:
+        for text, job in ((self.ci_text(), "wheel"), (self.release_text(), "smoke")):
+            with self.subTest(job=job):
+                body = job_text(text, job)
+                self.assertNotIn("self-hosted", body)
+                self.assertNotIn("SHIM_TIERS", body)
+                self.assertNotIn("continue-on-error", body)
 
     def test_the_smoke_legs_equal_the_wheel_legs(self) -> None:
         self.assertEqual(check_legs_match(self.ci_text(), self.release_text()), [])
@@ -709,7 +737,7 @@ class WheelPackagingTests(unittest.TestCase):
     def test_a_3x_leg_on_a_versioned_image_is_flagged(self) -> None:
         text = self.ci_text().replace("os: ubuntu-latest", "os: ubuntu-24.04", 1)
         self.assertIn(
-            "wheel 3.x leg does not run on ubuntu-latest",
+            "wheel 3.x legs do not run on ubuntu-latest and macos-latest",
             check_wheel_job(text, "wheel", python_floor()),
         )
 

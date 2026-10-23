@@ -408,6 +408,13 @@ def workflow_floor_legs(name: str) -> list:
     return [leg for leg in legs if leg[0] != "3.x"]
 
 
+def workflow_macos_legs(name: str) -> list:
+    """The ``(python, os)`` pairs of ``.github/workflows/<name>`` that run on macOS."""
+    text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+    legs = re.findall(r'-\s*python:\s*"([^"]+)"\s*\n\s*os:\s*(macos-\S+)', text)
+    return list(legs)
+
+
 class WheelLegsDocsTests(unittest.TestCase):
     """The documented wheel check legs and evidence consequence match the workflows."""
 
@@ -423,6 +430,21 @@ class WheelLegsDocsTests(unittest.TestCase):
         self.assertIn(f"| `{python}` | `{runner}` |", text)
         self.assertIn("| `3.x` | `ubuntu-latest` |", text)
         self.assertIn(f"`{runner}` is the last hosted image", text)
+
+    def test_documented_macos_leg_equals_the_workflows(self) -> None:
+        legs = workflow_macos_legs("ci.yml")
+        self.assertEqual(len(legs), 1, legs)
+        self.assertEqual(workflow_macos_legs("release.yml"), legs)
+        python, runner = legs[0]
+        for name in ("releasing.md", "testing.md"):
+            with self.subTest(document=name):
+                text = self.normalised(name)
+                self.assertIn(f"`{python}`", text)
+                self.assertIn(f"`{runner}`", text)
+        text = self.normalised("releasing.md")
+        self.assertIn(f"| `{python}` | `{runner}` |", text)
+        self.assertIn("macOS leg", text)
+        self.assertIn("does not run the `live` tier", text)
 
     def test_documents_say_scripts_and_tests_invalidate_the_evidence(self) -> None:
         expected = {
