@@ -1379,6 +1379,56 @@ def _check_build_secrets(
         raise ShimError("compose: nothing was created; fix the problems above", 64)
 
 
+_RESERVED_LABEL_NAMESPACE = "com.docker.compose"
+
+
+def _reserved_label_keys(labels: Any) -> list[str]:
+    """Keys of a ``labels`` value that fall in the shim's reserved namespace.
+
+    ``labels`` is a mapping or a list of ``key=value`` strings (the key is the
+    part before the first ``=``; an entry without ``=`` is a bare key). A key
+    is reserved when it is ``com.docker.compose`` or starts with
+    ``com.docker.compose.``; any other shape yields nothing.
+    """
+    if isinstance(labels, dict):
+        keys = [_as_str(key) for key in labels]
+    elif isinstance(labels, list):
+        keys = [_as_str(entry).split("=", 1)[0] for entry in labels]
+    else:
+        return []
+    return [
+        key
+        for key in keys
+        if key == _RESERVED_LABEL_NAMESPACE or key.startswith(_RESERVED_LABEL_NAMESPACE + ".")
+    ]
+
+
+def _reserved_label_problems(project: Project, services: list[Service]) -> list[str]:
+    """One refusal per reserved label key on a planned service or a declared resource.
+
+    Every top-level network and volume is checked, used or not and external or
+    not, so a project cannot carry a reserved label that a later edit would
+    start applying. Order is services, then networks, then volumes, each in
+    declaration order.
+    """
+    problems: list[str] = []
+
+    def collect(kind: str, name: str, labels: Any) -> None:
+        for key in _reserved_label_keys(labels):
+            problems.append(
+                compose_capabilities.refused(
+                    f"{kind} {name!r}: labels: {key!r} is reserved for the shim"
+                )
+            )
+
+    for service in services:
+        collect("service", service.name, service.spec.get("labels"))
+    for kind, declared in (("network", project.networks), ("volume", project.volumes)):
+        for key in declared if isinstance(declared, dict) else ():
+            collect(kind, key, _resource_spec(declared, key).get("labels"))
+    return problems
+
+
 def _validate_plan(project: Project, services: list[Service]) -> None:
     """Validate every service about to be acted on, before any side effect.
 
@@ -1397,6 +1447,7 @@ def _validate_plan(project: Project, services: list[Service]) -> None:
         for f in report.refusals
     ]
     problems.extend(_mount_problems(project, services, problems))
+    problems.extend(_reserved_label_problems(project, services))
     problems.extend(
         compose_capabilities.refused(line)
         for line in _build_secret_problems(project, services)
