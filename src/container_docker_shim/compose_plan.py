@@ -1,9 +1,10 @@
-"""Which services ``docker compose up`` acts on, and in what order.
+"""Which services ``docker compose up`` acts on, in what order, and which
+networks they use.
 
-Pure graph logic over ``project.services`` (objects with ``depends_on`` and
-``depends_required``): no runtime calls, so it is tested without Apple
-``container``. The result feeds both validation and creation, so the set that
-is checked is the set that is created.
+Pure logic over ``project.services`` (objects with ``depends_on``,
+``depends_required`` and ``networks``): no runtime calls, so it is tested
+without Apple ``container``. The result feeds both validation and creation, so
+the set that is checked is the set that is created.
 """
 
 from __future__ import annotations
@@ -16,10 +17,11 @@ from .cli import ShimError
 
 @dataclass(frozen=True)
 class Plan:
-    """Service names to act on, dependencies first, and the notices to print."""
+    """Service names to act on, dependencies first, their networks, and notices."""
 
     ordered: list[str]
     notices: list[str] = field(default_factory=list)
+    networks: list[str] = field(default_factory=list)
 
 
 def _required(service: Any, dep: str) -> bool:
@@ -60,6 +62,21 @@ def _check_cycles(services: dict[str, Any]) -> None:
 
     for name in services:
         visit(name)
+
+
+def service_network_keys(spec: dict[str, Any]) -> list[str]:
+    """Network keys a service uses, in declared order.
+
+    A mapping or list of keys is read as-is, so an empty one yields none; a
+    service that declares no ``networks`` at all uses the implicit project
+    ``default``.
+    """
+    declared = spec.get("networks")
+    if isinstance(declared, dict):
+        return [str(key) for key in declared]
+    if isinstance(declared, list):
+        return [str(item) for item in declared]
+    return ["default"]
 
 
 def plan(project: Any, selected: Iterable[str] | None = None, no_deps: bool = False) -> Plan:
@@ -121,4 +138,9 @@ def plan(project: Any, selected: Iterable[str] | None = None, no_deps: bool = Fa
 
     for name in chosen:
         visit(name)
-    return Plan(ordered, notices)
+    networks: list[str] = []
+    for name in ordered:
+        for key in service_network_keys(services[name].spec):
+            if key not in networks:
+                networks.append(key)
+    return Plan(ordered, notices, networks)
