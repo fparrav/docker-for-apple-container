@@ -67,14 +67,14 @@ def _check_cycles(services: dict[str, Any]) -> None:
 def service_network_keys(spec: dict[str, Any]) -> list[str]:
     """Network keys a service uses, in declared order.
 
-    A mapping or list of keys is read as-is, so an empty one yields none; a
-    service that declares no ``networks`` at all uses the implicit project
-    ``default``.
+    A mapping or list of keys is read as-is. A service that declares no
+    ``networks``, or an empty list or mapping, uses the implicit project
+    ``default``, as the official Compose normalizes it.
     """
     declared = spec.get("networks")
-    if isinstance(declared, dict):
+    if isinstance(declared, dict) and declared:
         return [str(key) for key in declared]
-    if isinstance(declared, list):
+    if isinstance(declared, list) and declared:
         return [str(item) for item in declared]
     return ["default"]
 
