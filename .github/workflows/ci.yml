@@ -52,6 +52,11 @@ jobs:
           # The newest release, on the image that moves with GitHub.
           - python: "3.x"
             os: ubuntu-latest
+          # The same wheel on a hosted macOS runner. It has no Apple
+          # container runtime and no virtualization, so only the runtime-free
+          # checks of verify_wheel.py run here; the live tier does not.
+          - python: "3.x"
+            os: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
