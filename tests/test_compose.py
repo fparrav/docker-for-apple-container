@@ -540,7 +540,11 @@ def mutating_calls(calls: list) -> list:
     ]
 
 
-class ComposeE2ETests(unittest.TestCase):
+class ComposeFakeBase(unittest.TestCase):
+    """Fake-`container` infrastructure shared by the compose end-to-end tests:
+    the throwaway fake binary, its JSON state file and the call log of every
+    argv it receives, plus the helpers that read them."""
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -604,11 +608,43 @@ class ComposeE2ETests(unittest.TestCase):
         ]
         self.assertEqual(mutating, [])
 
+    def created_networks(self) -> list:
+        """Names of every network the runtime was asked to create, in order."""
+        return [
+            call[-1]
+            for call in self.runtime_calls()
+            if call[:2] == ["network", "create"]
+        ]
+
     def clear_action_log(self) -> None:
         state = self.load_state()
         state["action_log"] = []
         self.state.write_text(json.dumps(state))
 
+    def _seed_state(self) -> None:
+        # A refused `up` never reaches the fake runtime, so give the state
+        # file the same defaults the fake binary would create on first run.
+        self.state.write_text(
+            json.dumps(
+                {
+                    "containers": {},
+                    "networks": {},
+                    "volumes": {},
+                    "ip": 1,
+                    "exec_log": [],
+                    "action_log": [],
+                }
+            )
+        )
+
+    def _seed_resource(self, family: str, name: str, labels: dict) -> None:
+        self._seed_state() if not self.state.exists() else None
+        state = self.load_state()
+        state[family][name] = {"configuration": {"name": name, "labels": labels}, "id": name}
+        self.state.write_text(json.dumps(state))
+
+
+class ComposeE2ETests(ComposeFakeBase):
     def script_run_failure(self, container: str, fail: bool = True) -> None:
         """Make `container run` for `container` fail (or stop failing)."""
         if not self.state.exists():
@@ -722,11 +758,43 @@ class ComposeE2ETests(unittest.TestCase):
             argv = state["containers"][name]["run_argv"]
             self.assertEqual(argv[argv.index("--network") + 1], "edge")
         self.assertNotIn("demo_edge", state["networks"])
-        self.assertNotIn(["network", "create"], [a[:2] for a in state["action_log"]])
+        self.assertEqual(self.created_networks(), [])
+        self.assertNotIn("demo_default", state["networks"])
         hosts_writes = [e for e in state["exec_log"] if "/etc/hosts" in " ".join(e["cmd"])]
         joined = " ".join(" ".join(e["cmd"]) for e in hosts_writes)
         self.assertIn("web", joined)
         self.assertIn("db", joined)
+
+    def test_created_networks_reports_only_the_networks_up_created(self) -> None:
+        # The helper reads the runtime call log, not the container-only action
+        # log: with the project network already present, `up` creates only
+        # `demo_back`, and the name it reports is the key the fake stored it
+        # under.
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["demo_default"] = {
+            "configuration": {
+                "name": "demo_default",
+                "labels": {"com.docker.compose.project": "demo"},
+            },
+            "id": "demo_default",
+        }
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        self.assertIn("demo_back", state["networks"])
 
     def test_up_injects_host_docker_internal(self) -> None:
         # Multi-service /etc/hosts writes must also publish the host-gateway
@@ -1342,12 +1410,6 @@ class ComposeE2ETests(unittest.TestCase):
 
     # -- Existence pass before creation (external / foreign / unlabelled) --- #
 
-    def _seed_resource(self, family: str, name: str, labels: dict) -> None:
-        self._seed_state() if not self.state.exists() else None
-        state = self.load_state()
-        state[family][name] = {"configuration": {"name": name, "labels": labels}, "id": name}
-        self.state.write_text(json.dumps(state))
-
     def _write_external_volume_compose(self) -> None:
         self.write_compose(
             """
@@ -1854,22 +1916,6 @@ class ComposeE2ETests(unittest.TestCase):
         self.assertNotIn("demo-web-1", self.load_state()["containers"])
 
     # -- Security enforcement (security.decide, all-or-nothing) ------------- #
-
-    def _seed_state(self) -> None:
-        # A refused `up` never reaches the fake runtime, so give the state
-        # file the same defaults the fake binary would create on first run.
-        self.state.write_text(
-            json.dumps(
-                {
-                    "containers": {},
-                    "networks": {},
-                    "volumes": {},
-                    "ip": 1,
-                    "exec_log": [],
-                    "action_log": [],
-                }
-            )
-        )
 
     def test_refused_project_creates_nothing(self) -> None:
         self._seed_state()
@@ -4504,6 +4550,516 @@ class ComposeE2ETests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertIn("only supported with 'up'", result.stderr)
         self.assertEqual(self.runtime_calls(), [])
+
+
+class ImplicitDefaultNetworkTests(ComposeFakeBase):
+    """The implicit `default` network follows the plan of the `up` it serves.
+
+    Every test asserts `created_networks()` (the `network create` calls the
+    runtime received) and the final `state["networks"]`, including the labels
+    of every network that was created.
+    """
+
+    def _assert_labels(self, state: dict, name: str, key: str) -> None:
+        labels = state["networks"][name]["configuration"]["labels"]
+        self.assertEqual(labels["com.docker.compose.project"], "demo")
+        self.assertEqual(labels["com.docker.compose.network"], key)
+
+    def _seed_container(self, name: str, service: str, network: str) -> None:
+        self._seed_state() if not self.state.exists() else None
+        state = self.load_state()
+        labels = {
+            "com.docker.compose.project": "demo",
+            "com.docker.compose.service": service,
+        }
+        state["containers"][name] = {
+            "id": name,
+            "name": name,
+            "image": "nginx:latest",
+            "labels": labels,
+            "networks": [network],
+            "dns": [],
+            "dns_search": [],
+            "dns_opt": [],
+            "entrypoint": None,
+            "cmd": [],
+            "run_argv": [],
+            "configuration": {
+                "id": name,
+                "labels": labels,
+                "mounts": [],
+                "image": {"reference": "nginx:latest"},
+            },
+            "status": {"state": "running", "networks": []},
+        }
+        self.state.write_text(json.dumps(state))
+
+    # -- `up` creates exactly the networks the planned services use --------- #
+
+    def test_service_without_networks_creates_default(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_default"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_default"})
+        self._assert_labels(state, "demo_default", "default")
+
+    def test_single_external_network_creates_nothing(self) -> None:
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["edge"] = {"configuration": {"name": "edge", "labels": {}}, "id": "edge"}
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+            networks:
+              edge:
+                external: true
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), [])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"edge"})
+        argv = state["containers"]["demo-web-1"]["run_argv"]
+        self.assertEqual(argv[argv.index("--network") + 1], "edge")
+
+    def test_single_managed_network_creates_only_its_own(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = self.created_networks()
+        # The single network is created, before the fix too; the fix is that
+        # nothing else is.
+        self.assertIn("demo_back", created)
+        self.assertEqual(created, ["demo_back"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back"})
+        self._assert_labels(state, "demo_back", "back")
+
+    def test_mixed_services_create_each_network_once_in_plan_order(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+              db:
+                image: postgres:16
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Both networks are created exactly once, in the plan's order: `web`
+        # (back) is planned before `db` (default), so default no longer comes
+        # first.
+        self.assertEqual(self.created_networks(), ["demo_back", "demo_default"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back", "demo_default"})
+        self._assert_labels(state, "demo_back", "back")
+        self._assert_labels(state, "demo_default", "default")
+
+    def test_named_default_and_default_plus_back(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [default]
+              db:
+                image: postgres:16
+                networks: [default, back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_default", "demo_back"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_default", "demo_back"})
+        self._assert_labels(state, "demo_default", "default")
+        self._assert_labels(state, "demo_back", "back")
+
+    def test_declared_default_no_service_uses_creates_nothing(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              default: {}
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back"})
+        self._assert_labels(state, "demo_back", "back")
+
+    # -- No side effect when a needed network is missing or conflicts ------- #
+
+    def test_missing_external_network_blocks_up_without_side_effects(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+            networks:
+              edge:
+                external: true
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("edge", up.stderr)
+        self.assertIn("external", up.stderr)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        self.assertEqual(self.load_state()["networks"], {})
+
+    def test_used_default_labelled_for_another_project_is_refused(self) -> None:
+        self._seed_resource("networks", "demo_default", {"com.docker.compose.project": "other"})
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 1, up.stderr)
+        self.assertIn("belongs to project", up.stderr)
+        self.assertIn("other", up.stderr)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        state = self.load_state()
+        self.assertEqual(
+            state["networks"]["demo_default"]["configuration"]["labels"],
+            {"com.docker.compose.project": "other"},
+        )
+
+    def test_unused_default_labelled_for_another_project_does_not_block_up(self) -> None:
+        self._seed_resource("networks", "demo_default", {"com.docker.compose.project": "other"})
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        up = self.docker("compose", "up", "-d")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back", "demo_default"})
+        back_labels = state["networks"]["demo_back"]["configuration"]["labels"]
+        default_labels = state["networks"]["demo_default"]["configuration"]["labels"]
+        self.assertEqual(back_labels["com.docker.compose.project"], "demo")
+        self.assertEqual(default_labels["com.docker.compose.project"], "other")
+
+    # -- The dry run reports the plan, in the plan's order ------------------ #
+
+    def test_dry_run_prints_only_used_networks_in_plan_order(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+              db:
+                image: postgres:16
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("Network ")]
+        # The plan's order: `web` (back) first, `db` (default) second.
+        self.assertEqual(lines, ["Network demo_back", "Network demo_default"])
+        self.assert_nothing_was_created()
+        # The common single-network case keeps its output: one `default`.
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("Network ")]
+        self.assertEqual(lines, ["Network demo_default"])
+        self.assert_nothing_was_created()
+
+    def test_dry_run_with_only_explicit_networks_lists_them_and_no_default(self) -> None:
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["edge"] = {"configuration": {"name": "edge", "labels": {}}, "id": "edge"}
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+                networks: [back]
+            networks:
+              edge:
+                external: true
+              back: {}
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("Network ")]
+        self.assertEqual(lines, ["Network edge (external, must exist)", "Network demo_back"])
+        self.assertNotIn("demo_default", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        self.assertEqual(set(self.load_state()["networks"]), {"edge"})
+
+    def test_dry_run_missing_external_network_exits_1_without_printing_the_plan(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+            networks:
+              edge:
+                external: true
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # The same message a real `up` prints for the missing external.
+        self.assertIn(
+            "network edge declared as external, but could not be found",
+            result.stderr,
+        )
+        self.assertNotIn("Dry run of project", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        self.assertEqual(self.load_state()["networks"], {})
+
+    def test_dry_run_unused_default_labelled_for_another_project_reports_no_conflict(self) -> None:
+        self._seed_resource("networks", "demo_default", {"com.docker.compose.project": "other"})
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("belongs to project", result.stderr)
+        self.assertNotIn("demo_default", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_default"})
+        self.assertEqual(
+            state["networks"]["demo_default"]["configuration"]["labels"],
+            {"com.docker.compose.project": "other"},
+        )
+
+    # -- Selection and dependencies restrict the set ------------------------ #
+
+    def test_up_api_leaves_default_uncreated_when_only_web_uses_it(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                networks: [back]
+              web:
+                image: nginx:latest
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d", "api")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back"})
+        self._assert_labels(state, "demo_back", "back")
+        self.assertEqual(set(state["containers"]), {"demo-api-1"})
+
+    def test_up_web_with_dependency_on_back_creates_both(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d", "web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The dependency is planned first, so its network is created first.
+        self.assertEqual(self.created_networks(), ["demo_back", "demo_default"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_back", "demo_default"})
+        self._assert_labels(state, "demo_back", "back")
+        self._assert_labels(state, "demo_default", "default")
+
+    def test_up_no_deps_web_does_not_create_back(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                depends_on: [db]
+              db:
+                image: postgres:16
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d", "--no-deps", "web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_default"])
+        state = self.load_state()
+        self.assertNotIn("demo_back", state["networks"])
+        self.assertNotIn("demo-db-1", state["containers"])
+
+    # -- `down` keeps its ownership rules ----------------------------------- #
+
+    def test_down_never_removes_a_default_the_project_never_created(self) -> None:
+        self._seed_resource(
+            "networks",
+            "demo_back",
+            {"com.docker.compose.project": "demo", "com.docker.compose.network": "back"},
+        )
+        self._seed_container("demo-web-1", "web", "demo_back")
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        down = self.docker("compose", "down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        rms = [call[-1] for call in self.runtime_calls() if call[:2] == ["network", "rm"]]
+        self.assertEqual(rms, ["demo_back"])
+        self.assertEqual(self.load_state()["networks"], {})
+
+    def test_down_removes_a_default_labelled_for_the_project(self) -> None:
+        self._seed_resource(
+            "networks",
+            "demo_default",
+            {"com.docker.compose.project": "demo", "com.docker.compose.network": "default"},
+        )
+        self._seed_container("demo-web-1", "web", "demo_default")
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+            """
+        )
+        down = self.docker("compose", "down")
+        self.assertEqual(down.returncode, 0, down.stderr)
+        rms = [call[-1] for call in self.runtime_calls() if call[:2] == ["network", "rm"]]
+        self.assertEqual(rms, ["demo_default"])
+        self.assertEqual(self.load_state()["networks"], {})
+
+    # -- The official normalizer -------------------------------------------- #
+
+    def test_official_normalizer_yields_default_for_empty_network_forms(self) -> None:
+        # Characterization (design D2): what the official normalizer yields
+        # for `networks: []` and `networks: {}` — the same implicit `default`
+        # as a service that declares none, so such a service uses `default`.
+        executable = shutil.which("docker-compose")
+        if executable is None or subprocess.run(
+            [executable, "version", "--short"], capture_output=True, text=True
+        ).stdout.strip() != "5.6.0":
+            self.skipTest("docker-compose 5.6.0 is not on PATH")
+        self.write_compose(
+            """
+            services:
+              empty_list:
+                image: alpine:3.20
+                networks: []
+              empty_map:
+                image: alpine:3.20
+                networks: {}
+            """
+        )
+        env = dict(os.environ)
+        env["DOCKER_HOST"] = "unix:///nonexistent.sock"
+        for name in [name for name in env if name.startswith("COMPOSE_")]:
+            del env[name]
+        result = subprocess.run(
+            [executable, "-p", "demo", "config", "--format", "json"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(self.project),
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        model = json.loads(result.stdout)
+        for service in ("empty_list", "empty_map"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    model["services"][service]["networks"],
+                    {"default": None},
+                )
 
 
 class DependsConditionTests(unittest.TestCase):

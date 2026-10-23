@@ -22,6 +22,16 @@ def project(**services):
     )
 
 
+def project_specs(**services):
+    """A project whose services map name -> spec dict (an ``image`` is added if absent)."""
+    specs = {}
+    for name, spec in services.items():
+        spec = dict(spec)
+        spec.setdefault("image", "x")
+        specs[name] = spec
+    return compose.Project("demo", {"services": specs}, "/tmp/demo")
+
+
 class SelectionTests(unittest.TestCase):
     def test_direct_dependency_excludes_the_unrelated_service(self):
         proj = project(api=["db"], db=None, worker=None)
@@ -80,6 +90,66 @@ class OptionalDependencyTests(unittest.TestCase):
     def test_required_dependency_is_pulled_in_even_when_another_is_optional(self):
         proj = project(api={"db": {}, "cache": {"required": False}}, db=None, cache=None)
         self.assertEqual(compose_plan.plan(proj, ["api"]).ordered, ["db", "api"])
+
+
+class NetworkTests(unittest.TestCase):
+    def test_no_networks_defaults_to_default(self):
+        proj = project_specs(api={})
+        self.assertEqual(compose_plan.plan(proj).networks, ["default"])
+
+    def test_only_edge_gives_edge(self):
+        proj = project_specs(api={"networks": ["edge"]})
+        self.assertEqual(compose_plan.plan(proj).networks, ["edge"])
+
+    def test_list_and_mapping_forms_agree(self):
+        list_form = project_specs(api={"networks": ["edge"]})
+        mapping_form = project_specs(api={"networks": {"edge": None}})
+        self.assertEqual(compose_plan.plan(list_form).networks, ["edge"])
+        self.assertEqual(compose_plan.plan(mapping_form).networks, ["edge"])
+
+    def test_default_named_explicitly(self):
+        proj = project_specs(api={"networks": ["default"]})
+        self.assertEqual(compose_plan.plan(proj).networks, ["default"])
+
+    def test_duplicates_across_services_collapse(self):
+        proj = project_specs(
+            api={"networks": ["edge"]},
+            web={"networks": ["edge", "front"]},
+        )
+        self.assertEqual(compose_plan.plan(proj).networks, ["edge", "front"])
+
+    def test_order_follows_dependencies_first(self):
+        proj = project_specs(
+            api={"depends_on": ["db"], "networks": ["edge"]},
+            db={"networks": ["front"]},
+        )
+        result = compose_plan.plan(proj)
+        self.assertEqual(result.ordered, ["db", "api"])
+        self.assertEqual(result.networks, ["front", "edge"])
+
+    def test_selection_restricts_the_set(self):
+        proj = project_specs(
+            api={"networks": ["edge"]},
+            db={"networks": ["front"]},
+            worker={"networks": ["batch"]},
+        )
+        self.assertEqual(compose_plan.plan(proj, ["db"]).networks, ["front"])
+
+    def test_no_deps_restricts_the_set(self):
+        proj = project_specs(
+            api={"depends_on": ["db"], "networks": ["edge"]},
+            db={"networks": ["front"]},
+        )
+        result = compose_plan.plan(proj, ["api"], no_deps=True)
+        self.assertEqual(result.ordered, ["api"])
+        self.assertEqual(result.networks, ["edge"])
+
+    def test_empty_mapping_contributes_nothing(self):
+        proj = project_specs(
+            api={"networks": {}},
+            web={"networks": ["edge"]},
+        )
+        self.assertEqual(compose_plan.plan(proj).networks, ["edge"])
 
 
 class InvalidGraphTests(unittest.TestCase):

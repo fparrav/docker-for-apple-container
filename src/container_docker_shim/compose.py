@@ -1089,12 +1089,7 @@ def _emit_planned(
 
 
 def _service_network_keys(service: Service) -> list[str]:
-    declared = service.spec.get("networks")
-    if isinstance(declared, dict):
-        return [str(key) for key in declared]
-    if isinstance(declared, list):
-        return [str(item) for item in declared]
-    return ["default"]
+    return compose_plan.service_network_keys(service.spec)
 
 
 def _service_networks(service: Service, project: Project) -> list[str]:
@@ -1904,7 +1899,6 @@ def _check_resources(project: Project, services: list[Service]) -> list[str]:
             uses["network"].setdefault(key, (_network_resource(project, key), service.name))
         for key in _service_volume_keys(service, project):
             uses["volume"].setdefault(key, (_volume_resource(project, key), service.name))
-    uses["network"].setdefault("default", (_network_resource(project, "default"), ""))
 
     notices: list[str] = []
     for family, used in uses.items():
@@ -2528,7 +2522,7 @@ def _print_dry_run(project: Project, services: list[Service]) -> None:
     """Print what ``up`` would create, from the same ordered list ``up`` uses."""
     networks: dict[str, compose_resources.Resource] = {}
     volumes: dict[str, compose_resources.Resource] = {}
-    for key in ["default", *(k for svc in services for k in _service_network_keys(svc))]:
+    for key in (k for svc in services for k in _service_network_keys(svc)):
         networks.setdefault(key, _network_resource(project, key))
     for service in services:
         for key in _service_volume_keys(service, project):
@@ -2590,17 +2584,9 @@ def cmd_up(
         _print_dry_run(project, services)
         return 0
 
-    # Provision declared networks (record specs for ensure-on-attach), defaulting
-    # to the implicit project network every service joins.
-    _ensure_network(project, "default")
-    referenced: set[str] = {"default"}
-    for service in services:
-        declared = service.spec.get("networks")
-        if isinstance(declared, dict):
-            referenced.update(str(k) for k in declared)
-        elif isinstance(declared, list):
-            referenced.update(str(k) for k in declared)
-    for net in referenced:
+    # Provision the networks the planned services use (record specs for
+    # ensure-on-attach); `default` is among them only when a service joins it.
+    for net in service_plan.networks:
         _ensure_network(project, net)
 
     # Reconcile instead of clearing: containers whose configuration and image
