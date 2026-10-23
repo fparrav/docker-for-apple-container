@@ -771,9 +771,17 @@ class LiveFixtureTests(unittest.TestCase):
     def test_fixture_e_services_resolve_only_peers_on_a_shared_network(self) -> None:
         self.require_images("alpine:3.20")
         harness = FixtureHarness(self, FIXTURE_E)
+        project = harness.project
 
         result = harness.compose("up", "-d", timeout=UP_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # Every service names its networks, so no default network is created.
+        listing = _run([_container(), "network", "ls"])
+        self.assertEqual(listing.returncode, 0, listing.stdout + listing.stderr)
+        self.assertNotIn(f"{project}_default", listing.stdout)
+        for network in ("front", "back"):
+            self.assertIn(f"{project}_{network}", listing.stdout)
 
         def resolves(service: str, peer: str) -> bool:
             # busybox getent exits non-zero when the name is not found.
