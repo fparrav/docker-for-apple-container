@@ -604,6 +604,14 @@ class ComposeE2ETests(unittest.TestCase):
         ]
         self.assertEqual(mutating, [])
 
+    def created_networks(self) -> list:
+        """Names of every network the runtime was asked to create, in order."""
+        return [
+            call[-1]
+            for call in self.runtime_calls()
+            if call[:2] == ["network", "create"]
+        ]
+
     def clear_action_log(self) -> None:
         state = self.load_state()
         state["action_log"] = []
@@ -722,11 +730,43 @@ class ComposeE2ETests(unittest.TestCase):
             argv = state["containers"][name]["run_argv"]
             self.assertEqual(argv[argv.index("--network") + 1], "edge")
         self.assertNotIn("demo_edge", state["networks"])
-        self.assertNotIn(["network", "create"], [a[:2] for a in state["action_log"]])
+        self.assertEqual(self.created_networks(), [])
+        self.assertNotIn("demo_default", state["networks"])
         hosts_writes = [e for e in state["exec_log"] if "/etc/hosts" in " ".join(e["cmd"])]
         joined = " ".join(" ".join(e["cmd"]) for e in hosts_writes)
         self.assertIn("web", joined)
         self.assertIn("db", joined)
+
+    def test_created_networks_reports_only_the_networks_up_created(self) -> None:
+        # The helper reads the runtime call log, not the container-only action
+        # log: with the project network already present, `up` creates only
+        # `demo_back`, and the name it reports is the key the fake stored it
+        # under.
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["demo_default"] = {
+            "configuration": {
+                "name": "demo_default",
+                "labels": {"com.docker.compose.project": "demo"},
+            },
+            "id": "demo_default",
+        }
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        self.assertIn("demo_back", state["networks"])
 
     def test_up_injects_host_docker_internal(self) -> None:
         # Multi-service /etc/hosts writes must also publish the host-gateway
