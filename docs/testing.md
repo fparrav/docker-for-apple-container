@@ -233,7 +233,9 @@ ran on (`ok environment: ...`). `--dist` may be a relative or an absolute path;
 CI runs it as `--dist dist`, and `tests/test_verify_wheel.py` covers both forms
 with a wheel built by hand in a temporary directory. CI runs it in the `wheel`
 job on the Python floor from `pyproject.toml` (`3.9` on `ubuntu-24.04`) and on
-`3.x` (`ubuntu-latest`); the release workflow runs it on the files it publishes
+`3.x` (`ubuntu-latest` and `macos-latest`); the macOS leg has no Apple
+`container` runtime, so it does not run the `live` tier. The release workflow
+runs it on the files it publishes
 (see [Releasing](releasing.md#the-wheel-check-legs)). It is a packaging check,
 not live evidence; a change to `scripts/` or `tests/` invalidates the recorded
 live evidence (see [Releasing](releasing.md#release-evidence)).
