@@ -4825,6 +4825,87 @@ class ImplicitDefaultNetworkTests(ComposeFakeBase):
         self.assertEqual(lines, ["Network demo_default"])
         self.assert_nothing_was_created()
 
+    def test_dry_run_with_only_explicit_networks_lists_them_and_no_default(self) -> None:
+        self._seed_state()
+        state = self.load_state()
+        state["networks"]["edge"] = {"configuration": {"name": "edge", "labels": {}}, "id": "edge"}
+        self.state.write_text(json.dumps(state))
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+                networks: [back]
+            networks:
+              edge:
+                external: true
+              back: {}
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("Network ")]
+        self.assertEqual(lines, ["Network edge (external, must exist)", "Network demo_back"])
+        self.assertNotIn("demo_default", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        self.assertEqual(set(self.load_state()["networks"]), {"edge"})
+
+    def test_dry_run_missing_external_network_exits_1_without_printing_the_plan(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [edge]
+              db:
+                image: postgres:16
+            networks:
+              edge:
+                external: true
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # The same message a real `up` prints for the missing external.
+        self.assertIn(
+            "network edge declared as external, but could not be found",
+            result.stderr,
+        )
+        self.assertNotIn("Dry run of project", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        self.assertEqual(self.load_state()["networks"], {})
+
+    def test_dry_run_unused_default_labelled_for_another_project_reports_no_conflict(self) -> None:
+        self._seed_resource("networks", "demo_default", {"com.docker.compose.project": "other"})
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self.docker("compose", "--dry-run", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("belongs to project", result.stderr)
+        self.assertNotIn("demo_default", result.stdout)
+        self.assertEqual(self.created_networks(), [])
+        self.assert_nothing_was_created()
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_default"})
+        self.assertEqual(
+            state["networks"]["demo_default"]["configuration"]["labels"],
+            {"com.docker.compose.project": "other"},
+        )
+
     # -- Selection and dependencies restrict the set ------------------------ #
 
     def test_up_api_leaves_default_uncreated_when_only_web_uses_it(self) -> None:
