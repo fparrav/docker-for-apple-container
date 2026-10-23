@@ -45,7 +45,7 @@ tag cannot be mistaken for a release.
 
 `.github/workflows/release.yml` has four jobs, all on hosted runners.
 `checks`, `package` and `release` run on `ubuntu-latest`; `smoke` runs on the
-two legs described in [The wheel check legs](#the-wheel-check-legs):
+three legs described in [The wheel check legs](#the-wheel-check-legs):
 
 1. `checks` (hosted checks, `contents: read`): the test report for the `unit`
    and `fake` tiers (`scripts/test_report.py --tiers unit,fake`), the
@@ -85,10 +85,19 @@ matrix, kept equal by `tests/test_workflows.py`:
 | ------ | --------------- | ------------------------------------------------------------ |
 | `3.9`  | `ubuntu-24.04`  | The floor from `pyproject.toml`; pinned to a versioned image. |
 | `3.x`  | `ubuntu-latest` | The newest release, on the image that moves with GitHub.      |
+| `3.x`  | `macos-latest`  | The macOS leg: the same wheel on a hosted macOS image.        |
 
 The floor leg is pinned because `ubuntu-24.04` is the last hosted image whose
 `actions/python-versions` manifest still ships CPython 3.9; on `ubuntu-latest`
-`setup-python` cannot install 3.9. Both legs block: a failed `smoke` leg stops
+`setup-python` cannot install 3.9. The macOS leg installs and exercises the
+exact files `package` built, so a platform problem in the wheel stops the
+release. A hosted macOS runner has no Apple `container` runtime and no
+virtualization, so the macOS leg does not run the `live` tier: only the
+runtime-free checks of `verify_wheel.py` run there, with its stand-in `container`
+and without Docker Desktop, and it writes nothing to `docs/evidence/`. If GitHub
+moves `macos-latest` to an image that breaks the check, the leg fails at
+`Set up Python` or in `verify_wheel.py` and the release does not run; pin a
+versioned `macos-*` image in both workflows while that is fixed. All legs block: a failed `smoke` leg stops
 the release, and neither leg is `continue-on-error`. `verify_wheel.py` prints
 `ok environment: Python <version> on <platform>` right after the wheel and
 contents lines, so a log shows which interpreter and image ran the check.
