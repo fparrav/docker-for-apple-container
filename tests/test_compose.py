@@ -5062,6 +5062,835 @@ class ImplicitDefaultNetworkTests(ComposeFakeBase):
                 )
 
 
+class ReservedComposeLabelTests(ComposeFakeBase):
+    """The `com.docker.compose` label namespace belongs to the shim.
+
+    A user label inside it — map or list form, on a service, a network or a
+    volume — must be refused before any runtime mutation: a non-zero exit
+    with a `REFUSED:` line naming the offending key and the resource, and an
+    unchanged fake-runtime state (no containers, networks or volumes).
+
+    The service-level check (task 2.1) has landed, so the service, in-use
+    network and in-use volume tests pass. The unused- and external-resource
+    tests (task 1.4) are expected to fail until task 2.2 widens the check to
+    every declared network and volume (Q3 resolved): today the shim only
+    validates the resources the planned services use, so a reserved label on
+    an unused or `external: true` resource is accepted and `up` succeeds. The
+    exit code is asserted as non-zero rather than a fixed 64 because design
+    Q2 leaves the exact code open; tighten to 64 once Q2 is resolved.
+
+    The official-normalizer tests (design D5) exercise the same refusals when
+    the model arrives normalized by the real `docker-compose` binary instead
+    of the built-in parser; they skip cleanly when `docker-compose` 5.6.0 is
+    not on PATH, like the other real-binary characterization tests.
+    """
+
+    def _assert_state_untouched(self) -> None:
+        state = self.load_state()
+        self.assertEqual(state["containers"], {})
+        self.assertEqual(state["networks"], {})
+        self.assertEqual(state["volumes"], {})
+
+    def _assert_refused(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED:", result.stderr)
+
+    def _assert_only_read_only_runtime_calls(self) -> None:
+        """Every recorded runtime call is read-only (list/inspect-style).
+
+        Asserts on the actual call log: any call that creates, runs, starts,
+        stops, modifies or removes anything fails the test, whatever else the
+        log contains.
+        """
+        for call in self.runtime_calls():
+            verb = call[0]
+            if verb in ("image", "network", "volume", "system"):
+                sub = call[1] if len(call) > 1 else ""
+                read_only = sub in ("inspect", "list", "status")
+            else:
+                read_only = verb in ("list", "inspect", "logs", "--version")
+            self.assertTrue(read_only, f"mutating runtime call reached the runtime: {call!r}")
+
+    def test_service_reserved_label_map_is_refused(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.compose.project: another-project
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.project", result.stderr)
+        self.assertIn("api", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_service_reserved_label_list_is_refused(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  - com.docker.compose.service=other
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.service", result.stderr)
+        self.assertIn("api", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_network_reserved_label_is_refused(self) -> None:
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    networks: [back]
+                networks:
+                  back:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    networks: [back]
+                networks:
+                  back:
+                    labels:
+                      - com.docker.compose.network=back
+                """,
+                "com.docker.compose.network",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("back", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_volume_reserved_label_is_refused(self) -> None:
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    volumes:
+                      - data:/data
+                volumes:
+                  data:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    volumes:
+                      - data:/data
+                volumes:
+                  data:
+                    labels:
+                      - com.docker.compose.volume=data
+                """,
+                "com.docker.compose.volume",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("data", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_several_offending_labels_are_reported_together(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.compose.project: other
+                networks: [back]
+            networks:
+              back:
+                labels:
+                  com.docker.compose.network: other
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        refused = [line for line in result.stderr.splitlines() if line.startswith("REFUSED:")]
+        self.assertEqual(len(refused), 2, result.stderr)
+        self.assertIn("com.docker.compose.project", result.stderr)
+        self.assertIn("com.docker.compose.network", result.stderr)
+        self.assertIn("api", result.stderr)
+        self.assertIn("back", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_error_text_names_the_offending_key_and_resource(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                networks: [back]
+            networks:
+              back:
+                labels:
+                  com.docker.compose.project: other-project
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.project", result.stderr)
+        self.assertIn("back", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_dry_run_reports_the_same_refusal_as_up(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.compose.project: another-project
+            """
+        )
+        dry = self.docker("compose", "--dry-run", "up", "-d")
+        real = self.docker("compose", "up", "-d")
+        self.assertEqual(dry.returncode, real.returncode)
+        self.assertNotEqual(real.returncode, 0, real.stderr)
+        refused_dry = [line for line in dry.stderr.splitlines() if line.startswith("REFUSED:")]
+        refused_real = [line for line in real.stderr.splitlines() if line.startswith("REFUSED:")]
+        self.assertTrue(refused_dry, dry.stderr)
+        self.assertEqual(refused_dry, refused_real)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    # -- Review findings (task 1.4) ----------------------------------------- #
+    #
+    # The independent review found that the task 2.1 check only validates the
+    # networks and volumes the planned services use, and skips external ones.
+    # Q3 is resolved: every declared network and volume is validated, used or
+    # not, managed or external. The unused- and external-resource tests below
+    # are expected to fail until task 2.2 widens the check; the exact-key,
+    # bare-list-entry and pre-existing-state tests pin behaviour the current
+    # implementation already has.
+
+    def test_unused_network_reserved_label_is_refused(self) -> None:
+        # Q3: a declared network is validated even when no service uses it.
+        # Until task 2.2 the shim never looks at it, so `up` succeeds and the
+        # label is accepted.
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                networks:
+                  back:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                networks:
+                  back:
+                    labels:
+                      - com.docker.compose.network=back
+                """,
+                "com.docker.compose.network",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("back", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_unused_volume_reserved_label_is_refused(self) -> None:
+        # Q3: a declared volume is validated even when no service mounts it.
+        # Until task 2.2 the shim never looks at it, so `up` succeeds and the
+        # label is accepted.
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                volumes:
+                  data:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                volumes:
+                  data:
+                    labels:
+                      - com.docker.compose.volume=data
+                """,
+                "com.docker.compose.volume",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("data", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_external_network_and_volume_reserved_labels_are_refused(self) -> None:
+        # Q3: `external: true` resources are validated too. They are left
+        # unused by the service, so the fake state needs no live counterpart;
+        # until task 2.2 the shim skips external resources and `up` succeeds.
+        for body, key, resource in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                networks:
+                  back:
+                    external: true
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+                "back",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                networks:
+                  back:
+                    external: true
+                    labels:
+                      - com.docker.compose.network=back
+                """,
+                "com.docker.compose.network",
+                "back",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                volumes:
+                  data:
+                    external: true
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+                "data",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                volumes:
+                  data:
+                    external: true
+                    labels:
+                      - com.docker.compose.volume=data
+                """,
+                "com.docker.compose.volume",
+                "data",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn(resource, result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_exact_namespace_key_and_bare_list_entry_are_refused(self) -> None:
+        # The namespace boundary is the exact key `com.docker.compose` (no
+        # suffix) and a list entry without `=` (a bare key, no value).
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    labels:
+                      com.docker.compose: other
+                """,
+                "com.docker.compose",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    labels:
+                      - com.docker.compose.project
+                """,
+                "com.docker.compose.project",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("api", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_refusal_leaves_preexisting_resources_byte_for_byte_unchanged(self) -> None:
+        # A live project: a network, a volume and the container for the very
+        # service that carries the reserved label already exist in the fake
+        # runtime. The refusal must happen before any runtime call that
+        # creates, runs, starts, stops, modifies or removes anything, and the
+        # pre-existing resources must survive byte for byte.
+        self._seed_state()
+        network = {
+            "configuration": {
+                "name": "demo_back",
+                "labels": {
+                    "com.docker.compose.project": "demo",
+                    "com.docker.compose.network": "back",
+                },
+            },
+            "id": "demo_back",
+        }
+        volume = {
+            "configuration": {
+                "name": "demo_data",
+                "labels": {
+                    "com.docker.compose.project": "demo",
+                    "com.docker.compose.volume": "data",
+                },
+            },
+            "id": "demo_data",
+        }
+        labels = {
+            "com.docker.compose.project": "demo",
+            "com.docker.compose.service": "api",
+            "com.docker.compose.container-number": "1",
+            "com.docker.compose.oneoff": "False",
+            "com.docker.compose.config-hash": "0" * 64,
+            "com.docker.compose.image": "fakeid-alpine:3.20",
+        }
+        container = {
+            "id": "demo-api-1",
+            "name": "demo-api-1",
+            "image": "alpine:3.20",
+            "labels": labels,
+            "networks": ["demo_back"],
+            "dns": [],
+            "dns_search": [],
+            "dns_opt": [],
+            "entrypoint": None,
+            "cmd": [],
+            "run_argv": [],
+            "configuration": {
+                "id": "demo-api-1",
+                "labels": labels,
+                "mounts": [],
+                "image": {"reference": "alpine:3.20"},
+            },
+            "status": {"state": "running", "networks": []},
+        }
+        state = self.load_state()
+        state["networks"]["demo_back"] = network
+        state["volumes"]["demo_data"] = volume
+        state["containers"]["demo-api-1"] = container
+        self.state.write_text(json.dumps(state))
+        before = self.state.read_text()
+
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.compose.project: other
+                networks: [back]
+                volumes:
+                  - data:/data
+            networks:
+              back: {}
+            volumes:
+              data: {}
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.project", result.stderr)
+        self.assertIn("api", result.stderr)
+
+        after = self.state.read_text()
+        self.assertEqual(after, before)
+        state = self.load_state()
+        self.assertEqual(state["networks"]["demo_back"], network)
+        self.assertEqual(state["volumes"]["demo_data"], volume)
+        self.assertEqual(state["containers"]["demo-api-1"], container)
+        self._assert_only_read_only_runtime_calls()
+        self.assert_nothing_was_created()
+
+    # -- Official-normalizer path (design D5) ------------------------------ #
+    #
+    # The same refusals must hold when the model arrives normalized by the
+    # official `docker-compose` binary instead of the built-in parser. The
+    # normalizer converts list-form labels to a map, so both forms arrive as
+    # maps; the validation must refuse either way.
+
+    def _use_official_normalizer(self) -> None:
+        """Point the shim at the real `docker-compose` 5.6.0, or skip.
+
+        Same gate as the other real-binary tests: the official-normalizer
+        path is only exercised when `docker-compose` 5.6.0 is on PATH. The
+        `version` check guards against the env var silently not taking
+        effect, so a skip or a failure is never mistaken for the built-in
+        parser's behaviour.
+        """
+        real = shutil.which("docker-compose")
+        if real is None or subprocess.run(
+            [real, "version", "--short"], capture_output=True, text=True
+        ).stdout.strip() != "5.6.0":
+            self.skipTest("docker-compose 5.6.0 is not on PATH")
+        self.env["CONTAINER_DOCKER_SHIM_COMPOSE"] = real
+        self.env["DOCKER_HOST"] = "unix:///nonexistent.sock"
+        version = self.docker("compose", "version")
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertEqual(version.stdout, "normalizer: official 5.6.0\n")
+
+    def test_official_normalizer_reserved_service_label_map_is_refused(self) -> None:
+        self._use_official_normalizer()
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.compose.project: another-project
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.project", result.stderr)
+        self.assertIn("api", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_official_normalizer_reserved_service_label_list_is_refused(self) -> None:
+        # The official normalizer converts the list to a map before the model
+        # reaches the shim; the refusal must hold on the normalized model.
+        self._use_official_normalizer()
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  - com.docker.compose.service=other
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self._assert_refused(result)
+        self.assertIn("com.docker.compose.service", result.stderr)
+        self.assertIn("api", result.stderr)
+        self.assert_nothing_was_created()
+        self._assert_state_untouched()
+
+    def test_official_normalizer_reserved_network_label_is_refused(self) -> None:
+        self._use_official_normalizer()
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    networks: [back]
+                networks:
+                  back:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    networks: [back]
+                networks:
+                  back:
+                    labels:
+                      - com.docker.compose.network=back
+                """,
+                "com.docker.compose.network",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("back", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+    def test_official_normalizer_reserved_volume_label_is_refused(self) -> None:
+        self._use_official_normalizer()
+        for body, key in (
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    volumes:
+                      - data:/data
+                volumes:
+                  data:
+                    labels:
+                      com.docker.compose.project: other
+                """,
+                "com.docker.compose.project",
+            ),
+            (
+                """
+                services:
+                  api:
+                    image: alpine:3.20
+                    volumes:
+                      - data:/data
+                volumes:
+                  data:
+                    labels:
+                      - com.docker.compose.volume=data
+                """,
+                "com.docker.compose.volume",
+            ),
+        ):
+            with self.subTest(key=key):
+                self._seed_state()
+                self.write_compose(body)
+                result = self.docker("compose", "up", "-d")
+                self._assert_refused(result)
+                self.assertIn(key, result.stderr)
+                self.assertIn("data", result.stderr)
+                self.assert_nothing_was_created()
+                self._assert_state_untouched()
+
+
+class UserLabelsStillWorkTests(ComposeFakeBase):
+    """Non-regression: user labels outside the reserved namespace keep working.
+
+    These tests pin the behaviour change `reject-reserved-compose-labels`
+    must not alter (spec `compose-resource-identity`, scenarios "Non-reserved
+    labels keep working" and "Internal labels are not refused"): `up -d` exits
+    0, every user label reaches the container, the managed network and the
+    managed volume exactly once, next to the shim's ownership labels, and a
+    service without any `labels:` keeps the internal labels the shim writes.
+    They must pass both before and after task 2.1.
+    """
+
+    USER_LABELS = {
+        "team": "platform",
+        "com.example.owner": "ops",
+    }
+
+    MAP_BODY = """
+    services:
+      api:
+        image: alpine:3.20
+        labels:
+          team: platform
+          com.example.owner: ops
+        networks: [back]
+        volumes:
+          - data:/data
+    networks:
+      back:
+        labels:
+          team: platform
+          com.example.owner: ops
+    volumes:
+      data:
+        labels:
+          team: platform
+          com.example.owner: ops
+    """
+
+    LIST_BODY = """
+    services:
+      api:
+        image: alpine:3.20
+        labels:
+          - team=platform
+          - com.example.owner=ops
+        networks: [back]
+        volumes:
+          - data:/data
+    networks:
+      back:
+        labels:
+          - team=platform
+          - com.example.owner=ops
+    volumes:
+      data:
+        labels:
+          - team=platform
+          - com.example.owner=ops
+    """
+
+    @staticmethod
+    def _label_occurrences(argv: list[str], label: str) -> int:
+        """How many times `--label <label>` (or `--label=<label>`) appears in one argv."""
+        count = 0
+        i = 0
+        while i < len(argv):
+            if argv[i] == "--label" and i + 1 < len(argv) and argv[i + 1] == label:
+                count += 1
+                i += 2
+                continue
+            if argv[i] == f"--label={label}":
+                count += 1
+            i += 1
+        return count
+
+    def _created_argv(self, family: str, name: str) -> list[str]:
+        """The argv of the `network`/`volume` create call for `name` (empty when none)."""
+        for call in self.runtime_calls():
+            if call[:2] == [family, "create"] and call[-1] == name:
+                return call
+        return []
+
+    def _assert_user_labels(self, labels: dict, argv: list[str]) -> None:
+        """Each user label is recorded exactly once, next to the shim's ownership label."""
+        for key, value in self.USER_LABELS.items():
+            self.assertEqual(labels.get(key), value)
+            self.assertEqual(self._label_occurrences(argv, f"{key}={value}"), 1)
+        self.assertEqual(labels.get("com.docker.compose.project"), "demo")
+
+    def _assert_up_records_user_labels(self, body: str) -> None:
+        self._seed_state()
+        self.write_compose(body)
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.load_state()
+
+        container = state["containers"]["demo-api-1"]
+        self._assert_user_labels(container["labels"], container["run_argv"])
+        self.assertEqual(container["labels"]["com.docker.compose.service"], "api")
+
+        network = state["networks"]["demo_back"]["configuration"]
+        self._assert_user_labels(network["labels"], self._created_argv("network", "demo_back"))
+        self.assertEqual(network["labels"]["com.docker.compose.network"], "back")
+
+        volume = state["volumes"]["demo_data"]["configuration"]
+        self._assert_user_labels(volume["labels"], self._created_argv("volume", "demo_data"))
+        self.assertEqual(volume["labels"]["com.docker.compose.volume"], "data")
+
+    def test_non_reserved_labels_keep_working_on_service_network_and_volume(self) -> None:
+        self._assert_up_records_user_labels(self.MAP_BODY)
+
+    def test_non_reserved_labels_in_list_form_keep_working(self) -> None:
+        self._assert_up_records_user_labels(self.LIST_BODY)
+
+    def test_service_without_labels_keeps_the_internal_labels(self) -> None:
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        labels = self.load_state()["containers"]["demo-api-1"]["labels"]
+        self.assertEqual(labels["com.docker.compose.project"], "demo")
+        self.assertEqual(labels["com.docker.compose.service"], "api")
+        self.assertEqual(labels["com.docker.compose.container-number"], "1")
+        self.assertEqual(labels["com.docker.compose.oneoff"], "False")
+        self.assertEqual(len(labels["com.docker.compose.config-hash"]), 64)
+        self.assertEqual(labels["com.docker.compose.image"], "fakeid-alpine:3.20")
+
+    def test_lookalike_key_outside_the_reserved_namespace_is_not_refused(self) -> None:
+        # `com.docker.composer` shares the `com.docker.compose` prefix but is
+        # neither that key itself nor a `com.docker.compose.*` key, so design
+        # D1 (the exact prefix boundary of open question Q1) leaves it alone.
+        self._seed_state()
+        self.write_compose(
+            """
+            services:
+              api:
+                image: alpine:3.20
+                labels:
+                  com.docker.composer: x
+            """
+        )
+        result = self.docker("compose", "up", "-d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        container = self.load_state()["containers"]["demo-api-1"]
+        self.assertEqual(container["labels"].get("com.docker.composer"), "x")
+        self.assertEqual(self._label_occurrences(container["run_argv"], "com.docker.composer=x"), 1)
+
+
 class DependsConditionTests(unittest.TestCase):
     def project(self, body: str) -> compose.Project:
         return compose.Project("p", compose.parse_yaml(textwrap.dedent(body)), "/tmp/p")
