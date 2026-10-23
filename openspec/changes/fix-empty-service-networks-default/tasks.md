@@ -23,7 +23,7 @@
   - Archivos: ninguno. Depende de: 2.1.
   - Hecho cuando: la prueba de caracterización del normalizador oficial pasa (con `docker-compose` 5.6.0 disponible) y coincide con el comportamiento del shim para ambas formas; `python3 scripts/test_report.py --tiers unit,fake` termina en 0 (borrar el `report.json` generado); `python3 -m compileall -q src scripts tests` y `git diff --check` están limpios; `openspec validate fix-empty-service-networks-default --strict` pasa.
 
-- [ ] 3.2 Generar evidencia en vivo nueva antes del primer tag final @needs-human
+- [x] 3.2 Generar evidencia en vivo nueva antes del primer tag final @needs-human
   - Archivos: `docs/evidence/runtime-1.5.0-<timestamp>.json` (nuevo). Depende de: 3.1 y de integrar este change junto con `reject-reserved-compose-labels` y cualquier otro que toque `src/`, `scripts/` o `tests/`.
   - Por qué una persona: la corrida usa la máquina del mantenedor y la decisión de confirmar el archivo. No es necesaria para pre-releases.
   - Hecho cuando: `git status --porcelain -- src scripts tests pyproject.toml` no imprime nada, `python3 scripts/validate-runtime.py --evidence` termina en 0 con todas las pruebas declaradas aprobadas y `python3 scripts/verify_release_evidence.py --tag v9.9.9` termina en 0. Los archivos de evidencia anteriores no se modifican.
