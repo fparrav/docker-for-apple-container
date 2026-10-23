@@ -332,6 +332,11 @@ when available, then fall back to stable service-name order from labels.
   are never removed. `down -v` needs the Compose file to know what the project
   owns: without one it exits 64 and removes nothing (plain `down` still works
   from labels).
+- **The `com.docker.compose.*` label namespace belongs to the shim.** `up`
+  (and `--dry-run`) refuses a user label in that namespace on a service, network
+  or volume, in map or list form, before creating anything, with a `REFUSED:`
+  line naming the key and the resource. Labels the shim generates, and user
+  labels outside the namespace, are applied as before.
 - **`up [SERVICE...]` acts on the selection and what it needs.** The named
   services are created together with their `depends_on` closure, dependencies
   first, and unrelated services are left alone; unknown names exit 1 and
