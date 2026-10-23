@@ -1,0 +1,22 @@
+{
+  "schema": 2,
+  "container_version": "1.5.0",
+  "generated_at": "2026-10-23T19:39:48Z",
+  "commit": "37857405f9fd707c88b186495f5877ca8e0374f7",
+  "trees": {
+    "src": "79d9058ef95ce9f0ceb055d5d5edc385407952b1",
+    "scripts": "fb5e018013bb2bc048ae30bb1e886868f6e470b0",
+    "tests": "424a0a8b84cfe306890f1e87278b0d14ff008964",
+    "pyproject.toml": "23f543f5bc902a7d157b8503a664604da770d970"
+  },
+  "tree_hash": "7068e9c5bbf1e99db701fc27460dae47292f34f6d9fe7726f221b011b06d6413",
+  "live": {
+    "ran": 40,
+    "passed": 40,
+    "failed": 0,
+    "skipped": 0,
+    "not_run": 0,
+    "declared": 40
+  },
+  "result": "passed"
+}
