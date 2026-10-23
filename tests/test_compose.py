@@ -5062,6 +5062,113 @@ class ImplicitDefaultNetworkTests(ComposeFakeBase):
                 )
 
 
+class EmptyServiceNetworksTests(ComposeFakeBase):
+    """`networks: []` and `networks: {}` mean the project's `default`, as in
+    the official Compose; explicit non-empty networks do not add it."""
+
+    def _up(self, *args: str, dry_run: bool = False):
+        flag = ["--dry-run"] if dry_run else []
+        return self.docker("compose", *flag, "up", "-d", *args)
+
+    def _assert_default_attached(self, state: dict, container: str) -> None:
+        argv = state["containers"][container]["run_argv"]
+        self.assertEqual(argv[argv.index("--network") + 1], "demo_default")
+
+    def _assert_empty_form_gets_default(self, empty: str) -> None:
+        self.write_compose(
+            f"""
+            services:
+              web:
+                image: nginx:latest
+                networks: {empty}
+            """
+        )
+        result = self._up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_default"])
+        state = self.load_state()
+        self.assertEqual(set(state["networks"]), {"demo_default"})
+        self._assert_default_attached(state, "demo-web-1")
+
+    def test_empty_list_creates_and_attaches_default(self) -> None:
+        self._assert_empty_form_gets_default("[]")
+
+    def test_empty_mapping_creates_and_attaches_default(self) -> None:
+        self._assert_empty_form_gets_default("{}")
+
+    def test_empty_form_next_to_explicit_network_creates_both_once(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: []
+              db:
+                image: postgres:16
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self._up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(self.created_networks()), ["demo_back", "demo_default"])
+        self.assertEqual(set(self.load_state()["networks"]), {"demo_back", "demo_default"})
+
+    def test_only_explicit_networks_do_not_create_default(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: [back]
+            networks:
+              back: {}
+            """
+        )
+        result = self._up()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        self.assertEqual(set(self.load_state()["networks"]), {"demo_back"})
+
+    def test_empty_form_in_an_unselected_service_creates_no_default(self) -> None:
+        self.write_compose(
+            """
+            services:
+              api:
+                image: nginx:latest
+                networks: [back]
+              web:
+                image: nginx:latest
+                networks: {}
+            networks:
+              back: {}
+            """
+        )
+        result = self._up("api")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created_networks(), ["demo_back"])
+        self.assertEqual(set(self.load_state()["networks"]), {"demo_back"})
+
+    def test_dry_run_lists_default_once_and_creates_nothing(self) -> None:
+        self.write_compose(
+            """
+            services:
+              web:
+                image: nginx:latest
+                networks: []
+              worker:
+                image: nginx:latest
+                networks: {}
+            """
+        )
+        result = self._up(dry_run=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("Network ")]
+        self.assertEqual(lines, ["Network demo_default"])
+        self.assert_nothing_was_created()
+
+
 class ReservedComposeLabelTests(ComposeFakeBase):
     """The `com.docker.compose` label namespace belongs to the shim.
 
