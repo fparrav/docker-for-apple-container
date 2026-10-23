@@ -40,7 +40,7 @@
   - Por qué una persona: las patas de macOS solo corren en runners alojados de GitHub; no se pueden reproducir localmente.
   - Hecho cuando: el job `wheel` de `ci.yml` pasa en macOS y un tag de pre-release de prueba muestra el job `smoke` de macOS verde antes de `release`.
 
-- [ ] 4.3 Generar evidencia en vivo nueva antes del primer tag final @needs-human
+- [x] 4.3 Generar evidencia en vivo nueva antes del primer tag final @needs-human
   - Archivos: `docs/evidence/runtime-1.5.0-<timestamp>.json` (nuevo). Depende de: 4.2 e integrar este change junto con `reject-reserved-compose-labels` y `fix-empty-service-networks-default`.
   - Por qué una persona: la corrida usa la máquina del mantenedor y la decisión de confirmar el archivo. No es necesaria para pre-releases.
   - Hecho cuando: `git status --porcelain -- src scripts tests pyproject.toml` no imprime nada, `python3 scripts/validate-runtime.py --evidence` termina en 0 con todas las pruebas declaradas aprobadas y `python3 scripts/verify_release_evidence.py --tag v9.9.9` termina en 0. Los archivos de evidencia anteriores no se modifican.

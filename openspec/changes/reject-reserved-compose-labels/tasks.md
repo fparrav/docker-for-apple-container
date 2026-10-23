@@ -50,7 +50,7 @@
   - Archivos: ninguno. Depende de: 2.1, 3.1.
   - Hecho cuando: `python3 -m unittest discover -s tests` y `/usr/bin/python3 -m unittest discover -s tests` pasan, `python3 scripts/test_report.py --tiers unit,fake` termina en 0 (borrar el `report.json` generado), `python3 -m compileall -q src scripts tests` y `git diff --check` están limpios, y `openspec validate reject-reserved-compose-labels --strict` pasa.
 
-- [ ] 4.3 Generar evidencia en vivo nueva antes del primer tag final @needs-human
+- [x] 4.3 Generar evidencia en vivo nueva antes del primer tag final @needs-human
   - Archivos: `docs/evidence/runtime-1.5.0-<timestamp>.json` (nuevo). Depende de: 4.2 y de integrar este change junto con `fix-empty-service-networks-default` y cualquier otro que toque `src/`, `scripts/` o `tests/`.
   - Por qué una persona: la corrida usa la máquina del mantenedor y la decisión de confirmar el archivo. No es necesaria para pre-releases.
   - Hecho cuando: `git status --porcelain -- src scripts tests pyproject.toml` no imprime nada, `python3 scripts/validate-runtime.py --evidence` termina en 0 con todas las pruebas declaradas aprobadas, y `python3 scripts/verify_release_evidence.py --tag v9.9.9` termina en 0. Los archivos de evidencia anteriores no se modifican.
