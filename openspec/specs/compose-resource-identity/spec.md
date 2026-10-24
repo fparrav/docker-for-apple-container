@@ -98,14 +98,28 @@ networks they share, including external and explicitly named networks.
 
 ### Requirement: The implicit default network exists only when a selected service uses it
 `up` SHALL create, check and attach the network with key `default` only when at
-least one selected service uses it, either because it declares no network or
-because it names `default`. A service that names only other networks SHALL NOT
-cause `<project>_default` to be created, checked or reported, and a declared
-top-level `default` that no selected service uses SHALL be treated the same way.
+least one selected service uses it, either because it declares no network, because
+it declares an empty list or an empty mapping of networks (`networks: []` or
+`networks: {}`), or because it names `default`. A service that names only other
+networks SHALL NOT cause `<project>_default` to be created, checked or reported,
+and a declared top-level `default` that no selected service uses SHALL be treated
+the same way.
 
 #### Scenario: Service without networks
 - **WHEN** `up` runs for a project whose only service declares no `networks`
 - **THEN** `<project>_default` is created with the project and key labels and the container attaches to it
+
+#### Scenario: Empty list of networks
+- **WHEN** `up` corre para un proyecto cuyo único servicio declara `networks: []`
+- **THEN** `<project>_default` se crea con las etiquetas de proyecto y de clave, y el contenedor se adjunta a ella, igual que con el normalizador oficial (`{"default": null}`)
+
+#### Scenario: Empty mapping of networks
+- **WHEN** `up` corre para un proyecto cuyo único servicio declara `networks: {}`
+- **THEN** `<project>_default` se crea y el contenedor se adjunta a ella
+
+#### Scenario: Empty forms next to explicit networks
+- **WHEN** un servicio declara `networks: []` y otro declara `networks: [back]`
+- **THEN** se crean `<project>_default` y `<project>_back`, una vez cada una, y cada servicio se adjunta solo a la que usa
 
 #### Scenario: Only an external network
 - **WHEN** the only service declares `networks: [edge]` and `edge` is `external: true` and exists
@@ -127,6 +141,10 @@ top-level `default` that no selected service uses SHALL be treated the same way.
 - **WHEN** the model declares a top-level `default` network and every selected service uses other networks
 - **THEN** `<project>_default` is not created and is not checked
 
+#### Scenario: Empty form outside the selection
+- **WHEN** `up api` corre, `api` usa solo `edge`, y `web`, que no está seleccionado, declara `networks: []`
+- **THEN** `<project>_default` no se crea
+
 #### Scenario: Unused default belonging to another project
 - **WHEN** `<project>_default` exists with another project's label and no selected service uses `default`
 - **THEN** `up` succeeds and leaves that network untouched
@@ -146,3 +164,42 @@ top-level `default` that no selected service uses SHALL be treated the same way.
 #### Scenario: Teardown of a default created by an earlier version
 - **WHEN** `<project>_default` exists with this project's label and the model declares it managed
 - **THEN** `down` removes it
+
+### Requirement: Reserved Compose labels are refused before anything is created
+El namespace de etiquetas `com.docker.compose` (la clave `com.docker.compose` y toda clave que empiece por `com.docker.compose.`) pertenece al shim. `up` SHALL rechazar, antes de cualquier llamada que cree o modifique un recurso, toda etiqueta de usuario de ese namespace declarada en un servicio, una red o un volumen, en forma de mapa o de lista, nombrando la clave y el servicio o recurso. Las etiquetas que genera el shim y las etiquetas de usuario fuera del namespace SHALL seguir aplicándose.
+
+#### Scenario: Reserved key on a service as a map
+- **WHEN** el servicio `api` declara `labels: {com.docker.compose.project: another-project}`
+- **THEN** `up` termina con error que nombra `com.docker.compose.project` y el servicio `api`, y el runtime no recibe ninguna llamada que cree o modifique una red, un volumen o un contenedor
+
+#### Scenario: Reserved key on a service as a list
+- **WHEN** el servicio `api` declara `labels: ["com.docker.compose.service=other"]`
+- **THEN** `up` termina con el mismo tipo de error nombrando `com.docker.compose.service` y `api`, y no crea nada
+
+#### Scenario: Reserved key on a network
+- **WHEN** la red `back` declara una clave `com.docker.compose.*` en `labels`, en forma de mapa o de lista
+- **THEN** `up` termina con error que nombra la clave y la red `back`, y no crea ninguna red, volumen ni contenedor
+
+#### Scenario: Reserved key on a volume
+- **WHEN** el volumen `data` declara una clave `com.docker.compose.*` en `labels`, en forma de mapa o de lista
+- **THEN** `up` termina con error que nombra la clave y el volumen `data`, y no crea ninguna red, volumen ni contenedor
+
+#### Scenario: Several offending labels are reported together
+- **WHEN** un servicio y una red declaran cada uno una clave reservada
+- **THEN** el error nombra ambas claves con su recurso, y no se crea nada
+
+#### Scenario: Non-reserved labels keep working
+- **WHEN** un servicio, una red y un volumen declaran etiquetas como `team=platform` o `com.example.owner=ops`
+- **THEN** `up` crea los recursos y cada etiqueta aparece una sola vez en el recurso, junto con las etiquetas de propiedad del shim
+
+#### Scenario: Internal labels are not refused
+- **WHEN** `up` crea un servicio, una red y un volumen sin etiquetas de usuario
+- **THEN** los recursos llevan las etiquetas `com.docker.compose.*` que genera el shim y `up` termina con éxito
+
+#### Scenario: Same result with the official normalizer
+- **WHEN** el modelo llega normalizado por el `docker-compose` oficial con una etiqueta reservada declarada en lista o en mapa
+- **THEN** el resultado es el mismo error que con el parser integrado y no se crea nada
+
+#### Scenario: Dry run reports the same problem
+- **WHEN** `docker compose --dry-run up` se ejecuta con una etiqueta reservada
+- **THEN** termina con el mismo error y el mismo código de salida que `up`, y no crea nada
