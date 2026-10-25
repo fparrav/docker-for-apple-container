@@ -209,3 +209,18 @@ def network_mode_message(value: str) -> str:
         f"network_mode: {value} is not supported by Apple container; only the "
         "project network is available"
     )
+
+
+def service_network_keys(spec: Mapping[str, Any]) -> list[str]:
+    """Network keys a service uses, in declared order.
+
+    A mapping or list of keys is read as-is. A service that declares no
+    ``networks``, or an empty list or mapping, uses the implicit project
+    ``default``, as the official Compose normalizes it.
+    """
+    declared = spec.get("networks")
+    if isinstance(declared, Mapping) and declared:
+        return [str(key) for key in declared]
+    if isinstance(declared, list) and declared:
+        return [str(item) for item in declared]
+    return ["default"]

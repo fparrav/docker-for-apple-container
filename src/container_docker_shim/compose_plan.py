@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .cli import ShimError
+from .compose_resource_compat import service_network_keys
 
 
 @dataclass(frozen=True)
@@ -62,21 +63,6 @@ def _check_cycles(services: dict[str, Any]) -> None:
 
     for name in services:
         visit(name)
-
-
-def service_network_keys(spec: dict[str, Any]) -> list[str]:
-    """Network keys a service uses, in declared order.
-
-    A mapping or list of keys is read as-is. A service that declares no
-    ``networks``, or an empty list or mapping, uses the implicit project
-    ``default``, as the official Compose normalizes it.
-    """
-    declared = spec.get("networks")
-    if isinstance(declared, dict) and declared:
-        return [str(key) for key in declared]
-    if isinstance(declared, list) and declared:
-        return [str(item) for item in declared]
-    return ["default"]
 
 
 def plan(project: Any, selected: Iterable[str] | None = None, no_deps: bool = False) -> Plan:

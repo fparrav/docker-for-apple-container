@@ -510,12 +510,8 @@ def _collect_resources(
     networks: dict[str, str],
     volumes: dict[str, str],
 ) -> None:
-    declared = spec.get("networks")
-    if isinstance(declared, (list, Mapping)):
-        for net in declared:
-            networks.setdefault(str(net), name)
-    else:
-        networks.setdefault("default", name)
+    for net in compose_resource_compat.service_network_keys(spec):
+        networks.setdefault(net, name)
     for entry in spec.get("volumes") or []:
         if isinstance(entry, Mapping):
             if entry.get("type", "volume") == "volume" and entry.get("source"):
